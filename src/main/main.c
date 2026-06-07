@@ -28,7 +28,10 @@
 
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 
-
+static int smooth_coord(int old_value, int new_value)
+{
+    return (old_value * 3 + new_value) / 4;
+}
 
 static void draw_rect_rgb565(
     uint16_t *fb,
@@ -80,7 +83,7 @@ static ppa_client_handle_t ppa_srm_handle = NULL;
 static size_t data_cache_line_size = 0;
 static void *lcd_buffer[CONFIG_BSP_LCD_DPI_BUFFER_NUMS];
 static lv_display_t *disp;
-#define FACE_DETECT_INTERVAL 10
+#define FACE_DETECT_INTERVAL 5
 #define MAX_FACE_BOXES 5
 
 static uint32_t frame_count = 0;
@@ -89,7 +92,7 @@ static face_box_t last_boxes[MAX_FACE_BOXES];
 static int last_face_count = 0;
 static int no_face_frames = 0;
 
-#define FACE_BOX_HOLD_FRAMES 30
+#define FACE_BOX_HOLD_MISSES 3
 
 i2c_master_bus_handle_t i2c_bus_;
 
@@ -268,13 +271,21 @@ static void camera_video_frame_operation(
         ESP_LOGI(TAG, "Detection ran, face_count=%d", face_count);
 
         if (face_count > 0) {
-            last_face_count = face_count;
-            if (last_face_count > MAX_FACE_BOXES) {
-                last_face_count = MAX_FACE_BOXES;
+            int update_count = face_count;
+            if (update_count > MAX_FACE_BOXES) {
+                update_count = MAX_FACE_BOXES;
             }
 
-            for (int i = 0; i < last_face_count; i++) {
-                last_boxes[i] = boxes[i];
+            for (int i = 0; i < update_count; i++) {
+                if (i < last_face_count) {
+                    last_boxes[i].x1 = smooth_coord(last_boxes[i].x1, boxes[i].x1);
+                    last_boxes[i].y1 = smooth_coord(last_boxes[i].y1, boxes[i].y1);
+                    last_boxes[i].x2 = smooth_coord(last_boxes[i].x2, boxes[i].x2);
+                    last_boxes[i].y2 = smooth_coord(last_boxes[i].y2, boxes[i].y2);
+                    last_boxes[i].score = boxes[i].score;
+                } else {
+                    last_boxes[i] = boxes[i];
+                }
 
                 ESP_LOGI(TAG,
                         "Face %d score=%.2f box=[%d,%d,%d,%d]",
@@ -286,11 +297,12 @@ static void camera_video_frame_operation(
                         boxes[i].y2);
             }
 
+            last_face_count = update_count;
             no_face_frames = 0;
         } else {
             no_face_frames++;
 
-            if (no_face_frames > FACE_BOX_HOLD_FRAMES) {
+            if (no_face_frames >= FACE_BOX_HOLD_MISSES) {
                 last_face_count = 0;
             }
         }
