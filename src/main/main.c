@@ -3,6 +3,7 @@
  *
  * SPDX-License-Identifier: CC0-1.0
  */
+#include <inttypes.h>
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_video_init.h"
@@ -14,6 +15,7 @@
 #include "esp_timer.h"
 #include "driver/ppa.h"
 #include "app_video.h"
+#include "face_detect_wrapper.h"
 
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -25,6 +27,43 @@
 #include "lv_demos.h"
 
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
+
+
+
+static void draw_rect_rgb565(
+    uint16_t *fb,
+    uint32_t fb_w,
+    uint32_t fb_h,
+    int x1,
+    int y1,
+    int x2,
+    int y2,
+    uint16_t color)
+{
+    if (!fb) {
+        return;
+    }
+
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 < 0) x2 = 0;
+    if (y2 < 0) y2 = 0;
+
+    if (x1 >= (int)fb_w) x1 = fb_w - 1;
+    if (x2 >= (int)fb_w) x2 = fb_w - 1;
+    if (y1 >= (int)fb_h) y1 = fb_h - 1;
+    if (y2 >= (int)fb_h) y2 = fb_h - 1;
+
+    for (int x = x1; x <= x2; x++) {
+        fb[y1 * fb_w + x] = color;
+        fb[y2 * fb_w + x] = color;
+    }
+
+    for (int y = y1; y <= y2; y++) {
+        fb[y * fb_w + x1] = color;
+        fb[y * fb_w + x2] = color;
+    }
+}
 
 static void camera_video_frame_operation(
     uint8_t *camera_buf,
@@ -41,6 +80,16 @@ static ppa_client_handle_t ppa_srm_handle = NULL;
 static size_t data_cache_line_size = 0;
 static void *lcd_buffer[CONFIG_BSP_LCD_DPI_BUFFER_NUMS];
 static lv_display_t *disp;
+#define FACE_DETECT_INTERVAL 10
+#define MAX_FACE_BOXES 5
+
+static uint32_t frame_count = 0;
+
+static face_box_t last_boxes[MAX_FACE_BOXES];
+static int last_face_count = 0;
+static int no_face_frames = 0;
+
+#define FACE_BOX_HOLD_FRAMES 30
 
 i2c_master_bus_handle_t i2c_bus_;
 
@@ -77,7 +126,7 @@ void app_main(void)
         .oper_type = PPA_OPERATION_SRM,
     };
     ESP_ERROR_CHECK(ppa_register_client(&ppa_srm_config, &ppa_srm_handle));
-
+    ESP_ERROR_CHECK(face_detect_init());
     ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size));
 
     i2c_bus_ = bsp_i2c_get_handle();
@@ -147,6 +196,11 @@ static void camera_video_frame_operation(
     uint32_t in_block_w = camera_buf_hes;
     uint32_t in_block_h = camera_buf_ves;
 
+    float scale_x = (float)display_width / (float)camera_buf_hes;
+    float scale_y = (float)display_height / (float)camera_buf_ves;
+
+
+
     ppa_srm_oper_config_t srm_config = {
         .in.buffer = camera_buf,
         .in.pic_w = camera_buf_hes,
@@ -168,12 +222,11 @@ static void camera_video_frame_operation(
         .out.srm_cm = APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? PPA_SRM_COLOR_MODE_RGB565 : PPA_SRM_COLOR_MODE_RGB888,
 
         .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-        .scale_x = (float)display_width / (float)camera_buf_hes,
-        .scale_y = (float)display_height / (float)camera_buf_ves,
+        .scale_x = scale_x,
+        .scale_y = scale_y,
         .mirror_x = 0,
         .mirror_y = 0,
-        // Original / previous
-        .rgb_swap = 1,
+        .rgb_swap = 0,
         .byte_swap = 0,
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
@@ -185,6 +238,83 @@ static void camera_video_frame_operation(
         return;
     }
 
+    frame_count++;
+
+    if ((frame_count % 100) == 0) {
+        ESP_LOGI(TAG, "Frame count=%" PRIu32, frame_count);
+    }
+
+    if ((frame_count % FACE_DETECT_INTERVAL) == 0) {
+        face_box_t boxes[MAX_FACE_BOXES];
+
+    #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+        int face_count = face_detect_run_rgb565(
+            camera_buf,
+            camera_buf_hes,
+            camera_buf_ves,
+            boxes,
+            MAX_FACE_BOXES
+        );
+    #else
+        int face_count = face_detect_run_rgb888(
+            camera_buf,
+            camera_buf_hes,
+            camera_buf_ves,
+            boxes,
+            MAX_FACE_BOXES
+        );
+    #endif
+
+        ESP_LOGI(TAG, "Detection ran, face_count=%d", face_count);
+
+        if (face_count > 0) {
+            last_face_count = face_count;
+            if (last_face_count > MAX_FACE_BOXES) {
+                last_face_count = MAX_FACE_BOXES;
+            }
+
+            for (int i = 0; i < last_face_count; i++) {
+                last_boxes[i] = boxes[i];
+
+                ESP_LOGI(TAG,
+                        "Face %d score=%.2f box=[%d,%d,%d,%d]",
+                        i,
+                        boxes[i].score,
+                        boxes[i].x1,
+                        boxes[i].y1,
+                        boxes[i].x2,
+                        boxes[i].y2);
+            }
+
+            no_face_frames = 0;
+        } else {
+            no_face_frames++;
+
+            if (no_face_frames > FACE_BOX_HOLD_FRAMES) {
+                last_face_count = 0;
+            }
+        }
+    }
+
+    #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+    for (int i = 0; i < last_face_count; i++) {
+        int lcd_x1 = last_boxes[i].x1 * display_width / camera_buf_hes;
+        int lcd_y1 = last_boxes[i].y1 * display_height / camera_buf_ves;
+        int lcd_x2 = last_boxes[i].x2 * display_width / camera_buf_hes;
+        int lcd_y2 = last_boxes[i].y2 * display_height / camera_buf_ves;
+
+        draw_rect_rgb565(
+            (uint16_t *)lcd_buffer[camera_buf_index],
+            display_width,
+            display_height,
+            lcd_x1,
+            lcd_y1,
+            lcd_x2,
+            lcd_y2,
+            0xF800
+        );
+    }
+    #endif
     uint32_t draw_w = display_width;
     uint32_t draw_h = display_height;
 

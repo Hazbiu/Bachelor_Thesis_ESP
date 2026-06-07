@@ -121,7 +121,7 @@ int app_video_open(char *dev, video_fmt_t init_fmt)
     controls.count      = 1;
     controls.controls   = control;
     control[0].id       = V4L2_CID_VFLIP;
-    control[0].value    = 1;
+    control[0].value    = 0;
     if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) != 0) {
         ESP_LOGW(TAG, "failed to mirror the frame horizontally and skip this step");
     }
@@ -130,7 +130,7 @@ int app_video_open(char *dev, video_fmt_t init_fmt)
     controls.count      = 1;
     controls.controls   = control;
     control[0].id       = V4L2_CID_HFLIP;
-    control[0].value    = 1;
+    control[0].value    = 0;
     if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) != 0) {
         ESP_LOGW(TAG, "failed to mirror the frame horizontally and skip this step");
     }

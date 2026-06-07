@@ -1,7 +1,9 @@
 dependencies:
-  idf: ">=5.3"
+  idf: '>=5.3'
 
   esp_video:
-    version: "0.8.*"
+    version: 0.8.*
     public: true
-  waveshare/esp32_p4_platform: "*"
+  waveshare/esp32_p4_platform: '*'
+  espressif/esp-dl: ^3.3.5
+  espressif/human_face_detect: ^0.4.2
