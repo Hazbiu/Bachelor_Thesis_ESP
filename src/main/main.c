@@ -16,6 +16,7 @@
 #include "driver/ppa.h"
 #include "app_video.h"
 #include "face_detect_wrapper.h"
+#include "face_recognition_wrapper.h"
 
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -85,6 +86,7 @@ static void *lcd_buffer[CONFIG_BSP_LCD_DPI_BUFFER_NUMS];
 static lv_display_t *disp;
 #define FACE_DETECT_INTERVAL 5
 #define MAX_FACE_BOXES 5
+#define FACE_RECOG_INTERVAL 20
 
 static uint32_t frame_count = 0;
 
@@ -130,6 +132,7 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(ppa_register_client(&ppa_srm_config, &ppa_srm_handle));
     ESP_ERROR_CHECK(face_detect_init());
+    ESP_ERROR_CHECK(face_recognition_init());
     ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size));
 
     i2c_bus_ = bsp_i2c_get_handle();
@@ -295,6 +298,28 @@ static void camera_video_frame_operation(
                         boxes[i].y1,
                         boxes[i].x2,
                         boxes[i].y2);
+
+                if ((frame_count % FACE_RECOG_INTERVAL) == 0 && i == 0) {
+                    char name[FACE_RECOG_MAX_NAME_LEN];
+                    float recog_score = 0.0f;
+
+                    esp_err_t recog_ret = face_recognition_recognize(
+                        camera_buf,
+                        camera_buf_hes,
+                        camera_buf_ves,
+                        &boxes[i],
+                        name,
+                        sizeof(name),
+                        &recog_score
+                    );
+
+                    if (recog_ret == ESP_OK) {
+                        ESP_LOGI(TAG,
+                                "Recognition result: name=%s score=%.3f",
+                                name,
+                                recog_score);
+                    }
+                }
             }
 
             last_face_count = update_count;
