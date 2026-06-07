@@ -7,3 +7,4 @@ dependencies:
   waveshare/esp32_p4_platform: '*'
   espressif/esp-dl: ^3.3.5
   espressif/human_face_detect: ^0.4.2
+  espressif/human_face_recognition: '*'

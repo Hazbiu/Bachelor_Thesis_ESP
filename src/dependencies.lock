@@ -363,6 +363,17 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 0.4.2
+  espressif/human_face_recognition:
+    component_hash: ebdce22800621739386c8c5ae0e974cd5ee59f9d3d0735bf6cfe4c8040313ae4
+    dependencies:
+    - name: espressif/human_face_detect
+      registry_url: https://components.espressif.com
+      require: private
+      version: ~0.4.1
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.3.2
   espressif/i2c_bus:
     component_hash: 804ec068d163570fd367b279a310ca383484630d2310c586b50def0bcf21de13
     dependencies:
@@ -588,8 +599,9 @@ direct_dependencies:
 - espressif/esp_sccb_intf
 - espressif/esp_video
 - espressif/human_face_detect
+- espressif/human_face_recognition
 - idf
 - waveshare/esp32_p4_platform
-manifest_hash: 5c07b32696b9ea61d1a8b84996e8370974bf26c2bb109ffa52bdbcb2e6d4652c
+manifest_hash: ac2eff6eba1b59c150e25ba59180267ac96fbe928aea7cdde0819471d552ab40
 target: esp32p4
 version: 2.0.0
