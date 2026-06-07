@@ -9,6 +9,7 @@
 #include "human_face_recognition.hpp"
 #include "dl_image_define.hpp"
 #include "dl_detect_define.hpp"
+#include "app_video.h"
 
 static const char *TAG_RECOG = "face_recognition_wrapper";
 
@@ -23,11 +24,6 @@ static std::list<dl::detect::result_t> make_detect_result_from_box(const face_bo
     r.score = box->score;
     r.box = {box->x1, box->y1, box->x2, box->y2};
 
-    /*
-     * Temporary approximate 5-point landmarks.
-     * HumanFaceRecognizer expects landmarks for alignment.
-     * Later we should replace these with real keypoints from HumanFaceDetect.
-     */
     int w = box->x2 - box->x1;
     int h = box->y2 - box->y1;
 
@@ -58,11 +54,6 @@ extern "C" esp_err_t face_recognition_init(void)
         return ESP_OK;
     }
 
-    /*
-     * Database path:
-     * Start with a simple path. If this fails at runtime, we will switch to
-     * a mounted filesystem path such as /spiffs/face.db or /littlefs/face.db.
-     */
     s_recognizer = new HumanFaceRecognizer("/spiffs/face.db");
 
     if (!s_recognizer) {
@@ -74,6 +65,15 @@ extern "C" esp_err_t face_recognition_init(void)
              s_recognizer->get_num_feats());
 
     return ESP_OK;
+}
+
+extern "C" int face_recognition_get_count(void)
+{
+    if (!s_recognizer) {
+        return 0;
+    }
+
+    return s_recognizer->get_num_feats();
 }
 
 extern "C" esp_err_t face_recognition_enroll(
@@ -151,11 +151,6 @@ extern "C" esp_err_t face_recognition_recognize(
         return ESP_OK;
     }
 
-    /*
-     * We do not yet know the exact fields of result_t in your version.
-     * If this part fails to compile, paste the compiler error and the
-     * dl_recognition_define.hpp content.
-     */
     snprintf(out_name, out_name_len, "id_%d", results[0].id);
     *out_score = results[0].similarity;
 

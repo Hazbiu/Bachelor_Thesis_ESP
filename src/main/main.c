@@ -17,6 +17,7 @@
 #include "app_video.h"
 #include "face_detect_wrapper.h"
 #include "face_recognition_wrapper.h"
+#include "esp_spiffs.h"
 
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -28,6 +29,7 @@
 #include "lv_demos.h"
 
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
+static bool enrolled_once = false;
 
 static int smooth_coord(int old_value, int new_value)
 {
@@ -118,6 +120,33 @@ static void calc_ppa_input_offset(uint32_t src_w, uint32_t src_h,
     }
 }
 
+static esp_err_t mount_spiffs(void)
+{
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = "storage",
+        .max_files = 4,
+        .format_if_mount_failed = true,
+    };
+
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPIFFS mount failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    size_t total = 0;
+    size_t used = 0;
+    ret = esp_spiffs_info("storage", &total, &used);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "SPIFFS mounted: total=%d used=%d", total, used);
+    } else {
+        ESP_LOGE(TAG, "SPIFFS info failed: %s", esp_err_to_name(ret));
+    }
+
+    return ESP_OK;
+}
+
 void app_main(void)
 {
     disp = bsp_display_start();
@@ -131,8 +160,12 @@ void app_main(void)
         .oper_type = PPA_OPERATION_SRM,
     };
     ESP_ERROR_CHECK(ppa_register_client(&ppa_srm_config, &ppa_srm_handle));
+
+    ESP_ERROR_CHECK(mount_spiffs());
+
     ESP_ERROR_CHECK(face_detect_init());
     ESP_ERROR_CHECK(face_recognition_init());
+    enrolled_once = face_recognition_get_count() > 0;
     ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size));
 
     i2c_bus_ = bsp_i2c_get_handle();
@@ -298,6 +331,22 @@ static void camera_video_frame_operation(
                         boxes[i].y1,
                         boxes[i].x2,
                         boxes[i].y2);
+                if (!enrolled_once && i == 0 && boxes[i].score > 0.90f) {
+                    esp_err_t enroll_ret = face_recognition_enroll(
+                        camera_buf,
+                        camera_buf_hes,
+                        camera_buf_ves,
+                        &boxes[i],
+                        "person_1"
+                    );
+
+                    if (enroll_ret == ESP_OK) {
+                        enrolled_once = true;
+                        ESP_LOGI(TAG, "Enrolled person_1");
+                    } else {
+                        ESP_LOGE(TAG, "Enroll failed: %s", esp_err_to_name(enroll_ret));
+                    }
+                }
 
                 if ((frame_count % FACE_RECOG_INTERVAL) == 0 && i == 0) {
                     char name[FACE_RECOG_MAX_NAME_LEN];

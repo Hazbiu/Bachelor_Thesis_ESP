@@ -30,6 +30,8 @@ esp_err_t face_recognition_recognize(
     float *out_score
 );
 
+int face_recognition_get_count(void);
+
 #ifdef __cplusplus
 }
 #endif
