@@ -1,0 +1,108 @@
+Command: /home/hazbiu/.espressif/tools/python/v5.5.4/venv/bin/python /home/hazbiu/.espressif/v5.5.4/esp-idf/tools/idf_monitor.py -p /dev/ttyACM0 -b 115200 --toolchain-prefix riscv32-esp-elf- --target esp32p4 --revision 1 --decode-panic backtrace /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/video_lcd_display.elf /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/bootloader/bootloader.elf -m '/home/hazbiu/.espressif/tools/python/v5.5.4/venv/bin/python' '/home/hazbiu/.espressif/v5.5.4/esp-idf/tools/idf.py' '-p' '/dev/ttyACM0'
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0x1 (POWERON),boot:0x30f (SPI_FAST_FLASH_BOOT)
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x173c
+load:0x4ff29ed0,len:0xff0
+load:0x4ff2cbd0,len:0x3608
+entry 0x4ff29eda
+[0;32mI (26) boot: ESP-IDF v5.5.4 2nd stage bootloader[0m
+[0;32mI (26) boot: compile time Jun  7 2026 15:47:50[0m
+[0;32mI (26) boot: Multicore bootloader[0m
+[0;32mI (28) boot: chip revision: v1.3[0m
+[0;32mI (29) boot: efuse block revision: v0.3[0m
+[0;32mI (32) qio_mode: Enabling default flash chip QIO[0m
+[0;32mI (37) boot.esp32p4: SPI Speed      : 80MHz[0m
+[0;32mI (41) boot.esp32p4: SPI Mode       : QIO[0m
+[0;32mI (44) boot.esp32p4: SPI Flash Size : 16MB[0m
+[0;32mI (48) boot: Enabling RNG early entropy source...[0m
+[0;32mI (53) boot: Partition Table:[0m
+[0;32mI (55) boot: ## Label            Usage          Type ST Offset   Length[0m
+[0;32mI (62) boot:  0 nvs              WiFi data        01 02 0000b000 00006000[0m
+[0;32mI (68) boot:  1 phy_init         RF data          01 01 00011000 00001000[0m
+[0;32mI (75) boot:  2 factory          factory app      00 00 00020000 00f00000[0m
+[0;32mI (82) boot: End of partition table[0m
+[0;32mI (85) esp_image: segment 0: paddr=00020020 vaddr=480a0020 size=214e8h (136424) map[0m
+[0;32mI (112) esp_image: segment 1: paddr=00041510 vaddr=30100000 size=00068h (   104) load[0m
+[0;32mI (114) esp_image: segment 2: paddr=00041580 vaddr=4ff00000 size=0ea98h ( 60056) load[0m
+[0;32mI (127) esp_image: segment 3: paddr=00050020 vaddr=48000020 size=98360h (623456) map[0m
+[0;32mI (217) esp_image: segment 4: paddr=000e8388 vaddr=4ff0ea98 size=0b3f4h ( 46068) load[0m
+[0;32mI (231) boot: Loaded app from partition at offset 0x20000[0m
+[0;32mI (231) boot: Disabling RNG early entropy source...[0m
+[0;32mI (242) hex_psram: vendor id    : 0x0d (AP)[0m
+[0;32mI (242) hex_psram: Latency      : 0x01 (Fixed)[0m
+[0;32mI (243) hex_psram: DriveStr.    : 0x00 (25 Ohm)[0m
+[0;32mI (243) hex_psram: dev id       : 0x03 (generation 4)[0m
+[0;32mI (248) hex_psram: density      : 0x07 (256 Mbit)[0m
+[0;32mI (253) hex_psram: good-die     : 0x06 (Pass)[0m
+[0;32mI (257) hex_psram: SRF          : 0x02 (Slow Refresh)[0m
+[0;32mI (261) hex_psram: BurstType    : 0x00 ( Wrap)[0m
+[0;32mI (266) hex_psram: BurstLen     : 0x03 (2048 Byte)[0m
+[0;32mI (270) hex_psram: BitMode      : 0x01 (X16 Mode)[0m
+[0;32mI (274) hex_psram: Readlatency  : 0x04 (14 cycles@Fixed)[0m
+[0;32mI (280) hex_psram: DriveStrength: 0x00 (1/1)[0m
+[0;32mI (284) MSPI Timing: Enter psram timing tuning[0m
+I esp_psram: Found 32MB PSRAM device
+I esp_psram: Speed: 200MHz
+[0;32mI (466) mmu_psram: .rodata xip on psram[0m
+[0;32mI (496) mmu_psram: .text xip on psram[0m
+[0;32mI (497) hex_psram: psram CS IO is dedicated[0m
+[0;32mI (497) cpu_start: Multicore app[0m
+[0;32mI (945) esp_psram: SPI SRAM memory test OK[0m
+[0;32mI (953) cpu_start: GPIO 38 and 37 are used as console UART I/O pins[0m
+[0;32mI (954) cpu_start: Pro cpu start user code[0m
+[0;32mI (954) cpu_start: cpu freq: 360000000 Hz[0m
+[0;32mI (956) app_init: Application information:[0m
+[0;32mI (960) app_init: Project name:     video_lcd_display[0m
+[0;32mI (964) app_init: App version:      a42049a[0m
+[0;32mI (968) app_init: Compile time:     Jun  7 2026 15:47:43[0m
+[0;32mI (973) app_init: ELF file SHA256:  bff6de665...[0m
+[0;32mI (978) app_init: ESP-IDF:          v5.5.4[0m
+[0;32mI (981) efuse_init: Min chip rev:     v0.1[0m
+[0;32mI (985) efuse_init: Max chip rev:     v1.99 [0m
+[0;32mI (989) efuse_init: Chip rev:         v1.3[0m
+[0;32mI (993) heap_init: Initializing. RAM available for dynamic allocation:[0m
+[0;32mI (999) heap_init: At 4FF1BDB0 len 0001F210 (124 KiB): RETENT_RAM[0m
+[0;32mI (1005) heap_init: At 4FF3AFC0 len 00004BF0 (18 KiB): RAM[0m
+[0;32mI (1010) heap_init: At 4FF40000 len 00040000 (256 KiB): RAM[0m
+[0;32mI (1016) heap_init: At 50108080 len 00007F80 (31 KiB): RTCRAM[0m
+[0;32mI (1021) heap_init: At 30100068 len 00001F98 (7 KiB): TCM[0m
+[0;32mI (1026) esp_psram: Adding pool of 31936K of PSRAM memory to heap allocator[0m
+[0;32mI (1033) esp_psram: Adding pool of 31K of PSRAM memory gap generated due to end address alignment of irom to the heap allocator[0m
+[0;32mI (1044) esp_psram: Adding pool of 58K of PSRAM memory gap generated due to end address alignment of drom to the heap allocator[0m
+[0;32mI (1056) spi_flash: detected chip: gd[0m
+[0;32mI (1059) spi_flash: flash io: qio[0m
+[0;32mI (1062) sleep_gpio: Configure to isolate all GPIO pins in sleep state[0m
+[0;32mI (1068) sleep_gpio: Enable automatic switching of GPIO sleep configuration[0m
+[0;32mI (1075) main_task: Started on CPU0[0m
+[0;32mI (1079) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations[0m
+[0;32mI (1086) main_task: Calling app_main()[0m
+[0;32mI (1090) esp_lvgl:adapter: LVGL adapter initialized successfully[0m
+[0;33mW (1095) i2c.master: Please check pull-up resistances whether be connected properly. Otherwise unexpected behavior would happen. For more detailed information, please read docs[0m
+[0;32mI (1111) ESP32_P4_PLATFORM: MIPI DSI PHY Powered on[0m
+[0;32mI (1116) ESP32_P4_PLATFORM: Install MIPI DSI LCD control panel[0m
+[0;32mI (1121) ESP32_P4_PLATFORM: Install Waveshare LCD control panel[0m
+[0;32mI (1126) jd9365: version: 1.0.6[0m
+[0;32mI (1129) i2c_bus: I2C Bus V2 uses the externally initialized bus handle[0m
+[0;32mI (2389) jd9365: LCD ID: 93 65 04[0m
+[0;32mI (2531) ESP32_P4_PLATFORM: Display initialized[0m
+[0;32mI (2533) esp_lvgl:bridge_v9: Initializing hardware resources[0m
+[0;32mI (2533) esp_lvgl:bridge_v9: Hardware resources initialized successfully[0m
+[0;32mI (2536) ESP32_P4_PLATFORM: Touch 0x5d found[0m
+[0;32mI (2539) GT911: I2C address initialization procedure skipped - using default GT9xx setup[0m
+[0;32mI (2548) GT911: TouchPad_ID:0x39,0x32,0x37[0m
+[0;32mI (2551) GT911: TouchPad_Config_Version:130[0m
+[0;32mI (2555) esp_lvgl:touch: Touch input device registered successfully (IRQ mode: disabled)[0m
+[0;32mI (2563) esp_lvgl:adapter: LVGL task started successfully[0m
+[0;32mI (2564) esp_lvgl:bridge: Initializing hardware resources[0m
+[0;32mI (2573) esp_lvgl:bridge: Hardware resources initialized successfully[0m
+[0;32mI (2581) ov5647: Detected Camera sensor PID=0x5647[0m
+[0;32mI (2613) app_video: version: 0.8.0[0m
+[0;32mI (2613) app_video: driver:  MIPI-CSI[0m
+[0;32mI (2613) app_video: card:    MIPI-CSI[0m
+[0;32mI (2613) app_video: bus:     esp32p4:MIPI-CSI[0m
+[0;32mI (2616) app_video: width=800 height=640[0m
+[0;32mI (2621) app_main: Using user defined buffer[0m
+[0;32mI (2641) app_video: Video Stream Start[0m
+[0;32mI (2642) main_task: Returned from app_main()[0m
