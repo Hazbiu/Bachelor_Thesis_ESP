@@ -162,6 +162,8 @@ void app_main(void)
     ESP_ERROR_CHECK(ppa_register_client(&ppa_srm_config, &ppa_srm_handle));
 
     ESP_ERROR_CHECK(mount_spiffs());
+    remove("/spiffs/face.db");
+    ESP_LOGW(TAG, "Deleted /spiffs/face.db");
 
     ESP_ERROR_CHECK(face_detect_init());
     ESP_ERROR_CHECK(face_recognition_init());

@@ -15,6 +15,18 @@ static const char *TAG_RECOG = "face_recognition_wrapper";
 
 static HumanFaceRecognizer *s_recognizer = nullptr;
 
+/*
+ * Extra safety threshold.
+ *
+ * Espressif's HumanFaceRecognizer already has an internal threshold,
+ * but this project also applies a manual threshold so weak matches
+ * are rejected instead of being shown as id_1.
+ *
+ * Increase this value if wrong people are recognized as the same ID.
+ * Good test values: 0.65, 0.70, 0.75
+ */
+#define FACE_SIMILARITY_THRESHOLD 0.70f
+
 static std::list<dl::detect::result_t> make_detect_result_from_box(const face_box_t *box)
 {
     std::list<dl::detect::result_t> detect_res;
@@ -61,7 +73,8 @@ extern "C" esp_err_t face_recognition_init(void)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG_RECOG, "HumanFaceRecognizer initialized, enrolled=%d",
+    ESP_LOGI(TAG_RECOG,
+             "HumanFaceRecognizer initialized, enrolled=%d",
              s_recognizer->get_num_feats());
 
     return ESP_OK;
@@ -100,14 +113,28 @@ extern "C" esp_err_t face_recognition_enroll(
 
     std::list<dl::detect::result_t> detect_res = make_detect_result_from_box(box);
 
+    ESP_LOGI(TAG_RECOG,
+             "Trying to enroll name=%s box=[%d,%d,%d,%d] score=%.3f current_total=%d",
+             name,
+             box->x1,
+             box->y1,
+             box->x2,
+             box->y2,
+             box->score,
+             s_recognizer->get_num_feats());
+
     esp_err_t ret = s_recognizer->enroll(img, detect_res);
+
     if (ret == ESP_OK) {
         ESP_LOGI(TAG_RECOG,
                  "Enrolled face name=%s, total=%d",
                  name,
                  s_recognizer->get_num_feats());
     } else {
-        ESP_LOGE(TAG_RECOG, "Enroll failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG_RECOG,
+                 "Enroll failed for name=%s: %s",
+                 name,
+                 esp_err_to_name(ret));
     }
 
     return ret;
@@ -142,22 +169,49 @@ extern "C" esp_err_t face_recognition_recognize(
 
     std::list<dl::detect::result_t> detect_res = make_detect_result_from_box(box);
 
-    std::vector<dl::recognition::result_t> results = s_recognizer->recognize(img, detect_res);
+    std::vector<dl::recognition::result_t> results =
+        s_recognizer->recognize(img, detect_res);
 
     if (results.empty()) {
         strncpy(out_name, "unknown", out_name_len - 1);
         out_name[out_name_len - 1] = '\0';
         *out_score = 0.0f;
+
+        ESP_LOGI(TAG_RECOG,
+                 "Recognition result: unknown, no database match");
+
+        return ESP_OK;
+    }
+
+    float similarity = results[0].similarity;
+    *out_score = similarity;
+
+    /*
+     * Manual rejection step.
+     *
+     * Without this, different people may still be returned as id_1
+     * if the internal recognizer gives a weak match.
+     */
+    if (similarity < FACE_SIMILARITY_THRESHOLD) {
+        strncpy(out_name, "unknown", out_name_len - 1);
+        out_name[out_name_len - 1] = '\0';
+
+        ESP_LOGI(TAG_RECOG,
+                 "Face rejected: id=%d similarity=%.3f threshold=%.2f",
+                 results[0].id,
+                 similarity,
+                 FACE_SIMILARITY_THRESHOLD);
+
         return ESP_OK;
     }
 
     snprintf(out_name, out_name_len, "id_%d", results[0].id);
-    *out_score = results[0].similarity;
 
     ESP_LOGI(TAG_RECOG,
-             "Recognized id=%d similarity=%.3f",
+             "Recognized id=%d similarity=%.3f threshold=%.2f",
              results[0].id,
-             results[0].similarity);
+             similarity,
+             FACE_SIMILARITY_THRESHOLD);
 
     return ESP_OK;
 }

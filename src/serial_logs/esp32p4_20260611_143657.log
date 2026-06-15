@@ -1,0 +1,479 @@
+[0;33m--- esp-idf-monitor 1.9.0 on /dev/ttyACM0 115200[0m
+[0;33m--- Quit: Ctrl+] | Menu: Ctrl+T | Help: Ctrl+T followed by Ctrl+H[0m
+Executing action: monitor
+Running idf_monitor in directory /home/hazbiu/Programming/Bachelor_Thesis_ESP/src
+Executing "/home/hazbiu/.espressif/tools/python/v5.5.4/venv/bin/python /home/hazbiu/.espressif/v5.5.4/esp-idf/tools/idf_monitor.py -p /dev/ttyACM0 -b 115200 --toolchain-prefix riscv32-esp-elf- --target esp32p4 --revision 1 --decode-panic backtrace /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/video_lcd_display.elf /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/bootloader/bootloader.elf -m '/home/hazbiu/.espressif/tools/python/v5.5.4/venv/bin/python' '/home/hazbiu/.espressif/v5.5.4/esp-idf/tools/idf.py' '-p' '/dev/ttyACM0' '-b' '115200'"...
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0x1 (POWERON),boot:0x30f (SPI_FAST_FLASH_BOOT)
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x173c
+load:0x4ff29ed0,len:0xff0
+[0m--- 0x4ff29ed0: [0;33mesp_bootloader_get_description[0m[0m at [0;32m/home/hazbiu/.espressif/v5.5.4/esp-idf/components/esp_bootloader_format/esp_bootloader_desc.c[0m[0m:[1;31m39[0m
+load:0x4ff2cbd0,len:0x3608
+[0m--- 0x4ff2cbd0: [0;33mesp_flash_encryption_enabled[0m[0m at [0;32m/home/hazbiu/.espressif/v5.5.4/esp-idf/components/bootloader_support/src/flash_encrypt.c[0m[0m:[1;31m89[0m
+entry 0x4ff29eda
+[0m--- 0x4ff29eda: [0;33mcall_start_cpu0[0m[0m at [0;32m/home/hazbiu/.espressif/v5.5.4/esp-idf/components/bootloader/subproject/main/bootloader_start.c[0m[0m:[1;31m27[0m
+[0;32mI (26) boot: ESP-IDF v5.5.4 2nd stage bootloader[0m
+[0;32mI (26) boot: compile time Jun  7 2026 22:22:01[0m
+[0;32mI (26) boot: Multicore bootloader[0m
+[0;32mI (28) boot: chip revision: v1.3[0m
+[0;32mI (29) boot: efuse block revision: v0.3[0m
+[0;32mI (32) qio_mode: Enabling default flash chip QIO[0m
+[0;32mI (37) boot.esp32p4: SPI Speed      : 80MHz[0m
+[0;32mI (41) boot.esp32p4: SPI Mode       : QIO[0m
+[0;32mI (44) boot.esp32p4: SPI Flash Size : 16MB[0m
+[0;32mI (48) boot: Enabling RNG early entropy source...[0m
+[0;32mI (53) boot: Partition Table:[0m
+[0;32mI (55) boot: ## Label            Usage          Type ST Offset   Length[0m
+[0;32mI (62) boot:  0 nvs              WiFi data        01 02 0000b000 00006000[0m
+[0;32mI (68) boot:  1 phy_init         RF data          01 01 00011000 00001000[0m
+[0;32mI (75) boot:  2 storage          Unknown data     01 82 00012000 0000e000[0m
+[0;32mI (81) boot:  3 factory          factory app      00 00 00020000 00f00000[0m
+[0;32mI (89) boot: End of partition table[0m
+[0;32mI (91) esp_image: segment 0: paddr=00020020 vaddr=482c0020 size=1965fch (1664508) map[0m
+[0;32mI (334) esp_image: segment 1: paddr=001b6624 vaddr=30100000 size=00068h (   104) load[0m
+[0;32mI (336) esp_image: segment 2: paddr=001b6694 vaddr=4ff00000 size=09984h ( 39300) load[0m
+[0;32mI (346) esp_image: segment 3: paddr=001c0020 vaddr=48000020 size=2b4260h (2835040) map[0m
+[0;32mI (746) esp_image: segment 4: paddr=00474288 vaddr=4ff09984 size=0ce50h ( 52816) load[0m
+[0;32mI (757) esp_image: segment 5: paddr=004810e0 vaddr=4ff16800 size=0438ch ( 17292) load[0m
+[0;32mI (766) boot: Loaded app from partition at offset 0x20000[0m
+[0;32mI (766) boot: Disabling RNG early entropy source...[0m
+[0;32mI (777) hex_psram: vendor id    : 0x0d (AP)[0m
+[0;32mI (778) hex_psram: Latency      : 0x01 (Fixed)[0m
+[0;32mI (778) hex_psram: DriveStr.    : 0x00 (25 Ohm)[0m
+[0;32mI (778) hex_psram: dev id       : 0x03 (generation 4)[0m
+[0;32mI (783) hex_psram: density      : 0x07 (256 Mbit)[0m
+[0;32mI (788) hex_psram: good-die     : 0x06 (Pass)[0m
+[0;32mI (792) hex_psram: SRF          : 0x02 (Slow Refresh)[0m
+[0;32mI (796) hex_psram: BurstType    : 0x00 ( Wrap)[0m
+[0;32mI (801) hex_psram: BurstLen     : 0x03 (2048 Byte)[0m
+[0;32mI (805) hex_psram: BitMode      : 0x01 (X16 Mode)[0m
+[0;32mI (810) hex_psram: Readlatency  : 0x04 (14 cycles@Fixed)[0m
+[0;32mI (815) hex_psram: DriveStrength: 0x00 (1/1)[0m
+[0;32mI (819) MSPI Timing: Enter psram timing tuning[0m
+I esp_psram: Found 32MB PSRAM device
+I esp_psram: Speed: 200MHz
+[0;32mI (1071) mmu_psram: .rodata xip on psram[0m
+[0;32mI (1207) mmu_psram: .text xip on psram[0m
+[0;32mI (1207) hex_psram: psram CS IO is dedicated[0m
+[0;32mI (1207) cpu_start: Multicore app[0m
+[0;32mI (1620) esp_psram: SPI SRAM memory test OK[0m
+[0;32mI (1628) cpu_start: GPIO 38 and 37 are used as console UART I/O pins[0m
+[0;32mI (1629) cpu_start: Pro cpu start user code[0m
+[0;32mI (1629) cpu_start: cpu freq: 360000000 Hz[0m
+[0;32mI (1631) app_init: Application information:[0m
+[0;32mI (1635) app_init: Project name:     video_lcd_display[0m
+[0;32mI (1640) app_init: App version:      71df275-dirty[0m
+[0;32mI (1644) app_init: Compile time:     Jun 10 2026 20:52:36[0m
+[0;32mI (1649) app_init: ELF file SHA256:  7f777e8b2...[0m
+[0;32mI (1654) app_init: ESP-IDF:          v5.5.4[0m
+[0;32mI (1658) efuse_init: Min chip rev:     v0.1[0m
+[0;32mI (1662) efuse_init: Max chip rev:     v1.99 [0m
+[0;32mI (1666) efuse_init: Chip rev:         v1.3[0m
+[0;32mI (1670) heap_init: Initializing. RAM available for dynamic allocation:[0m
+[0;32mI (1676) heap_init: At 4FF1CEC0 len 0001E100 (120 KiB): RETENT_RAM[0m
+[0;32mI (1682) heap_init: At 4FF3AFC0 len 00004BF0 (18 KiB): RAM[0m
+[0;32mI (1687) heap_init: At 4FF40000 len 00040000 (256 KiB): RAM[0m
+[0;32mI (1693) heap_init: At 50108080 len 00007F80 (31 KiB): RTCRAM[0m
+[0;32mI (1698) heap_init: At 30100068 len 00001F98 (7 KiB): TCM[0m
+[0;32mI (1703) esp_psram: Adding pool of 28288K of PSRAM memory to heap allocator[0m
+[0;32mI (1710) esp_psram: Adding pool of 47K of PSRAM memory gap generated due to end address alignment of irom to the heap allocator[0m
+[0;32mI (1721) esp_psram: Adding pool of 38K of PSRAM memory gap generated due to end address alignment of drom to the heap allocator[0m
+[0;32mI (1732) spi_flash: detected chip: gd[0m
+[0;32mI (1735) spi_flash: flash io: qio[0m
+[0;32mI (1739) sleep_gpio: Configure to isolate all GPIO pins in sleep state[0m
+[0;32mI (1745) sleep_gpio: Enable automatic switching of GPIO sleep configuration[0m
+[0;32mI (1752) main_task: Started on CPU0[0m
+[0;32mI (1756) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations[0m
+[0;32mI (1763) main_task: Calling app_main()[0m
+[0;32mI (1767) esp_lvgl:adapter: LVGL adapter initialized successfully[0m
+[0;33mW (1772) i2c.master: Please check pull-up resistances whether be connected properly. Otherwise unexpected behavior would happen. For more detailed information, please read docs[0m
+[0;32mI (1788) ESP32_P4_PLATFORM: MIPI DSI PHY Powered on[0m
+[0;32mI (1793) ESP32_P4_PLATFORM: Install MIPI DSI LCD control panel[0m
+[0;32mI (1798) ESP32_P4_PLATFORM: Install Waveshare LCD control panel[0m
+[0;32mI (1803) jd9365: version: 1.0.6[0m
+[0;32mI (1806) i2c_bus: I2C Bus V2 uses the externally initialized bus handle[0m
+[0;32mI (3066) jd9365: LCD ID: 93 65 04[0m
+[0;32mI (3208) ESP32_P4_PLATFORM: Display initialized[0m
+[0;32mI (3210) esp_lvgl:bridge_v9: Initializing hardware resources[0m
+[0;32mI (3210) esp_lvgl:bridge_v9: Hardware resources initialized successfully[0m
+[0;32mI (3213) ESP32_P4_PLATFORM: Touch 0x5d found[0m
+[0;32mI (3216) GT911: I2C address initialization procedure skipped - using default GT9xx setup[0m
+[0;32mI (3225) GT911: TouchPad_ID:0x39,0x32,0x37[0m
+[0;32mI (3228) GT911: TouchPad_Config_Version:130[0m
+[0;32mI (3232) esp_lvgl:touch: Touch input device registered successfully (IRQ mode: disabled)[0m
+[0;32mI (3240) esp_lvgl:adapter: LVGL task started successfully[0m
+[0;32mI (3241) esp_lvgl:bridge: Initializing hardware resources[0m
+[0;32mI (3250) esp_lvgl:bridge: Hardware resources initialized successfully[0m
+[0;32mI (3261) app_main: SPIFFS mounted: total=45431 used=502[0m
+[0;33mW (3264) app_main: Deleted /spiffs/face.db[0m
+[0;32mI (3265) face_detect_wrapper: HumanFaceDetect initialized[0m
+[0;33mW (3271) FbsLoader: There is only one model in the flatbuffers, ignore the input model name![0m
+[0;33mW (3278) FbsLoader: CONFIG_SPIRAM_RODATA or CONFIG_SPIRAM_XIP_FROM_PSRAM option is on, fbs model is copied to PSRAM.[0m
+[0;33mW (3352) dl::Model: Minimize() will delete variables not used in model inference, which will make it impossible to test or debug the model.[0m
+[0;32mI (3270) face_recognition_wrapper: HumanFaceRecognizer initialized, enrolled=0[0m
+[0;32mI (3361) ov5647: Detected Camera sensor PID=0x5647[0m
+[0;32mI (3393) app_video: version: 0.8.0[0m
+[0;32mI (3393) app_video: driver:  MIPI-CSI[0m
+[0;32mI (3393) app_video: card:    MIPI-CSI[0m
+[0;32mI (3393) app_video: bus:     esp32p4:MIPI-CSI[0m
+[0;32mI (3395) app_video: width=1280 height=960[0m
+[0;32mI (3400) app_main: Using user defined buffer[0m
+[0;32mI (3444) app_video: Video Stream Start[0m
+[0;32mI (3446) main_task: Returned from app_main()[0m
+[0;33mW (3921) FbsLoader: CONFIG_SPIRAM_RODATA or CONFIG_SPIRAM_XIP_FROM_PSRAM option is on, fbs model is copied to PSRAM.[0m
+[0;33mW (3948) dl::Model: Minimize() will delete variables not used in model inference, which will make it impossible to test or debug the model.[0m
+[0;33mW (3951) FbsLoader: CONFIG_SPIRAM_RODATA or CONFIG_SPIRAM_XIP_FROM_PSRAM option is on, fbs model is copied to PSRAM.[0m
+[0;33mW (3971) dl::Model: Minimize() will delete variables not used in model inference, which will make it impossible to test or debug the model.[0m
+[0;32mI (3994) app_main: Detection ran, face_count=0[0m
+[0;32mI (4473) app_main: Detection ran, face_count=0[0m
+[0;32mI (4959) app_main: Detection ran, face_count=0[0m
+[0;32mI (5450) app_main: Detection ran, face_count=1[0m
+[0;32mI (5451) app_main: Face 0 score=0.99 box=[121,122,759,959][0m
+[0;32mI (5451) face_recognition_wrapper: Trying to enroll name=person_1 box=[121,122,759,959] score=0.994 current_total=0[0m
+[0;32mI (5603) face_recognition_wrapper: Enrolled face name=person_1, total=1[0m
+[0;32mI (5603) app_main: Enrolled person_1[0m
+[0;32mI (5731) face_recognition_wrapper: Recognized id=1 similarity=0.970 threshold=0.70[0m
+[0;32mI (5732) app_main: Recognition result: name=id_1 score=0.970[0m
+[0;32mI (6239) app_main: Detection ran, face_count=1[0m
+[0;32mI (6239) app_main: Face 0 score=0.68 box=[237,70,816,866][0m
+[0;32mI (6719) app_main: Detection ran, face_count=0[0m
+[0;32mI (7210) app_main: Detection ran, face_count=1[0m
+[0;32mI (7210) app_main: Face 0 score=1.00 box=[151,33,720,859][0m
+[0;32mI (7696) app_main: Detection ran, face_count=1[0m
+[0;32mI (7696) app_main: Face 0 score=0.99 box=[150,43,710,851][0m
+[0;32mI (7826) face_recognition_wrapper: Recognized id=1 similarity=0.727 threshold=0.70[0m
+[0;32mI (7826) app_main: Recognition result: name=id_1 score=0.727[0m
+[0;32mI (8322) app_main: Detection ran, face_count=1[0m
+[0;32mI (8322) app_main: Face 0 score=0.99 box=[152,33,731,892][0m
+[0;32mI (8808) app_main: Detection ran, face_count=1[0m
+[0;32mI (8808) app_main: Face 0 score=0.99 box=[156,52,728,881][0m
+[0;32mI (9288) app_main: Detection ran, face_count=1[0m
+[0;32mI (9288) app_main: Face 0 score=0.99 box=[154,67,733,876][0m
+[0;32mI (9775) app_main: Detection ran, face_count=0[0m
+[0;32mI (10266) app_main: Detection ran, face_count=1[0m
+[0;32mI (10266) app_main: Face 0 score=0.89 box=[134,74,739,936][0m
+[0;32mI (10747) app_main: Detection ran, face_count=0[0m
+[0;32mI (11238) app_main: Detection ran, face_count=1[0m
+[0;32mI (11239) app_main: Face 0 score=0.83 box=[165,100,730,918][0m
+[0;32mI (11719) app_main: Detection ran, face_count=0[0m
+[0;32mI (12211) app_main: Detection ran, face_count=1[0m
+[0;32mI (12211) app_main: Face 0 score=0.96 box=[173,137,750,913][0m
+[0;32mI (12692) app_main: Detection ran, face_count=0[0m
+[0;32mI (13178) app_main: Detection ran, face_count=1[0m
+[0;32mI (13178) app_main: Face 0 score=0.90 box=[140,93,718,899][0m
+[0;32mI (13643) app_main: Frame count=100[0m
+[0;32mI (13664) app_main: Detection ran, face_count=0[0m
+[0;32mI (14150) app_main: Detection ran, face_count=0[0m
+[0;32mI (14641) app_main: Detection ran, face_count=1[0m
+[0;32mI (14641) app_main: Face 0 score=0.84 box=[127,82,725,917][0m
+[0;32mI (15122) app_main: Detection ran, face_count=0[0m
+[0;32mI (15609) app_main: Detection ran, face_count=0[0m
+[0;32mI (16094) app_main: Detection ran, face_count=0[0m
+[0;32mI (16580) app_main: Detection ran, face_count=0[0m
+[0;32mI (17066) app_main: Detection ran, face_count=0[0m
+[0;32mI (17553) app_main: Detection ran, face_count=0[0m
+[0;32mI (18039) app_main: Detection ran, face_count=0[0m
+[0;32mI (18526) app_main: Detection ran, face_count=0[0m
+[0;32mI (19011) app_main: Detection ran, face_count=0[0m
+[0;32mI (19497) app_main: Detection ran, face_count=0[0m
+[0;32mI (19983) app_main: Detection ran, face_count=0[0m
+[0;32mI (20469) app_main: Detection ran, face_count=0[0m
+[0;32mI (20955) app_main: Detection ran, face_count=0[0m
+[0;32mI (21442) app_main: Detection ran, face_count=0[0m
+[0;32mI (21928) app_main: Detection ran, face_count=0[0m
+[0;32mI (22414) app_main: Detection ran, face_count=0[0m
+[0;32mI (22900) app_main: Detection ran, face_count=0[0m
+[0;32mI (23365) app_main: Frame count=200[0m
+[0;32mI (23386) app_main: Detection ran, face_count=0[0m
+[0;32mI (23872) app_main: Detection ran, face_count=0[0m
+[0;32mI (24358) app_main: Detection ran, face_count=0[0m
+[0;32mI (24844) app_main: Detection ran, face_count=0[0m
+[0;32mI (25331) app_main: Detection ran, face_count=0[0m
+[0;32mI (25817) app_main: Detection ran, face_count=0[0m
+[0;32mI (26303) app_main: Detection ran, face_count=0[0m
+[0;32mI (26789) app_main: Detection ran, face_count=0[0m
+[0;32mI (27275) app_main: Detection ran, face_count=0[0m
+[0;32mI (27761) app_main: Detection ran, face_count=0[0m
+[0;32mI (28248) app_main: Detection ran, face_count=0[0m
+[0;32mI (28734) app_main: Detection ran, face_count=0[0m
+[0;32mI (29220) app_main: Detection ran, face_count=0[0m
+[0;32mI (29706) app_main: Detection ran, face_count=0[0m
+[0;32mI (30192) app_main: Detection ran, face_count=0[0m
+[0;32mI (30678) app_main: Detection ran, face_count=0[0m
+[0;32mI (31164) app_main: Detection ran, face_count=0[0m
+[0;32mI (31650) app_main: Detection ran, face_count=0[0m
+[0;32mI (32137) app_main: Detection ran, face_count=0[0m
+[0;32mI (32622) app_main: Detection ran, face_count=0[0m
+[0;32mI (33088) app_main: Frame count=300[0m
+[0;32mI (33109) app_main: Detection ran, face_count=0[0m
+[0;32mI (33595) app_main: Detection ran, face_count=0[0m
+[0;32mI (34081) app_main: Detection ran, face_count=0[0m
+[0;32mI (34567) app_main: Detection ran, face_count=0[0m
+[0;32mI (35054) app_main: Detection ran, face_count=0[0m
+[0;32mI (35539) app_main: Detection ran, face_count=0[0m
+[0;32mI (36026) app_main: Detection ran, face_count=0[0m
+[0;32mI (36512) app_main: Detection ran, face_count=0[0m
+[0;32mI (36998) app_main: Detection ran, face_count=0[0m
+[0;32mI (37489) app_main: Detection ran, face_count=1[0m
+[0;32mI (37490) app_main: Face 0 score=0.83 box=[246,0,904,758][0m
+[0;32mI (37976) app_main: Detection ran, face_count=1[0m
+[0;32mI (37976) app_main: Face 0 score=0.98 box=[424,101,1076,959][0m
+[0;32mI (38462) app_main: Detection ran, face_count=1[0m
+[0;32mI (38463) app_main: Face 0 score=0.71 box=[352,0,994,797][0m
+[0;32mI (38949) app_main: Detection ran, face_count=1[0m
+[0;32mI (38949) app_main: Face 0 score=0.72 box=[366,0,973,811][0m
+[0;32mI (39078) face_recognition_wrapper: Recognized id=1 similarity=0.701 threshold=0.70[0m
+[0;32mI (39078) app_main: Recognition result: name=id_1 score=0.701[0m
+[0;32mI (39573) app_main: Detection ran, face_count=1[0m
+[0;32mI (39573) app_main: Face 0 score=0.83 box=[359,41,992,895][0m
+[0;32mI (40059) app_main: Detection ran, face_count=1[0m
+[0;32mI (40059) app_main: Face 0 score=0.68 box=[306,82,924,932][0m
+[0;32mI (40546) app_main: Detection ran, face_count=1[0m
+[0;32mI (40546) app_main: Face 0 score=0.89 box=[314,108,948,959][0m
+[0;32mI (41032) app_main: Detection ran, face_count=1[0m
+[0;32mI (41032) app_main: Face 0 score=0.88 box=[308,108,950,959][0m
+[0;32mI (41161) face_recognition_wrapper: Face rejected: id=1 similarity=0.652 threshold=0.70[0m
+[0;32mI (41162) app_main: Recognition result: name=unknown score=0.652[0m
+[0;32mI (41657) app_main: Detection ran, face_count=1[0m
+[0;32mI (41657) app_main: Face 0 score=0.80 box=[334,78,955,902][0m
+[0;32mI (42143) app_main: Detection ran, face_count=1[0m
+[0;32mI (42143) app_main: Face 0 score=0.79 box=[317,104,950,959][0m
+[0;32mI (42630) app_main: Detection ran, face_count=1[0m
+[0;32mI (42630) app_main: Face 0 score=0.75 box=[301,115,935,944][0m
+[0;32mI (43089) app_main: Frame count=400[0m
+[0;32mI (43115) app_main: Detection ran, face_count=1[0m
+[0;32mI (43115) app_main: Face 0 score=0.99 box=[301,117,925,959][0m
+[0;32mI (43245) face_recognition_wrapper: Recognition result: unknown, no database match[0m
+[0;32mI (43245) app_main: Recognition result: name=unknown score=0.000[0m
+[0;32mI (43740) app_main: Detection ran, face_count=1[0m
+[0;32mI (43740) app_main: Face 0 score=0.90 box=[303,119,911,959][0m
+[0;32mI (44227) app_main: Detection ran, face_count=1[0m
+[0;32mI (44227) app_main: Face 0 score=0.95 box=[284,119,923,959][0m
+[0;32mI (44712) app_main: Detection ran, face_count=1[0m
+[0;32mI (44712) app_main: Face 0 score=0.97 box=[300,109,936,959][0m
+[0;32mI (45199) app_main: Detection ran, face_count=1[0m
+[0;32mI (45199) app_main: Face 0 score=0.94 box=[297,99,931,952][0m
+[0;32mI (45328) face_recognition_wrapper: Face rejected: id=1 similarity=0.674 threshold=0.70[0m
+[0;32mI (45328) app_main: Recognition result: name=unknown score=0.674[0m
+[0;32mI (45823) app_main: Detection ran, face_count=1[0m
+[0;32mI (45823) app_main: Face 0 score=0.99 box=[320,126,921,941][0m
+[0;32mI (46310) app_main: Detection ran, face_count=1[0m
+[0;32mI (46310) app_main: Face 0 score=0.98 box=[313,116,948,959][0m
+[0;32mI (46791) app_main: Detection ran, face_count=0[0m
+[0;32mI (47277) app_main: Detection ran, face_count=0[0m
+[0;32mI (47768) app_main: Detection ran, face_count=1[0m
+[0;32mI (47768) app_main: Face 0 score=0.67 box=[315,169,919,959][0m
+[0;32mI (48255) app_main: Detection ran, face_count=1[0m
+[0;32mI (48255) app_main: Face 0 score=0.94 box=[313,65,907,873][0m
+[0;32mI (48740) app_main: Detection ran, face_count=1[0m
+[0;32mI (48741) app_main: Face 0 score=0.72 box=[310,89,917,891][0m
+[0;32mI (49227) app_main: Detection ran, face_count=1[0m
+[0;32mI (49227) app_main: Face 0 score=0.88 box=[377,108,1001,929][0m
+[0;32mI (49356) face_recognition_wrapper: Recognized id=1 similarity=0.768 threshold=0.70[0m
+[0;32mI (49356) app_main: Recognition result: name=id_1 score=0.768[0m
+[0;32mI (49846) app_main: Detection ran, face_count=0[0m
+[0;32mI (50333) app_main: Detection ran, face_count=0[0m
+[0;32mI (50824) app_main: Detection ran, face_count=1[0m
+[0;32mI (50824) app_main: Face 0 score=0.99 box=[361,39,925,794][0m
+[0;32mI (51305) app_main: Detection ran, face_count=0[0m
+[0;32mI (51791) app_main: Detection ran, face_count=0[0m
+[0;32mI (52282) app_main: Detection ran, face_count=1[0m
+[0;32mI (52282) app_main: Face 0 score=0.94 box=[309,133,858,876][0m
+[0;32mI (52769) app_main: Detection ran, face_count=1[0m
+[0;32mI (52769) app_main: Face 0 score=0.87 box=[279,72,884,841][0m
+[0;32mI (53228) app_main: Frame count=500[0m
+[0;32mI (53255) app_main: Detection ran, face_count=1[0m
+[0;32mI (53255) app_main: Face 0 score=0.67 box=[348,132,872,895][0m
+[0;32mI (53385) face_recognition_wrapper: Recognized id=1 similarity=0.829 threshold=0.70[0m
+[0;32mI (53386) app_main: Recognition result: name=id_1 score=0.829[0m
+[0;32mI (53879) app_main: Detection ran, face_count=1[0m
+[0;32mI (53879) app_main: Face 0 score=0.68 box=[316,107,901,898][0m
+[0;32mI (54366) app_main: Detection ran, face_count=1[0m
+[0;32mI (54366) app_main: Face 0 score=0.86 box=[299,119,865,888][0m
+[0;32mI (54852) app_main: Detection ran, face_count=1[0m
+[0;32mI (54852) app_main: Face 0 score=0.84 box=[311,100,901,897][0m
+[0;32mI (55333) app_main: Detection ran, face_count=0[0m
+[0;32mI (55824) app_main: Detection ran, face_count=1[0m
+[0;32mI (55824) app_main: Face 0 score=0.89 box=[339,129,885,901][0m
+[0;32mI (56305) app_main: Detection ran, face_count=0[0m
+[0;32mI (56791) app_main: Detection ran, face_count=0[0m
+[0;32mI (57273) app_main: Detection ran, face_count=0[0m
+[0;32mI (57763) app_main: Detection ran, face_count=0[0m
+[0;32mI (58249) app_main: Detection ran, face_count=0[0m
+[0;32mI (58735) app_main: Detection ran, face_count=0[0m
+[0;32mI (59222) app_main: Detection ran, face_count=0[0m
+[0;32mI (59708) app_main: Detection ran, face_count=0[0m
+[0;32mI (60193) app_main: Detection ran, face_count=0[0m
+[0;32mI (60680) app_main: Detection ran, face_count=0[0m
+[0;32mI (61167) app_main: Detection ran, face_count=0[0m
+[0;32mI (61652) app_main: Detection ran, face_count=0[0m
+[0;32mI (62138) app_main: Detection ran, face_count=0[0m
+[0;32mI (62624) app_main: Detection ran, face_count=0[0m
+[0;32mI (63090) app_main: Frame count=600[0m
+[0;32mI (63111) app_main: Detection ran, face_count=0[0m
+[0;32mI (63597) app_main: Detection ran, face_count=0[0m
+[0;32mI (64083) app_main: Detection ran, face_count=0[0m
+[0;32mI (64569) app_main: Detection ran, face_count=0[0m
+[0;32mI (65055) app_main: Detection ran, face_count=0[0m
+[0;32mI (65541) app_main: Detection ran, face_count=0[0m
+[0;32mI (66028) app_main: Detection ran, face_count=0[0m
+[0;32mI (66513) app_main: Detection ran, face_count=0[0m
+[0;32mI (67000) app_main: Detection ran, face_count=0[0m
+[0;32mI (67486) app_main: Detection ran, face_count=0[0m
+[0;32mI (67972) app_main: Detection ran, face_count=0[0m
+[0;32mI (68458) app_main: Detection ran, face_count=0[0m
+[0;32mI (68944) app_main: Detection ran, face_count=0[0m
+[0;32mI (69430) app_main: Detection ran, face_count=0[0m
+[0;32mI (69917) app_main: Detection ran, face_count=0[0m
+[0;32mI (70402) app_main: Detection ran, face_count=0[0m
+[0;32mI (70889) app_main: Detection ran, face_count=0[0m
+[0;32mI (71375) app_main: Detection ran, face_count=0[0m
+[0;32mI (71861) app_main: Detection ran, face_count=0[0m
+[0;32mI (72347) app_main: Detection ran, face_count=0[0m
+[0;32mI (72812) app_main: Frame count=700[0m
+[0;32mI (72833) app_main: Detection ran, face_count=0[0m
+[0;32mI (73319) app_main: Detection ran, face_count=0[0m
+[0;32mI (73806) app_main: Detection ran, face_count=0[0m
+[0;32mI (74291) app_main: Detection ran, face_count=0[0m
+[0;32mI (74778) app_main: Detection ran, face_count=0[0m
+[0;32mI (75264) app_main: Detection ran, face_count=0[0m
+[0;32mI (75750) app_main: Detection ran, face_count=0[0m
+[0;32mI (76236) app_main: Detection ran, face_count=0[0m
+[0;32mI (76722) app_main: Detection ran, face_count=0[0m
+[0;32mI (77209) app_main: Detection ran, face_count=0[0m
+[0;32mI (77696) app_main: Detection ran, face_count=0[0m
+[0;32mI (78181) app_main: Detection ran, face_count=0[0m
+[0;32mI (78667) app_main: Detection ran, face_count=0[0m
+[0;32mI (79153) app_main: Detection ran, face_count=0[0m
+[0;32mI (79639) app_main: Detection ran, face_count=0[0m
+[0;32mI (80125) app_main: Detection ran, face_count=0[0m
+[0;32mI (80612) app_main: Detection ran, face_count=0[0m
+[0;32mI (81098) app_main: Detection ran, face_count=0[0m
+[0;32mI (81583) app_main: Detection ran, face_count=0[0m
+[0;32mI (82070) app_main: Detection ran, face_count=0[0m
+[0;32mI (82535) app_main: Frame count=800[0m
+[0;32mI (82556) app_main: Detection ran, face_count=0[0m
+[0;32mI (83042) app_main: Detection ran, face_count=0[0m
+[0;32mI (83528) app_main: Detection ran, face_count=0[0m
+[0;32mI (84015) app_main: Detection ran, face_count=0[0m
+[0;32mI (84501) app_main: Detection ran, face_count=0[0m
+[0;32mI (84987) app_main: Detection ran, face_count=0[0m
+[0;32mI (85473) app_main: Detection ran, face_count=0[0m
+[0;32mI (85959) app_main: Detection ran, face_count=0[0m
+[0;32mI (86445) app_main: Detection ran, face_count=0[0m
+[0;32mI (86931) app_main: Detection ran, face_count=0[0m
+[0;32mI (87418) app_main: Detection ran, face_count=0[0m
+[0;32mI (87903) app_main: Detection ran, face_count=0[0m
+[0;32mI (88390) app_main: Detection ran, face_count=0[0m
+[0;32mI (88876) app_main: Detection ran, face_count=0[0m
+[0;32mI (89362) app_main: Detection ran, face_count=0[0m
+[0;32mI (89848) app_main: Detection ran, face_count=0[0m
+[0;32mI (90334) app_main: Detection ran, face_count=0[0m
+[0;32mI (90820) app_main: Detection ran, face_count=0[0m
+[0;32mI (91307) app_main: Detection ran, face_count=0[0m
+[0;32mI (91792) app_main: Detection ran, face_count=0[0m
+[0;32mI (92258) app_main: Frame count=900[0m
+[0;32mI (92279) app_main: Detection ran, face_count=0[0m
+[0;32mI (92765) app_main: Detection ran, face_count=0[0m
+[0;32mI (93251) app_main: Detection ran, face_count=0[0m
+[0;32mI (93737) app_main: Detection ran, face_count=0[0m
+[0;32mI (94224) app_main: Detection ran, face_count=0[0m
+[0;32mI (94709) app_main: Detection ran, face_count=0[0m
+[0;32mI (95196) app_main: Detection ran, face_count=0[0m
+[0;32mI (95682) app_main: Detection ran, face_count=0[0m
+[0;32mI (96168) app_main: Detection ran, face_count=0[0m
+[0;32mI (96654) app_main: Detection ran, face_count=0[0m
+[0;32mI (97140) app_main: Detection ran, face_count=0[0m
+[0;32mI (97626) app_main: Detection ran, face_count=0[0m
+[0;32mI (98113) app_main: Detection ran, face_count=0[0m
+[0;32mI (98598) app_main: Detection ran, face_count=0[0m
+[0;32mI (99085) app_main: Detection ran, face_count=0[0m
+[0;32mI (99571) app_main: Detection ran, face_count=0[0m
+[0;32mI (100057) app_main: Detection ran, face_count=0[0m
+[0;32mI (100544) app_main: Detection ran, face_count=0[0m
+[0;32mI (101029) app_main: Detection ran, face_count=0[0m
+[0;32mI (101516) app_main: Detection ran, face_count=0[0m
+[0;32mI (101981) app_main: Frame count=1000[0m
+[0;32mI (102002) app_main: Detection ran, face_count=0[0m
+[0;32mI (102488) app_main: Detection ran, face_count=0[0m
+[0;32mI (102974) app_main: Detection ran, face_count=0[0m
+[0;32mI (103460) app_main: Detection ran, face_count=0[0m
+[0;32mI (103946) app_main: Detection ran, face_count=0[0m
+[0;32mI (104432) app_main: Detection ran, face_count=0[0m
+[0;32mI (104918) app_main: Detection ran, face_count=0[0m
+[0;32mI (105405) app_main: Detection ran, face_count=0[0m
+[0;32mI (105891) app_main: Detection ran, face_count=0[0m
+[0;32mI (106376) app_main: Detection ran, face_count=0[0m
+[0;32mI (106863) app_main: Detection ran, face_count=0[0m
+[0;32mI (107349) app_main: Detection ran, face_count=0[0m
+[0;32mI (107835) app_main: Detection ran, face_count=0[0m
+[0;32mI (108321) app_main: Detection ran, face_count=0[0m
+[0;32mI (108807) app_main: Detection ran, face_count=0[0m
+[0;32mI (109294) app_main: Detection ran, face_count=0[0m
+[0;32mI (109780) app_main: Detection ran, face_count=0[0m
+[0;32mI (110266) app_main: Detection ran, face_count=0[0m
+[0;32mI (110753) app_main: Detection ran, face_count=0[0m
+[0;32mI (111238) app_main: Detection ran, face_count=0[0m
+[0;32mI (111703) app_main: Frame count=1100[0m
+[0;32mI (111724) app_main: Detection ran, face_count=0[0m
+[0;32mI (112211) app_main: Detection ran, face_count=0[0m
+[0;32mI (112696) app_main: Detection ran, face_count=0[0m
+[0;32mI (113183) app_main: Detection ran, face_count=0[0m
+[0;32mI (113669) app_main: Detection ran, face_count=0[0m
+[0;32mI (114155) app_main: Detection ran, face_count=0[0m
+[0;32mI (114641) app_main: Detection ran, face_count=0[0m
+[0;32mI (115127) app_main: Detection ran, face_count=0[0m
+[0;32mI (115614) app_main: Detection ran, face_count=0[0m
+[0;32mI (116099) app_main: Detection ran, face_count=0[0m
+[0;32mI (116585) app_main: Detection ran, face_count=0[0m
+[0;32mI (117073) app_main: Detection ran, face_count=0[0m
+[0;32mI (117558) app_main: Detection ran, face_count=0[0m
+[0;32mI (118044) app_main: Detection ran, face_count=0[0m
+[0;32mI (118531) app_main: Detection ran, face_count=0[0m
+[0;32mI (119016) app_main: Detection ran, face_count=0[0m
+[0;32mI (119503) app_main: Detection ran, face_count=0[0m
+[0;32mI (119994) app_main: Detection ran, face_count=1[0m
+[0;32mI (119994) app_main: Face 0 score=0.91 box=[243,77,783,831][0m
+[0;32mI (120480) app_main: Detection ran, face_count=1[0m
+[0;32mI (120480) app_main: Face 0 score=0.65 box=[210,82,748,832][0m
+[0;32mI (120968) app_main: Detection ran, face_count=1[0m
+[0;32mI (120968) app_main: Face 0 score=0.59 box=[202,58,757,848][0m
+[0;32mI (121426) app_main: Frame count=1200[0m
+[0;32mI (121453) app_main: Detection ran, face_count=1[0m
+[0;32mI (121453) app_main: Face 0 score=0.56 box=[198,55,738,799][0m
+[0;32mI (121582) face_recognition_wrapper: Face rejected: id=1 similarity=0.658 threshold=0.70[0m
+[0;32mI (121583) app_main: Recognition result: name=unknown score=0.658[0m
+[0;32mI (122078) app_main: Detection ran, face_count=1[0m
+[0;32mI (122078) app_main: Face 0 score=0.67 box=[199,55,748,810][0m
+[0;32mI (122564) app_main: Detection ran, face_count=1[0m
+[0;32mI (122564) app_main: Face 0 score=0.75 box=[244,50,813,783][0m
+[0;32mI (123045) app_main: Detection ran, face_count=0[0m
+[0;32mI (123531) app_main: Detection ran, face_count=0[0m
+[0;32mI (124018) app_main: Detection ran, face_count=0[0m
+[0;32mI (124503) app_main: Detection ran, face_count=0[0m
+[0;32mI (124989) app_main: Detection ran, face_count=0[0m
+[0;32mI (125476) app_main: Detection ran, face_count=0[0m
+[0;32mI (125961) app_main: Detection ran, face_count=0[0m
+[0;32mI (126447) app_main: Detection ran, face_count=0[0m
+[0;32mI (126933) app_main: Detection ran, face_count=0[0m
+[0;32mI (127419) app_main: Detection ran, face_count=0[0m
+[0;32mI (127906) app_main: Detection ran, face_count=0[0m
+[0;32mI (128392) app_main: Detection ran, face_count=0[0m
+[0;32mI (128878) app_main: Detection ran, face_count=0[0m
+[0;32mI (129365) app_main: Detection ran, face_count=0[0m
+[0;32mI (129850) app_main: Detection ran, face_count=0[0m
+[0;32mI (130336) app_main: Detection ran, face_count=0[0m
+[0;32mI (130823) app_main: Detection ran, face_count=0[0m
+[0;32mI (131288) app_main: Frame count=1300[0m
+[0;32mI (131309) app_main: Detection ran, face_count=0[0m
+[0;32mI (131795) app_main: Detection ran, face_count=0[0m
+[0;32mI (132281) app_main: Detection ran, face_count=0[0m
+[0;32mI (132767) app_main: Detection ran, face_count=0[0m
+[0;32mI (133253) app_main: Detection ran, face_count=0[0m
+[0;32mI (133739) app_main: Detection ran, face_count=0[0m
+[0;32mI (134225) app_main: Detection ran, face_count=0[0m
+[0;32mI (134712) app_main: Detection ran, face_count=0[0m
+[0;32mI (135198) app_main: Detection ran, face_count=0[0m
+[0m
