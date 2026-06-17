@@ -89,56 +89,6 @@ extern "C" int face_recognition_get_count(void)
     return s_recognizer->get_num_feats();
 }
 
-extern "C" esp_err_t face_recognition_enroll(
-    uint8_t *camera_buf,
-    uint32_t width,
-    uint32_t height,
-    const face_box_t *box,
-    const char *name)
-{
-    if (!s_recognizer || !camera_buf || !box || !name) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    dl::image::img_t img = {
-        .data = camera_buf,
-        .width = (uint16_t)width,
-        .height = (uint16_t)height,
-#if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
-        .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE,
-#else
-        .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB888,
-#endif
-    };
-
-    std::list<dl::detect::result_t> detect_res = make_detect_result_from_box(box);
-
-    ESP_LOGI(TAG_RECOG,
-             "Trying to enroll name=%s box=[%d,%d,%d,%d] score=%.3f current_total=%d",
-             name,
-             box->x1,
-             box->y1,
-             box->x2,
-             box->y2,
-             box->score,
-             s_recognizer->get_num_feats());
-
-    esp_err_t ret = s_recognizer->enroll(img, detect_res);
-
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG_RECOG,
-                 "Enrolled face name=%s, total=%d",
-                 name,
-                 s_recognizer->get_num_feats());
-    } else {
-        ESP_LOGE(TAG_RECOG,
-                 "Enroll failed for name=%s: %s",
-                 name,
-                 esp_err_to_name(ret));
-    }
-
-    return ret;
-}
 
 extern "C" esp_err_t face_recognition_recognize(
     uint8_t *camera_buf,
