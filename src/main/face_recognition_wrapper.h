@@ -12,13 +12,7 @@ extern "C" {
 
 esp_err_t face_recognition_init(void);
 
-esp_err_t face_recognition_enroll(
-    uint8_t *camera_buf,
-    uint32_t width,
-    uint32_t height,
-    const face_box_t *box,
-    const char *name
-);
+esp_err_t face_recognition_build_db_from_sd(void);
 
 esp_err_t face_recognition_recognize(
     uint8_t *camera_buf,

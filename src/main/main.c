@@ -28,7 +28,7 @@
 
 #include "lvgl.h"
 #include "lv_demos.h"
-
+#define BUILD_FACE_DB_FROM_SD 0
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 static bool enrolled_once = false;
 static bool enrollment_finished_this_boot = false;
@@ -185,7 +185,12 @@ void app_main(void)
     /* END SD CARD TEST */
 
     ESP_ERROR_CHECK(face_detect_init());
-    ESP_ERROR_CHECK(face_recognition_init());
+
+    #if BUILD_FACE_DB_FROM_SD
+        ESP_ERROR_CHECK(face_recognition_build_db_from_sd());
+    #else
+        ESP_ERROR_CHECK(face_recognition_init());
+    #endif
 
 
     ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size));
