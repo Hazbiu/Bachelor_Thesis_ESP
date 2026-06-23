@@ -1,9 +1,9 @@
-#include "face_detect_wrapper.h"
+#include "services/vision/face_detector.h"
 
 #include "esp_log.h"
 #include "human_face_detect.hpp"
+#include "diagnostics/core_trace.h"
 #include "dl_image_define.hpp"
-#include "core_trace.h"
 
 static const char *TAG_FACE = "face_detect_wrapper";
 

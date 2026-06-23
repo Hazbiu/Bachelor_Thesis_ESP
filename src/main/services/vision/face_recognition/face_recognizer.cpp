@@ -1,4 +1,4 @@
-#include "face_recognition_wrapper.h"
+#include "services/vision/face_recognizer.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,9 +14,10 @@
 #include "dl_image_define.hpp"
 #include "dl_detect_define.hpp"
 
-#include "app_video.h"
-#include "face_detect_wrapper.h"
-#include "core_trace.h"
+#include "services/vision/face_recognizer.h"
+#include "platform/camera/video_capture.h"
+#include "services/vision/face_detector.h"
+#include "diagnostics/core_trace.h"
 
 static const char *TAG_RECOG = "face_recognition_wrapper";
 

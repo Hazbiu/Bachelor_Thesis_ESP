@@ -1,8 +1,9 @@
 idf_component_register(
     SRCS
-        "main.c"
-        "app_video.c"
-        "face_detect_wrapper.cpp"
-        "face_recognition_wrapper.cpp"
-    INCLUDE_DIRS "."
+        "app/app_main.c"
+        "app/app_boot.c"
+        "platform/camera/video_capture.c"
+        "services/vision/face_detection/face_detector.cpp"
+        "services/vision/face_recognition/face_recognizer.cpp"
+    INCLUDE_DIRS "include"
 )

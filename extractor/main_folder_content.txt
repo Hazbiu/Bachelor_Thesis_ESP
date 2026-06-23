@@ -1,10 +1,1158 @@
 Main folder export
-Generated on: Tue Jun 23 04:57:03 PM CEST 2026
+Generated on: Tue Jun 23 07:13:06 PM CEST 2026
 Source: /home/hazbiu/Programming/Bachelor_Thesis_ESP/extractor/../src/main
 ==================================================
 
 ==================================================
-FILE: src/main/app_video.c
+FILE: src/main/app/app_boot.c
+==================================================
+#include <stdio.h>
+#include "app/app_boot.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_spiffs.h"
+#include "bsp/esp-bsp.h"
+#include "services/vision/face_detector.h"
+#include "services/vision/face_recognizer.h"
+
+
+#define BUILD_FACE_DB_FROM_SD 0
+static const char *TAG = "app_main";
+
+static esp_err_t mount_spiffs(void)
+{
+     esp_vfs_spiffs_conf_t conf = {
+            .base_path = "/spiffs",
+            .partition_label = "storage",
+            .max_files = 4,
+            .format_if_mount_failed = true,
+        };
+
+        esp_err_t ret = esp_vfs_spiffs_register(&conf);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "SPIFFS mount failed: %s", esp_err_to_name(ret));
+            return ret;
+        }
+
+        size_t total = 0;
+        size_t used = 0;
+        ret = esp_spiffs_info("storage", &total, &used);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "SPIFFS mounted: total=%d used=%d", total, used);
+        } else {
+            ESP_LOGE(TAG, "SPIFFS info failed: %s", esp_err_to_name(ret));
+        }
+
+        return ESP_OK;
+}
+
+void app_boot_initialize_services(void)
+{
+    ESP_ERROR_CHECK(mount_spiffs());
+
+    /* SD CARD TEST */
+    esp_err_t sd_ret = bsp_sdcard_mount();
+    if (sd_ret == ESP_OK) {
+        ESP_LOGI(TAG, "SD card mounted at /sdcard");
+
+        FILE *f = fopen("/sdcard/test.txt", "w");
+        if (f) {
+            fprintf(f, "ESP32-P4 SD card test OK\n");
+            fclose(f);
+            ESP_LOGI(TAG, "Wrote /sdcard/test.txt");
+        } else {
+            ESP_LOGE(TAG, "Failed to open /sdcard/test.txt");
+        }
+    } else {
+        ESP_LOGE(TAG, "SD card mount failed: %s", esp_err_to_name(sd_ret));
+    }
+    /* END SD CARD TEST */
+
+    ESP_ERROR_CHECK(face_detect_init());
+
+#if BUILD_FACE_DB_FROM_SD
+    ESP_ERROR_CHECK(face_recognition_build_db_from_sd());
+#else
+    ESP_ERROR_CHECK(face_recognition_init());
+#endif
+}
+==================================================
+FILE: src/main/app/app_main.c
+==================================================
+#include <inttypes.h>
+#include <stdio.h>
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_video_init.h"
+#include "esp_lcd_mipi_dsi.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_cache.h"
+#include "esp_heap_caps.h"
+#include "esp_private/esp_cache_private.h"
+#include "esp_timer.h"
+#include "driver/ppa.h"
+#include "platform/camera/video_capture.h"
+#include "services/vision/face_detector.h"
+#include "services/vision/face_recognizer.h"
+#include "diagnostics/core_trace.h"
+#include "app/app_boot.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h"
+#include "bsp/display.h"
+#include "bsp/esp-bsp.h"
+#include "lvgl.h"
+#include "lv_demos.h"
+
+#define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
+static bool enrolled_once = false;
+static bool enrollment_finished_this_boot = false;
+
+static int smooth_coord(int old_value, int new_value)
+{
+    return (old_value * 3 + new_value) / 4;
+}
+
+static void draw_rect_rgb565(
+    uint16_t *fb,
+    uint32_t fb_w,
+    uint32_t fb_h,
+    int x1,
+    int y1,
+    int x2,
+    int y2,
+    uint16_t color)
+{
+    if (!fb) {
+        return;
+    }
+
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 < 0) x2 = 0;
+    if (y2 < 0) y2 = 0;
+
+    if (x1 >= (int)fb_w) x1 = fb_w - 1;
+    if (x2 >= (int)fb_w) x2 = fb_w - 1;
+    if (y1 >= (int)fb_h) y1 = fb_h - 1;
+    if (y2 >= (int)fb_h) y2 = fb_h - 1;
+
+    for (int x = x1; x <= x2; x++) {
+        fb[y1 * fb_w + x] = color;
+        fb[y2 * fb_w + x] = color;
+    }
+
+    for (int y = y1; y <= y2; y++) {
+        fb[y * fb_w + x1] = color;
+        fb[y * fb_w + x2] = color;
+    }
+}
+
+static void camera_video_frame_operation(
+    uint8_t *camera_buf,
+    uint8_t camera_buf_index,
+    uint32_t camera_buf_hes,
+    uint32_t camera_buf_ves,
+    size_t camera_buf_len,
+    void *user_data);
+
+static const char *TAG = "app_main";
+
+static esp_lcd_panel_handle_t display_panel;
+static ppa_client_handle_t ppa_srm_handle = NULL;
+static size_t data_cache_line_size = 0;
+static void *lcd_buffer[CONFIG_BSP_LCD_DPI_BUFFER_NUMS];
+static lv_display_t *disp;
+#define FACE_DETECT_INTERVAL 5
+#define MAX_FACE_BOXES 5
+#define FACE_RECOG_INTERVAL 20
+
+static uint32_t frame_count = 0;
+
+static face_box_t last_boxes[MAX_FACE_BOXES];
+static int last_face_count = 0;
+static int no_face_frames = 0;
+
+#define FACE_BOX_HOLD_MISSES 3
+
+i2c_master_bus_handle_t i2c_bus_;
+
+static bool dummy_draw_enabled = true;
+static bool dummy_mode_delay_flag = false;
+
+static void calc_ppa_input_offset(uint32_t src_w, uint32_t src_h,
+                                  uint32_t dst_w, uint32_t dst_h,
+                                  uint32_t *offset_x, uint32_t *offset_y)
+{
+    *offset_x = (src_w > dst_w) ? (src_w - dst_w) / 2 : 0;
+    *offset_y = (src_h > dst_h) ? (src_h - dst_h) / 2 : 0;
+
+    if ((*offset_x + dst_w) > src_w)
+    {
+        *offset_x = 0;
+    }
+    if ((*offset_y + dst_h) > src_h)
+    {
+        *offset_y = 0;
+    }
+}
+
+
+void app_main(void)
+{
+    core_trace(TAG, "APP_MAIN_START");
+    disp = bsp_display_start();
+    bsp_display_backlight_on();
+
+    ESP_ERROR_CHECK(esp_lv_adapter_set_dummy_draw(disp, dummy_draw_enabled));
+
+    display_panel = bsp_display_get_panel_handle();
+
+    ppa_client_config_t ppa_srm_config = {
+        .oper_type = PPA_OPERATION_SRM,
+    };
+    ESP_ERROR_CHECK(ppa_register_client(&ppa_srm_config, &ppa_srm_handle));
+
+    app_boot_initialize_services();
+    
+
+
+
+    ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size));
+
+    i2c_bus_ = bsp_i2c_get_handle();
+
+    esp_err_t ret = app_video_main(i2c_bus_);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "video main init failed with err=0x%x", ret);
+        return;
+    }
+
+    int video_cam_fd0 = app_video_open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, APP_VIDEO_FMT);
+    if (video_cam_fd0 < 0)
+    {
+        ESP_LOGE(TAG, "video cam open failed");
+        return;
+    }
+
+    ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(
+        display_panel, 3,
+        &lcd_buffer[0], &lcd_buffer[1], &lcd_buffer[2]));
+
+    ESP_LOGI(TAG, "Using user defined buffer");
+    void *camera_buf[2];
+    for (int i = 0; i < 2; i++)
+    {
+        camera_buf[i] = heap_caps_aligned_calloc(
+            data_cache_line_size,
+            1,
+            app_video_get_buf_size(),
+            MALLOC_CAP_SPIRAM);
+    }
+    ESP_ERROR_CHECK(app_video_set_bufs(video_cam_fd0, 2, (void *)camera_buf));
+
+    ESP_ERROR_CHECK(app_video_register_frame_operation_cb(camera_video_frame_operation));
+
+    ESP_LOGI(TAG, "[CORE-PROOF] Requesting video stream task on CPU0");
+
+    ESP_ERROR_CHECK(app_video_stream_task_start(video_cam_fd0, 0, NULL));
+
+}
+
+static void camera_video_frame_operation(
+    uint8_t *camera_buf,
+    uint8_t camera_buf_index,
+    uint32_t camera_buf_hes,
+    uint32_t camera_buf_ves,
+    size_t camera_buf_len,
+    void *user_data)
+{
+
+    if (!dummy_draw_enabled || dummy_mode_delay_flag)
+    {
+        return;
+    }
+
+    const uint32_t display_width = BSP_LCD_H_RES;
+    const uint32_t display_height = BSP_LCD_V_RES;
+
+    if (display_height == 0)
+    {
+        ESP_LOGE(TAG, "Display height is zero!");
+        return;
+    }
+
+    uint32_t in_offset_x = 0;
+    uint32_t in_offset_y = 0;
+
+    uint32_t in_block_w = camera_buf_hes;
+    uint32_t in_block_h = camera_buf_ves;
+
+    float scale_x = (float)display_width / (float)camera_buf_hes;
+    float scale_y = (float)display_height / (float)camera_buf_ves;
+
+
+
+    ppa_srm_oper_config_t srm_config = {
+        .in.buffer = camera_buf,
+        .in.pic_w = camera_buf_hes,
+        .in.pic_h = camera_buf_ves,
+        .in.block_w = in_block_w,
+        .in.block_h = in_block_h,
+        .in.block_offset_x = in_offset_x,
+        .in.block_offset_y = in_offset_y,
+        .in.srm_cm = APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? PPA_SRM_COLOR_MODE_RGB565 : PPA_SRM_COLOR_MODE_RGB888,
+
+        .out.buffer = lcd_buffer[camera_buf_index],
+        .out.buffer_size = ALIGN_UP(display_width * display_height *
+                                        (APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? 2 : 3),
+                                    data_cache_line_size),
+        .out.pic_w = display_width,
+        .out.pic_h = display_height,
+        .out.block_offset_x = 0,
+        .out.block_offset_y = 0,
+        .out.srm_cm = APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? PPA_SRM_COLOR_MODE_RGB565 : PPA_SRM_COLOR_MODE_RGB888,
+
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+        .scale_x = scale_x,
+        .scale_y = scale_y,
+        .mirror_x = 0,
+        .mirror_y = 0,
+        .rgb_swap = 0,
+        .byte_swap = 0,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+
+    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "PPA SRM failed: %d", ret);
+        return;
+    }
+
+    frame_count++;
+
+    if ((frame_count % 100) == 0) {
+        ESP_LOGI(TAG,
+                "[CORE-PROOF] MAIN_SW frame=%" PRIu32
+                " cpu=%d task=%s affinity=%d",
+                frame_count,
+                xPortGetCoreID(),
+                pcTaskGetName(NULL),
+                xTaskGetCoreID(xTaskGetCurrentTaskHandle()));
+    }
+    if ((frame_count % FACE_DETECT_INTERVAL) == 0) {
+        face_box_t boxes[MAX_FACE_BOXES];
+
+    #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+        int face_count = face_detect_run_rgb565(
+            camera_buf,
+            camera_buf_hes,
+            camera_buf_ves,
+            boxes,
+            MAX_FACE_BOXES
+        );
+    #else
+        int face_count = face_detect_run_rgb888(
+            camera_buf,
+            camera_buf_hes,
+            camera_buf_ves,
+            boxes,
+            MAX_FACE_BOXES
+        );
+    #endif
+
+        ESP_LOGI(TAG, "Detection ran, face_count=%d", face_count);
+
+        if (face_count > 0) {
+            int update_count = face_count;
+            if (update_count > MAX_FACE_BOXES) {
+                update_count = MAX_FACE_BOXES;
+            }
+
+            for (int i = 0; i < update_count; i++) {
+                if (i < last_face_count) {
+                    last_boxes[i].x1 = smooth_coord(last_boxes[i].x1, boxes[i].x1);
+                    last_boxes[i].y1 = smooth_coord(last_boxes[i].y1, boxes[i].y1);
+                    last_boxes[i].x2 = smooth_coord(last_boxes[i].x2, boxes[i].x2);
+                    last_boxes[i].y2 = smooth_coord(last_boxes[i].y2, boxes[i].y2);
+                    last_boxes[i].score = boxes[i].score;
+                } else {
+                    last_boxes[i] = boxes[i];
+                }
+
+                ESP_LOGI(TAG,
+                        "Face %d score=%.2f box=[%d,%d,%d,%d]",
+                        i,
+                        boxes[i].score,
+                        boxes[i].x1,
+                        boxes[i].y1,
+                        boxes[i].x2,
+                        boxes[i].y2);
+                
+
+                if (i == 0 && boxes[i].score > 0.85f) {
+                    char name[FACE_RECOG_MAX_NAME_LEN];
+                    float recog_score = 0.0f;
+
+                    esp_err_t recog_ret = face_recognition_recognize(
+                        camera_buf,
+                        camera_buf_hes,
+                        camera_buf_ves,
+                        &boxes[i],
+                        name,
+                        sizeof(name),
+                        &recog_score
+                    );
+
+                    if (recog_ret == ESP_OK) {
+                        ESP_LOGI(TAG,
+                                "Recognition result: name=%s score=%.3f",
+                                name,
+                                recog_score);
+                    }
+                }
+            }
+
+            last_face_count = update_count;
+            no_face_frames = 0;
+        } else {
+            no_face_frames++;
+
+            if (no_face_frames >= FACE_BOX_HOLD_MISSES) {
+                last_face_count = 0;
+            }
+        }
+    }
+
+    #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+    for (int i = 0; i < last_face_count; i++) {
+        int lcd_x1 = last_boxes[i].x1 * display_width / camera_buf_hes;
+        int lcd_y1 = last_boxes[i].y1 * display_height / camera_buf_ves;
+        int lcd_x2 = last_boxes[i].x2 * display_width / camera_buf_hes;
+        int lcd_y2 = last_boxes[i].y2 * display_height / camera_buf_ves;
+
+        draw_rect_rgb565(
+            (uint16_t *)lcd_buffer[camera_buf_index],
+            display_width,
+            display_height,
+            lcd_x1,
+            lcd_y1,
+            lcd_x2,
+            lcd_y2,
+            0xF800
+        );
+    }
+    #endif
+    uint32_t draw_w = display_width;
+    uint32_t draw_h = display_height;
+
+    if (dummy_draw_enabled && !dummy_mode_delay_flag)
+    {
+        ret = esp_lv_adapter_dummy_draw_blit(
+            disp,
+            0, 0,
+            draw_w,
+            draw_h,
+            lcd_buffer[camera_buf_index],
+            true);
+
+        if (ret != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Dummy draw blit failed: %d", ret);
+        }
+    }
+}
+==================================================
+FILE: src/main/CMakeLists.txt
+==================================================
+idf_component_register(
+    SRCS
+        "main.c"
+        "app_video.c"
+        "face_detect_wrapper.cpp"
+        "face_recognition_wrapper.cpp"
+    INCLUDE_DIRS "."
+)
+==================================================
+FILE: src/main/features/camera_perview/camera_preview.c
+==================================================
+[Skipped binary/non-text file]
+
+==================================================
+FILE: src/main/idf_component.yml
+==================================================
+dependencies:
+  idf: '>=5.3'
+
+  esp_video:
+    version: 0.8.*
+    public: true
+  waveshare/esp32_p4_platform: '*'
+  espressif/esp-dl: ^3.3.5
+  espressif/human_face_detect: ^0.4.2
+  espressif/human_face_recognition: '*'
+
+==================================================
+FILE: src/main/include/app/app_boot.h
+==================================================
+#pragma once
+
+void app_boot_initialize_services(void);
+==================================================
+FILE: src/main/include/config/app_features.h
+==================================================
+[Skipped binary/non-text file]
+
+==================================================
+FILE: src/main/include/diagnostics/core_trace.h
+==================================================
+#pragma once
+
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+static inline void core_trace(const char *tag, const char *stage)
+{
+    TaskHandle_t task = xTaskGetCurrentTaskHandle();
+
+    ESP_LOGI(tag,
+             "[CORE-PROOF] stage=%s cpu=%d task=%s affinity=%d time_us=%lld",
+             stage,
+             xPortGetCoreID(),                 // actual CPU executing this line
+             pcTaskGetName(task),
+             xTaskGetCoreID(task),             // task's configured affinity
+             (long long)esp_timer_get_time());
+}
+
+==================================================
+FILE: src/main/include/platform/camera/video_capture.h
+==================================================
+/*
+ * SPDX-FileCopyrightText: 2024 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#ifndef APP_VIDEO_H
+#define APP_VIDEO_H
+
+#include "esp_err.h"
+#include "linux/videodev2.h"
+#include "esp_video_device.h"
+#include "bsp/esp-bsp.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+    APP_VIDEO_FMT_RAW8 = V4L2_PIX_FMT_SBGGR8,
+    APP_VIDEO_FMT_RAW10 = V4L2_PIX_FMT_SBGGR10,
+    APP_VIDEO_FMT_GREY = V4L2_PIX_FMT_GREY,
+    APP_VIDEO_FMT_RGB565 = V4L2_PIX_FMT_RGB565,
+    APP_VIDEO_FMT_RGB888 = V4L2_PIX_FMT_RGB24,
+    APP_VIDEO_FMT_YUV422 = V4L2_PIX_FMT_YUV422P,
+    APP_VIDEO_FMT_YUV420 = V4L2_PIX_FMT_YUV420,
+} video_fmt_t;
+
+#if CONFIG_BSP_LCD_COLOR_FORMAT_RGB565
+#define APP_VIDEO_FMT              (APP_VIDEO_FMT_RGB565)
+#elif CONFIG_BSP_LCD_COLOR_FORMAT_RGB888
+#define APP_VIDEO_FMT              (APP_VIDEO_FMT_RGB888)
+#endif
+
+typedef void (*app_video_frame_operation_cb_t)(uint8_t *camera_buf, uint8_t camera_buf_index, uint32_t camera_buf_hes, uint32_t camera_buf_ves, size_t camera_buf_len, void *user_data);
+
+/**
+ * @brief Initialize the video camera.
+ *
+ * Configures SCCB settings for I2C communication. Overrides defaults if an
+ * I2C bus handle is provided, then initializes the camera.
+ *
+ * @param i2c_bus_handle Handle for the I2C bus (can be NULL).
+ * @return ESP_OK on success, or an error code on failure.
+ */
+esp_err_t app_video_main(i2c_master_bus_handle_t i2c_bus_handle);
+
+/**
+ * @brief Opens a specified video capture device and configures its format.
+ *
+ * This function initializes the video capture by opening the device at the given path,
+ * querying its capabilities, and retrieving the current format. If the current pixel format
+ * differs from the specified initial format, it sets the desired format. Additionally, it applies
+ * vertical or horizontal mirroring if enabled in the configuration.
+ *
+ * @param dev The device path of the video capture (e.g., "/dev/video0").
+ * @param init_fmt The desired pixel format for the video capture.
+ * @return Returns the file descriptor for the opened video device on success;
+ *         returns -1 on failure, indicating an error occurred during the operation.
+ */
+int app_video_open(char *dev, video_fmt_t init_fmt);
+
+/**
+ * @brief Set up video capture buffers.
+ *
+ * Configures the video device to use the specified number of buffers for
+ * capturing video frames. Ensures the buffer count is within acceptable limits
+ * and allocates buffers either via memory-mapped I/O or user pointers.
+ * Closes the device on failure.
+ *
+ * @param video_fd File descriptor for the video device.
+ * @param fb_num Number of frame buffers to allocate.
+ * @param fb Array of pointers to user-provided frame buffers (if applicable).
+ * @return ESP_OK on success, or ESP_FAIL on failure.
+ */
+esp_err_t app_video_set_bufs(int video_fd, uint32_t fb_num, const void **fb);
+
+/**
+ * @brief Retrieve video capture buffers.
+ *
+ * Fills the provided array with pointers to the allocated frame buffers for
+ * capturing video frames. Checks that the specified buffer count is within
+ * acceptable limits.
+ *
+ * @param fb_num Number of frame buffers to retrieve.
+ * @param fb Array of pointers to receive the frame buffers.
+ * @return ESP_OK on success, or ESP_FAIL on failure.
+ */
+esp_err_t app_video_get_bufs(int fb_num, void **fb);
+
+/**
+ * @brief Get the size of the video buffer.
+ *
+ * Calculates and returns the size of the video buffer based on the
+ * camera's width, height, and pixel format (RGB565 or RGB888).
+ *
+ * @return Size of the video buffer in bytes.
+ */
+uint32_t app_video_get_buf_size(void);
+
+/**
+ * @brief Start the video stream task.
+ *
+ * Initiates the video streaming by starting the video stream and creating
+ * a FreeRTOS task to handle the streaming process on a specified core.
+ * Stops the video stream if task creation fails.
+ *
+ * @param video_fd File descriptor for the video device.
+ * @param core_id Core ID to which the task will be pinned.
+ * @return ESP_OK on success, or ESP_FAIL on failure.
+ */
+esp_err_t app_video_stream_task_start(int video_fd, int core_id, void *user_data);
+
+/**
+ * @brief Restart the video stream task.
+ *
+ * This function stops the current video stream task and restarts it with the specified
+ * video device file descriptor. It first sets the necessary buffers for the video stream,
+ * then attempts to start the video stream task on the specified core.
+ *
+ * @param video_fd File descriptor for the video device.
+ * @return
+ * - ESP_OK on successful restart of the video stream task.
+ * - ESP_FAIL if there was an error while restarting the task.
+ */
+esp_err_t app_video_stream_task_restart(int video_fd);
+
+/**
+ * @brief Stop the video stream task.
+ *
+ * Deletes the video stream task if it is running and stops the video stream.
+ * Ensures the task handle is reset to NULL after deletion.
+ *
+ * @param video_fd File descriptor for the video device.
+ * @return ESP_OK on success.
+ */
+esp_err_t app_video_stream_task_stop(int video_fd);
+
+/**
+ * @brief Register a callback for frame operations.
+ *
+ * Sets the user-defined callback function to be invoked for frame operations
+ * during video processing.
+ *
+ * @param operation_cb Callback function to register.
+ * @return ESP_OK on success.
+ */
+esp_err_t app_video_register_frame_operation_cb(app_video_frame_operation_cb_t operation_cb);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+==================================================
+FILE: src/main/include/services/vision/face_detector.h
+==================================================
+#pragma once
+
+#include <stdint.h>
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    int x1;
+    int y1;
+    int x2;
+    int y2;
+    float score;
+} face_box_t;
+
+esp_err_t face_detect_init(void);
+
+int face_detect_run_rgb565(
+    uint8_t *buf,
+    uint32_t width,
+    uint32_t height,
+    face_box_t *boxes,
+    int max_boxes
+);
+
+int face_detect_run_rgb888(
+    uint8_t *buf,
+    uint32_t width,
+    uint32_t height,
+    face_box_t *boxes,
+    int max_boxes
+);
+
+#ifdef __cplusplus
+}
+#endif
+==================================================
+FILE: src/main/include/services/vision/face_recognizer.h
+==================================================
+#pragma once
+
+#include <stdint.h>
+#include "esp_err.h"
+#include "face_detector.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define FACE_RECOG_MAX_NAME_LEN 32
+
+esp_err_t face_recognition_init(void);
+
+esp_err_t face_recognition_build_db_from_sd(void);
+
+esp_err_t face_recognition_recognize(
+    uint8_t *camera_buf,
+    uint32_t width,
+    uint32_t height,
+    const face_box_t *box,
+    char *out_name,
+    int out_name_len,
+    float *out_score
+);
+
+int face_recognition_get_count(void);
+
+#ifdef __cplusplus
+}
+#endif
+==================================================
+FILE: src/main/main.c
+==================================================
+#include <inttypes.h>
+#include <stdio.h>
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_video_init.h"
+#include "esp_lcd_mipi_dsi.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_cache.h"
+#include "esp_heap_caps.h"
+#include "esp_private/esp_cache_private.h"
+#include "esp_timer.h"
+#include "driver/ppa.h"
+#include "app_video.h"
+#include "face_detect_wrapper.h"
+#include "face_recognition_wrapper.h"
+#include "esp_spiffs.h"
+#include "core_trace.h"
+#include "app/app_boot.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h"
+#include "bsp/display.h"
+#include "bsp/esp-bsp.h"
+#include "lvgl.h"
+#include "lv_demos.h"
+
+#define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
+static bool enrolled_once = false;
+static bool enrollment_finished_this_boot = false;
+
+static int smooth_coord(int old_value, int new_value)
+{
+    return (old_value * 3 + new_value) / 4;
+}
+
+static void draw_rect_rgb565(
+    uint16_t *fb,
+    uint32_t fb_w,
+    uint32_t fb_h,
+    int x1,
+    int y1,
+    int x2,
+    int y2,
+    uint16_t color)
+{
+    if (!fb) {
+        return;
+    }
+
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 < 0) x2 = 0;
+    if (y2 < 0) y2 = 0;
+
+    if (x1 >= (int)fb_w) x1 = fb_w - 1;
+    if (x2 >= (int)fb_w) x2 = fb_w - 1;
+    if (y1 >= (int)fb_h) y1 = fb_h - 1;
+    if (y2 >= (int)fb_h) y2 = fb_h - 1;
+
+    for (int x = x1; x <= x2; x++) {
+        fb[y1 * fb_w + x] = color;
+        fb[y2 * fb_w + x] = color;
+    }
+
+    for (int y = y1; y <= y2; y++) {
+        fb[y * fb_w + x1] = color;
+        fb[y * fb_w + x2] = color;
+    }
+}
+
+static void camera_video_frame_operation(
+    uint8_t *camera_buf,
+    uint8_t camera_buf_index,
+    uint32_t camera_buf_hes,
+    uint32_t camera_buf_ves,
+    size_t camera_buf_len,
+    void *user_data);
+
+static const char *TAG = "app_main";
+
+static esp_lcd_panel_handle_t display_panel;
+static ppa_client_handle_t ppa_srm_handle = NULL;
+static size_t data_cache_line_size = 0;
+static void *lcd_buffer[CONFIG_BSP_LCD_DPI_BUFFER_NUMS];
+static lv_display_t *disp;
+#define FACE_DETECT_INTERVAL 5
+#define MAX_FACE_BOXES 5
+#define FACE_RECOG_INTERVAL 20
+
+static uint32_t frame_count = 0;
+
+static face_box_t last_boxes[MAX_FACE_BOXES];
+static int last_face_count = 0;
+static int no_face_frames = 0;
+
+#define FACE_BOX_HOLD_MISSES 3
+
+i2c_master_bus_handle_t i2c_bus_;
+
+static bool dummy_draw_enabled = true;
+static bool dummy_mode_delay_flag = false;
+
+static void calc_ppa_input_offset(uint32_t src_w, uint32_t src_h,
+                                  uint32_t dst_w, uint32_t dst_h,
+                                  uint32_t *offset_x, uint32_t *offset_y)
+{
+    *offset_x = (src_w > dst_w) ? (src_w - dst_w) / 2 : 0;
+    *offset_y = (src_h > dst_h) ? (src_h - dst_h) / 2 : 0;
+
+    if ((*offset_x + dst_w) > src_w)
+    {
+        *offset_x = 0;
+    }
+    if ((*offset_y + dst_h) > src_h)
+    {
+        *offset_y = 0;
+    }
+}
+
+
+void app_main(void)
+{
+    core_trace(TAG, "APP_MAIN_START");
+    disp = bsp_display_start();
+    bsp_display_backlight_on();
+
+    ESP_ERROR_CHECK(esp_lv_adapter_set_dummy_draw(disp, dummy_draw_enabled));
+
+    display_panel = bsp_display_get_panel_handle();
+
+    ppa_client_config_t ppa_srm_config = {
+        .oper_type = PPA_OPERATION_SRM,
+    };
+    ESP_ERROR_CHECK(ppa_register_client(&ppa_srm_config, &ppa_srm_handle));
+
+    app_boot_initialize_services();
+    
+
+
+
+    ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size));
+
+    i2c_bus_ = bsp_i2c_get_handle();
+
+    esp_err_t ret = app_video_main(i2c_bus_);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "video main init failed with err=0x%x", ret);
+        return;
+    }
+
+    int video_cam_fd0 = app_video_open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, APP_VIDEO_FMT);
+    if (video_cam_fd0 < 0)
+    {
+        ESP_LOGE(TAG, "video cam open failed");
+        return;
+    }
+
+    ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(
+        display_panel, 3,
+        &lcd_buffer[0], &lcd_buffer[1], &lcd_buffer[2]));
+
+    ESP_LOGI(TAG, "Using user defined buffer");
+    void *camera_buf[2];
+    for (int i = 0; i < 2; i++)
+    {
+        camera_buf[i] = heap_caps_aligned_calloc(
+            data_cache_line_size,
+            1,
+            app_video_get_buf_size(),
+            MALLOC_CAP_SPIRAM);
+    }
+    ESP_ERROR_CHECK(app_video_set_bufs(video_cam_fd0, 2, (void *)camera_buf));
+
+    ESP_ERROR_CHECK(app_video_register_frame_operation_cb(camera_video_frame_operation));
+
+    ESP_LOGI(TAG, "[CORE-PROOF] Requesting video stream task on CPU0");
+
+    ESP_ERROR_CHECK(app_video_stream_task_start(video_cam_fd0, 0, NULL));
+
+}
+
+static void camera_video_frame_operation(
+    uint8_t *camera_buf,
+    uint8_t camera_buf_index,
+    uint32_t camera_buf_hes,
+    uint32_t camera_buf_ves,
+    size_t camera_buf_len,
+    void *user_data)
+{
+
+    if (!dummy_draw_enabled || dummy_mode_delay_flag)
+    {
+        return;
+    }
+
+    const uint32_t display_width = BSP_LCD_H_RES;
+    const uint32_t display_height = BSP_LCD_V_RES;
+
+    if (display_height == 0)
+    {
+        ESP_LOGE(TAG, "Display height is zero!");
+        return;
+    }
+
+    uint32_t in_offset_x = 0;
+    uint32_t in_offset_y = 0;
+
+    uint32_t in_block_w = camera_buf_hes;
+    uint32_t in_block_h = camera_buf_ves;
+
+    float scale_x = (float)display_width / (float)camera_buf_hes;
+    float scale_y = (float)display_height / (float)camera_buf_ves;
+
+
+
+    ppa_srm_oper_config_t srm_config = {
+        .in.buffer = camera_buf,
+        .in.pic_w = camera_buf_hes,
+        .in.pic_h = camera_buf_ves,
+        .in.block_w = in_block_w,
+        .in.block_h = in_block_h,
+        .in.block_offset_x = in_offset_x,
+        .in.block_offset_y = in_offset_y,
+        .in.srm_cm = APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? PPA_SRM_COLOR_MODE_RGB565 : PPA_SRM_COLOR_MODE_RGB888,
+
+        .out.buffer = lcd_buffer[camera_buf_index],
+        .out.buffer_size = ALIGN_UP(display_width * display_height *
+                                        (APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? 2 : 3),
+                                    data_cache_line_size),
+        .out.pic_w = display_width,
+        .out.pic_h = display_height,
+        .out.block_offset_x = 0,
+        .out.block_offset_y = 0,
+        .out.srm_cm = APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? PPA_SRM_COLOR_MODE_RGB565 : PPA_SRM_COLOR_MODE_RGB888,
+
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+        .scale_x = scale_x,
+        .scale_y = scale_y,
+        .mirror_x = 0,
+        .mirror_y = 0,
+        .rgb_swap = 0,
+        .byte_swap = 0,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+
+    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "PPA SRM failed: %d", ret);
+        return;
+    }
+
+    frame_count++;
+
+    if ((frame_count % 100) == 0) {
+        ESP_LOGI(TAG,
+                "[CORE-PROOF] MAIN_SW frame=%" PRIu32
+                " cpu=%d task=%s affinity=%d",
+                frame_count,
+                xPortGetCoreID(),
+                pcTaskGetName(NULL),
+                xTaskGetCoreID(xTaskGetCurrentTaskHandle()));
+    }
+    if ((frame_count % FACE_DETECT_INTERVAL) == 0) {
+        face_box_t boxes[MAX_FACE_BOXES];
+
+    #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+        int face_count = face_detect_run_rgb565(
+            camera_buf,
+            camera_buf_hes,
+            camera_buf_ves,
+            boxes,
+            MAX_FACE_BOXES
+        );
+    #else
+        int face_count = face_detect_run_rgb888(
+            camera_buf,
+            camera_buf_hes,
+            camera_buf_ves,
+            boxes,
+            MAX_FACE_BOXES
+        );
+    #endif
+
+        ESP_LOGI(TAG, "Detection ran, face_count=%d", face_count);
+
+        if (face_count > 0) {
+            int update_count = face_count;
+            if (update_count > MAX_FACE_BOXES) {
+                update_count = MAX_FACE_BOXES;
+            }
+
+            for (int i = 0; i < update_count; i++) {
+                if (i < last_face_count) {
+                    last_boxes[i].x1 = smooth_coord(last_boxes[i].x1, boxes[i].x1);
+                    last_boxes[i].y1 = smooth_coord(last_boxes[i].y1, boxes[i].y1);
+                    last_boxes[i].x2 = smooth_coord(last_boxes[i].x2, boxes[i].x2);
+                    last_boxes[i].y2 = smooth_coord(last_boxes[i].y2, boxes[i].y2);
+                    last_boxes[i].score = boxes[i].score;
+                } else {
+                    last_boxes[i] = boxes[i];
+                }
+
+                ESP_LOGI(TAG,
+                        "Face %d score=%.2f box=[%d,%d,%d,%d]",
+                        i,
+                        boxes[i].score,
+                        boxes[i].x1,
+                        boxes[i].y1,
+                        boxes[i].x2,
+                        boxes[i].y2);
+                
+
+                if (i == 0 && boxes[i].score > 0.85f) {
+                    char name[FACE_RECOG_MAX_NAME_LEN];
+                    float recog_score = 0.0f;
+
+                    esp_err_t recog_ret = face_recognition_recognize(
+                        camera_buf,
+                        camera_buf_hes,
+                        camera_buf_ves,
+                        &boxes[i],
+                        name,
+                        sizeof(name),
+                        &recog_score
+                    );
+
+                    if (recog_ret == ESP_OK) {
+                        ESP_LOGI(TAG,
+                                "Recognition result: name=%s score=%.3f",
+                                name,
+                                recog_score);
+                    }
+                }
+            }
+
+            last_face_count = update_count;
+            no_face_frames = 0;
+        } else {
+            no_face_frames++;
+
+            if (no_face_frames >= FACE_BOX_HOLD_MISSES) {
+                last_face_count = 0;
+            }
+        }
+    }
+
+    #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+    for (int i = 0; i < last_face_count; i++) {
+        int lcd_x1 = last_boxes[i].x1 * display_width / camera_buf_hes;
+        int lcd_y1 = last_boxes[i].y1 * display_height / camera_buf_ves;
+        int lcd_x2 = last_boxes[i].x2 * display_width / camera_buf_hes;
+        int lcd_y2 = last_boxes[i].y2 * display_height / camera_buf_ves;
+
+        draw_rect_rgb565(
+            (uint16_t *)lcd_buffer[camera_buf_index],
+            display_width,
+            display_height,
+            lcd_x1,
+            lcd_y1,
+            lcd_x2,
+            lcd_y2,
+            0xF800
+        );
+    }
+    #endif
+    uint32_t draw_w = display_width;
+    uint32_t draw_h = display_height;
+
+    if (dummy_draw_enabled && !dummy_mode_delay_flag)
+    {
+        ret = esp_lv_adapter_dummy_draw_blit(
+            disp,
+            0, 0,
+            draw_w,
+            draw_h,
+            lcd_buffer[camera_buf_index],
+            true);
+
+        if (ret != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Dummy draw blit failed: %d", ret);
+        }
+    }
+}
+==================================================
+FILE: src/main/platform/camera/camera_runtime.c
+==================================================
+[Skipped binary/non-text file]
+
+==================================================
+FILE: src/main/platform/camera/video_capture.c
 ==================================================
 /*
  * SPDX-FileCopyrightText: 2024 Espressif Systems (Shanghai) CO LTD
@@ -24,7 +1172,7 @@ FILE: src/main/app_video.c
 #include "esp_log.h"
 #include "linux/videodev2.h"
 #include "esp_video_init.h"
-#include "app_video.h"
+#include "video_capture.h"
 
 static const char *TAG = "app_video";
 
@@ -418,199 +1566,24 @@ esp_err_t app_video_register_frame_operation_cb(app_video_frame_operation_cb_t o
 }
 
 ==================================================
-FILE: src/main/app_video.h
+FILE: src/main/platform/display/display_platform.c
 ==================================================
-/*
- * SPDX-FileCopyrightText: 2024 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: Apache-2.0
- */
-#ifndef APP_VIDEO_H
-#define APP_VIDEO_H
-
-#include "esp_err.h"
-#include "linux/videodev2.h"
-#include "esp_video_device.h"
-#include "bsp/esp-bsp.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-typedef enum {
-    APP_VIDEO_FMT_RAW8 = V4L2_PIX_FMT_SBGGR8,
-    APP_VIDEO_FMT_RAW10 = V4L2_PIX_FMT_SBGGR10,
-    APP_VIDEO_FMT_GREY = V4L2_PIX_FMT_GREY,
-    APP_VIDEO_FMT_RGB565 = V4L2_PIX_FMT_RGB565,
-    APP_VIDEO_FMT_RGB888 = V4L2_PIX_FMT_RGB24,
-    APP_VIDEO_FMT_YUV422 = V4L2_PIX_FMT_YUV422P,
-    APP_VIDEO_FMT_YUV420 = V4L2_PIX_FMT_YUV420,
-} video_fmt_t;
-
-#if CONFIG_BSP_LCD_COLOR_FORMAT_RGB565
-#define APP_VIDEO_FMT              (APP_VIDEO_FMT_RGB565)
-#elif CONFIG_BSP_LCD_COLOR_FORMAT_RGB888
-#define APP_VIDEO_FMT              (APP_VIDEO_FMT_RGB888)
-#endif
-
-typedef void (*app_video_frame_operation_cb_t)(uint8_t *camera_buf, uint8_t camera_buf_index, uint32_t camera_buf_hes, uint32_t camera_buf_ves, size_t camera_buf_len, void *user_data);
-
-/**
- * @brief Initialize the video camera.
- *
- * Configures SCCB settings for I2C communication. Overrides defaults if an
- * I2C bus handle is provided, then initializes the camera.
- *
- * @param i2c_bus_handle Handle for the I2C bus (can be NULL).
- * @return ESP_OK on success, or an error code on failure.
- */
-esp_err_t app_video_main(i2c_master_bus_handle_t i2c_bus_handle);
-
-/**
- * @brief Opens a specified video capture device and configures its format.
- *
- * This function initializes the video capture by opening the device at the given path,
- * querying its capabilities, and retrieving the current format. If the current pixel format
- * differs from the specified initial format, it sets the desired format. Additionally, it applies
- * vertical or horizontal mirroring if enabled in the configuration.
- *
- * @param dev The device path of the video capture (e.g., "/dev/video0").
- * @param init_fmt The desired pixel format for the video capture.
- * @return Returns the file descriptor for the opened video device on success;
- *         returns -1 on failure, indicating an error occurred during the operation.
- */
-int app_video_open(char *dev, video_fmt_t init_fmt);
-
-/**
- * @brief Set up video capture buffers.
- *
- * Configures the video device to use the specified number of buffers for
- * capturing video frames. Ensures the buffer count is within acceptable limits
- * and allocates buffers either via memory-mapped I/O or user pointers.
- * Closes the device on failure.
- *
- * @param video_fd File descriptor for the video device.
- * @param fb_num Number of frame buffers to allocate.
- * @param fb Array of pointers to user-provided frame buffers (if applicable).
- * @return ESP_OK on success, or ESP_FAIL on failure.
- */
-esp_err_t app_video_set_bufs(int video_fd, uint32_t fb_num, const void **fb);
-
-/**
- * @brief Retrieve video capture buffers.
- *
- * Fills the provided array with pointers to the allocated frame buffers for
- * capturing video frames. Checks that the specified buffer count is within
- * acceptable limits.
- *
- * @param fb_num Number of frame buffers to retrieve.
- * @param fb Array of pointers to receive the frame buffers.
- * @return ESP_OK on success, or ESP_FAIL on failure.
- */
-esp_err_t app_video_get_bufs(int fb_num, void **fb);
-
-/**
- * @brief Get the size of the video buffer.
- *
- * Calculates and returns the size of the video buffer based on the
- * camera's width, height, and pixel format (RGB565 or RGB888).
- *
- * @return Size of the video buffer in bytes.
- */
-uint32_t app_video_get_buf_size(void);
-
-/**
- * @brief Start the video stream task.
- *
- * Initiates the video streaming by starting the video stream and creating
- * a FreeRTOS task to handle the streaming process on a specified core.
- * Stops the video stream if task creation fails.
- *
- * @param video_fd File descriptor for the video device.
- * @param core_id Core ID to which the task will be pinned.
- * @return ESP_OK on success, or ESP_FAIL on failure.
- */
-esp_err_t app_video_stream_task_start(int video_fd, int core_id, void *user_data);
-
-/**
- * @brief Restart the video stream task.
- *
- * This function stops the current video stream task and restarts it with the specified
- * video device file descriptor. It first sets the necessary buffers for the video stream,
- * then attempts to start the video stream task on the specified core.
- *
- * @param video_fd File descriptor for the video device.
- * @return
- * - ESP_OK on successful restart of the video stream task.
- * - ESP_FAIL if there was an error while restarting the task.
- */
-esp_err_t app_video_stream_task_restart(int video_fd);
-
-/**
- * @brief Stop the video stream task.
- *
- * Deletes the video stream task if it is running and stops the video stream.
- * Ensures the task handle is reset to NULL after deletion.
- *
- * @param video_fd File descriptor for the video device.
- * @return ESP_OK on success.
- */
-esp_err_t app_video_stream_task_stop(int video_fd);
-
-/**
- * @brief Register a callback for frame operations.
- *
- * Sets the user-defined callback function to be invoked for frame operations
- * during video processing.
- *
- * @param operation_cb Callback function to register.
- * @return ESP_OK on success.
- */
-esp_err_t app_video_register_frame_operation_cb(app_video_frame_operation_cb_t operation_cb);
-
-#ifdef __cplusplus
-}
-#endif
-#endif
+[Skipped binary/non-text file]
 
 ==================================================
-FILE: src/main/CMakeLists.txt
+FILE: src/main/platform/storage/sd_card_storage.c
 ==================================================
-idf_component_register(
-    SRCS
-        "main.c"
-        "app_video.c"
-        "face_detect_wrapper.cpp"
-        "face_recognition_wrapper.cpp"
-    INCLUDE_DIRS "."
-)
-==================================================
-FILE: src/main/core_trace.h
-==================================================
-#pragma once
-
-#include "esp_log.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
-static inline void core_trace(const char *tag, const char *stage)
-{
-    TaskHandle_t task = xTaskGetCurrentTaskHandle();
-
-    ESP_LOGI(tag,
-             "[CORE-PROOF] stage=%s cpu=%d task=%s affinity=%d time_us=%lld",
-             stage,
-             xPortGetCoreID(),                 // actual CPU executing this line
-             pcTaskGetName(task),
-             xTaskGetCoreID(task),             // task's configured affinity
-             (long long)esp_timer_get_time());
-}
+[Skipped binary/non-text file]
 
 ==================================================
-FILE: src/main/face_detect_wrapper.cpp
+FILE: src/main/platform/storage/spiffs_storage.c
 ==================================================
-#include "face_detect_wrapper.h"
+[Skipped binary/non-text file]
+
+==================================================
+FILE: src/main/services/vision/face_detaction/face_detector.cpp
+==================================================
+#include "face_detector.h"
 
 #include "esp_log.h"
 #include "human_face_detect.hpp"
@@ -720,48 +1693,7 @@ extern "C" int face_detect_run_rgb888(
 }
 
 ==================================================
-FILE: src/main/face_detect_wrapper.h
-==================================================
-#pragma once
-
-#include <stdint.h>
-#include "esp_err.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-typedef struct {
-    int x1;
-    int y1;
-    int x2;
-    int y2;
-    float score;
-} face_box_t;
-
-esp_err_t face_detect_init(void);
-
-int face_detect_run_rgb565(
-    uint8_t *buf,
-    uint32_t width,
-    uint32_t height,
-    face_box_t *boxes,
-    int max_boxes
-);
-
-int face_detect_run_rgb888(
-    uint8_t *buf,
-    uint32_t width,
-    uint32_t height,
-    face_box_t *boxes,
-    int max_boxes
-);
-
-#ifdef __cplusplus
-}
-#endif
-==================================================
-FILE: src/main/face_recognition_wrapper.cpp
+FILE: src/main/services/vision/face_recognition/face_recognizer.cpp
 ==================================================
 #include "face_recognition_wrapper.h"
 
@@ -779,8 +1711,8 @@ FILE: src/main/face_recognition_wrapper.cpp
 #include "dl_image_define.hpp"
 #include "dl_detect_define.hpp"
 
-#include "app_video.h"
-#include "face_detect_wrapper.h"
+#include "video_capture.h"
+#include "face_detector.h"
 #include "core_trace.h"
 
 static const char *TAG_RECOG = "face_recognition_wrapper";
@@ -1160,498 +2092,4 @@ extern "C" esp_err_t face_recognition_recognize(
              FACE_SIMILARITY_THRESHOLD);
 
     return ESP_OK;
-}
-==================================================
-FILE: src/main/face_recognition_wrapper.h
-==================================================
-#pragma once
-
-#include <stdint.h>
-#include "esp_err.h"
-#include "face_detect_wrapper.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-#define FACE_RECOG_MAX_NAME_LEN 32
-
-esp_err_t face_recognition_init(void);
-
-esp_err_t face_recognition_build_db_from_sd(void);
-
-esp_err_t face_recognition_recognize(
-    uint8_t *camera_buf,
-    uint32_t width,
-    uint32_t height,
-    const face_box_t *box,
-    char *out_name,
-    int out_name_len,
-    float *out_score
-);
-
-int face_recognition_get_count(void);
-
-#ifdef __cplusplus
-}
-#endif
-==================================================
-FILE: src/main/idf_component.yml
-==================================================
-dependencies:
-  idf: '>=5.3'
-
-  esp_video:
-    version: 0.8.*
-    public: true
-  waveshare/esp32_p4_platform: '*'
-  espressif/esp-dl: ^3.3.5
-  espressif/human_face_detect: ^0.4.2
-  espressif/human_face_recognition: '*'
-
-==================================================
-FILE: src/main/main.c
-==================================================
-/*
- * SPDX-FileCopyrightText: 2024 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: CC0-1.0
- */
-#include <inttypes.h>
-#include <stdio.h>
-#include "esp_err.h"
-#include "esp_log.h"
-#include "esp_video_init.h"
-#include "esp_lcd_mipi_dsi.h"
-#include "esp_lcd_panel_ops.h"
-#include "esp_cache.h"
-#include "esp_heap_caps.h"
-#include "esp_private/esp_cache_private.h"
-#include "esp_timer.h"
-#include "driver/ppa.h"
-#include "app_video.h"
-#include "face_detect_wrapper.h"
-#include "face_recognition_wrapper.h"
-#include "esp_spiffs.h"
-#include "core_trace.h"
-
-#include "esp_lcd_panel_io.h"
-#include "esp_lcd_panel_vendor.h"
-
-#include "bsp/display.h"
-#include "bsp/esp-bsp.h"
-
-#include "lvgl.h"
-#include "lv_demos.h"
-#define BUILD_FACE_DB_FROM_SD 0
-#define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
-static bool enrolled_once = false;
-static bool enrollment_finished_this_boot = false;
-
-static int smooth_coord(int old_value, int new_value)
-{
-    return (old_value * 3 + new_value) / 4;
-}
-
-static void draw_rect_rgb565(
-    uint16_t *fb,
-    uint32_t fb_w,
-    uint32_t fb_h,
-    int x1,
-    int y1,
-    int x2,
-    int y2,
-    uint16_t color)
-{
-    if (!fb) {
-        return;
-    }
-
-    if (x1 < 0) x1 = 0;
-    if (y1 < 0) y1 = 0;
-    if (x2 < 0) x2 = 0;
-    if (y2 < 0) y2 = 0;
-
-    if (x1 >= (int)fb_w) x1 = fb_w - 1;
-    if (x2 >= (int)fb_w) x2 = fb_w - 1;
-    if (y1 >= (int)fb_h) y1 = fb_h - 1;
-    if (y2 >= (int)fb_h) y2 = fb_h - 1;
-
-    for (int x = x1; x <= x2; x++) {
-        fb[y1 * fb_w + x] = color;
-        fb[y2 * fb_w + x] = color;
-    }
-
-    for (int y = y1; y <= y2; y++) {
-        fb[y * fb_w + x1] = color;
-        fb[y * fb_w + x2] = color;
-    }
-}
-
-static void camera_video_frame_operation(
-    uint8_t *camera_buf,
-    uint8_t camera_buf_index,
-    uint32_t camera_buf_hes,
-    uint32_t camera_buf_ves,
-    size_t camera_buf_len,
-    void *user_data);
-
-static const char *TAG = "app_main";
-
-static esp_lcd_panel_handle_t display_panel;
-static ppa_client_handle_t ppa_srm_handle = NULL;
-static size_t data_cache_line_size = 0;
-static void *lcd_buffer[CONFIG_BSP_LCD_DPI_BUFFER_NUMS];
-static lv_display_t *disp;
-#define FACE_DETECT_INTERVAL 5
-#define MAX_FACE_BOXES 5
-#define FACE_RECOG_INTERVAL 20
-
-static uint32_t frame_count = 0;
-
-static face_box_t last_boxes[MAX_FACE_BOXES];
-static int last_face_count = 0;
-static int no_face_frames = 0;
-
-#define FACE_BOX_HOLD_MISSES 3
-
-i2c_master_bus_handle_t i2c_bus_;
-
-static bool dummy_draw_enabled = true;
-static bool dummy_mode_delay_flag = false;
-
-static void calc_ppa_input_offset(uint32_t src_w, uint32_t src_h,
-                                  uint32_t dst_w, uint32_t dst_h,
-                                  uint32_t *offset_x, uint32_t *offset_y)
-{
-    *offset_x = (src_w > dst_w) ? (src_w - dst_w) / 2 : 0;
-    *offset_y = (src_h > dst_h) ? (src_h - dst_h) / 2 : 0;
-
-    if ((*offset_x + dst_w) > src_w)
-    {
-        *offset_x = 0;
-    }
-    if ((*offset_y + dst_h) > src_h)
-    {
-        *offset_y = 0;
-    }
-}
-
-static esp_err_t mount_spiffs(void)
-{
-    esp_vfs_spiffs_conf_t conf = {
-        .base_path = "/spiffs",
-        .partition_label = "storage",
-        .max_files = 4,
-        .format_if_mount_failed = true,
-    };
-
-    esp_err_t ret = esp_vfs_spiffs_register(&conf);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "SPIFFS mount failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    size_t total = 0;
-    size_t used = 0;
-    ret = esp_spiffs_info("storage", &total, &used);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "SPIFFS mounted: total=%d used=%d", total, used);
-    } else {
-        ESP_LOGE(TAG, "SPIFFS info failed: %s", esp_err_to_name(ret));
-    }
-
-    return ESP_OK;
-}
-
-void app_main(void)
-{
-    core_trace(TAG, "APP_MAIN_START");
-    disp = bsp_display_start();
-    bsp_display_backlight_on();
-
-    ESP_ERROR_CHECK(esp_lv_adapter_set_dummy_draw(disp, dummy_draw_enabled));
-
-    display_panel = bsp_display_get_panel_handle();
-
-    ppa_client_config_t ppa_srm_config = {
-        .oper_type = PPA_OPERATION_SRM,
-    };
-    ESP_ERROR_CHECK(ppa_register_client(&ppa_srm_config, &ppa_srm_handle));
-
-    ESP_ERROR_CHECK(mount_spiffs());
-    
-
-    /* SD CARD TEST */
-    esp_err_t sd_ret = bsp_sdcard_mount();
-    if (sd_ret == ESP_OK) {
-        ESP_LOGI(TAG, "SD card mounted at /sdcard");
-
-        FILE *f = fopen("/sdcard/test.txt", "w");
-        if (f) {
-            fprintf(f, "ESP32-P4 SD card test OK\n");
-            fclose(f);
-            ESP_LOGI(TAG, "Wrote /sdcard/test.txt");
-        } else {
-            ESP_LOGE(TAG, "Failed to open /sdcard/test.txt");
-        }
-    } else {
-        ESP_LOGE(TAG, "SD card mount failed: %s", esp_err_to_name(sd_ret));
-    }
-    /* END SD CARD TEST */
-
-    ESP_ERROR_CHECK(face_detect_init());
-
-    #if BUILD_FACE_DB_FROM_SD
-        ESP_ERROR_CHECK(face_recognition_build_db_from_sd());
-    #else
-        ESP_ERROR_CHECK(face_recognition_init());
-    #endif
-
-
-    ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size));
-
-    i2c_bus_ = bsp_i2c_get_handle();
-
-    esp_err_t ret = app_video_main(i2c_bus_);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "video main init failed with err=0x%x", ret);
-        return;
-    }
-
-    int video_cam_fd0 = app_video_open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, APP_VIDEO_FMT);
-    if (video_cam_fd0 < 0)
-    {
-        ESP_LOGE(TAG, "video cam open failed");
-        return;
-    }
-
-    ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(
-        display_panel, 3,
-        &lcd_buffer[0], &lcd_buffer[1], &lcd_buffer[2]));
-
-    ESP_LOGI(TAG, "Using user defined buffer");
-    void *camera_buf[2];
-    for (int i = 0; i < 2; i++)
-    {
-        camera_buf[i] = heap_caps_aligned_calloc(
-            data_cache_line_size,
-            1,
-            app_video_get_buf_size(),
-            MALLOC_CAP_SPIRAM);
-    }
-    ESP_ERROR_CHECK(app_video_set_bufs(video_cam_fd0, 2, (void *)camera_buf));
-
-    ESP_ERROR_CHECK(app_video_register_frame_operation_cb(camera_video_frame_operation));
-
-    ESP_LOGI(TAG, "[CORE-PROOF] Requesting video stream task on CPU0");
-
-    ESP_ERROR_CHECK(app_video_stream_task_start(video_cam_fd0, 0, NULL));
-
-}
-
-static void camera_video_frame_operation(
-    uint8_t *camera_buf,
-    uint8_t camera_buf_index,
-    uint32_t camera_buf_hes,
-    uint32_t camera_buf_ves,
-    size_t camera_buf_len,
-    void *user_data)
-{
-
-    if (!dummy_draw_enabled || dummy_mode_delay_flag)
-    {
-        return;
-    }
-
-    const uint32_t display_width = BSP_LCD_H_RES;
-    const uint32_t display_height = BSP_LCD_V_RES;
-
-    if (display_height == 0)
-    {
-        ESP_LOGE(TAG, "Display height is zero!");
-        return;
-    }
-
-    uint32_t in_offset_x = 0;
-    uint32_t in_offset_y = 0;
-
-    uint32_t in_block_w = camera_buf_hes;
-    uint32_t in_block_h = camera_buf_ves;
-
-    float scale_x = (float)display_width / (float)camera_buf_hes;
-    float scale_y = (float)display_height / (float)camera_buf_ves;
-
-
-
-    ppa_srm_oper_config_t srm_config = {
-        .in.buffer = camera_buf,
-        .in.pic_w = camera_buf_hes,
-        .in.pic_h = camera_buf_ves,
-        .in.block_w = in_block_w,
-        .in.block_h = in_block_h,
-        .in.block_offset_x = in_offset_x,
-        .in.block_offset_y = in_offset_y,
-        .in.srm_cm = APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? PPA_SRM_COLOR_MODE_RGB565 : PPA_SRM_COLOR_MODE_RGB888,
-
-        .out.buffer = lcd_buffer[camera_buf_index],
-        .out.buffer_size = ALIGN_UP(display_width * display_height *
-                                        (APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? 2 : 3),
-                                    data_cache_line_size),
-        .out.pic_w = display_width,
-        .out.pic_h = display_height,
-        .out.block_offset_x = 0,
-        .out.block_offset_y = 0,
-        .out.srm_cm = APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? PPA_SRM_COLOR_MODE_RGB565 : PPA_SRM_COLOR_MODE_RGB888,
-
-        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-        .scale_x = scale_x,
-        .scale_y = scale_y,
-        .mirror_x = 0,
-        .mirror_y = 0,
-        .rgb_swap = 0,
-        .byte_swap = 0,
-        .mode = PPA_TRANS_MODE_BLOCKING,
-    };
-
-    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "PPA SRM failed: %d", ret);
-        return;
-    }
-
-    frame_count++;
-
-    if ((frame_count % 100) == 0) {
-        ESP_LOGI(TAG,
-                "[CORE-PROOF] MAIN_SW frame=%" PRIu32
-                " cpu=%d task=%s affinity=%d",
-                frame_count,
-                xPortGetCoreID(),
-                pcTaskGetName(NULL),
-                xTaskGetCoreID(xTaskGetCurrentTaskHandle()));
-    }
-    if ((frame_count % FACE_DETECT_INTERVAL) == 0) {
-        face_box_t boxes[MAX_FACE_BOXES];
-
-    #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
-        int face_count = face_detect_run_rgb565(
-            camera_buf,
-            camera_buf_hes,
-            camera_buf_ves,
-            boxes,
-            MAX_FACE_BOXES
-        );
-    #else
-        int face_count = face_detect_run_rgb888(
-            camera_buf,
-            camera_buf_hes,
-            camera_buf_ves,
-            boxes,
-            MAX_FACE_BOXES
-        );
-    #endif
-
-        ESP_LOGI(TAG, "Detection ran, face_count=%d", face_count);
-
-        if (face_count > 0) {
-            int update_count = face_count;
-            if (update_count > MAX_FACE_BOXES) {
-                update_count = MAX_FACE_BOXES;
-            }
-
-            for (int i = 0; i < update_count; i++) {
-                if (i < last_face_count) {
-                    last_boxes[i].x1 = smooth_coord(last_boxes[i].x1, boxes[i].x1);
-                    last_boxes[i].y1 = smooth_coord(last_boxes[i].y1, boxes[i].y1);
-                    last_boxes[i].x2 = smooth_coord(last_boxes[i].x2, boxes[i].x2);
-                    last_boxes[i].y2 = smooth_coord(last_boxes[i].y2, boxes[i].y2);
-                    last_boxes[i].score = boxes[i].score;
-                } else {
-                    last_boxes[i] = boxes[i];
-                }
-
-                ESP_LOGI(TAG,
-                        "Face %d score=%.2f box=[%d,%d,%d,%d]",
-                        i,
-                        boxes[i].score,
-                        boxes[i].x1,
-                        boxes[i].y1,
-                        boxes[i].x2,
-                        boxes[i].y2);
-                
-
-                if (i == 0 && boxes[i].score > 0.85f) {
-                    char name[FACE_RECOG_MAX_NAME_LEN];
-                    float recog_score = 0.0f;
-
-                    esp_err_t recog_ret = face_recognition_recognize(
-                        camera_buf,
-                        camera_buf_hes,
-                        camera_buf_ves,
-                        &boxes[i],
-                        name,
-                        sizeof(name),
-                        &recog_score
-                    );
-
-                    if (recog_ret == ESP_OK) {
-                        ESP_LOGI(TAG,
-                                "Recognition result: name=%s score=%.3f",
-                                name,
-                                recog_score);
-                    }
-                }
-            }
-
-            last_face_count = update_count;
-            no_face_frames = 0;
-        } else {
-            no_face_frames++;
-
-            if (no_face_frames >= FACE_BOX_HOLD_MISSES) {
-                last_face_count = 0;
-            }
-        }
-    }
-
-    #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
-    for (int i = 0; i < last_face_count; i++) {
-        int lcd_x1 = last_boxes[i].x1 * display_width / camera_buf_hes;
-        int lcd_y1 = last_boxes[i].y1 * display_height / camera_buf_ves;
-        int lcd_x2 = last_boxes[i].x2 * display_width / camera_buf_hes;
-        int lcd_y2 = last_boxes[i].y2 * display_height / camera_buf_ves;
-
-        draw_rect_rgb565(
-            (uint16_t *)lcd_buffer[camera_buf_index],
-            display_width,
-            display_height,
-            lcd_x1,
-            lcd_y1,
-            lcd_x2,
-            lcd_y2,
-            0xF800
-        );
-    }
-    #endif
-    uint32_t draw_w = display_width;
-    uint32_t draw_h = display_height;
-
-    if (dummy_draw_enabled && !dummy_mode_delay_flag)
-    {
-        ret = esp_lv_adapter_dummy_draw_blit(
-            disp,
-            0, 0,
-            draw_w,
-            draw_h,
-            lcd_buffer[camera_buf_index],
-            true);
-
-        if (ret != ESP_OK)
-        {
-            ESP_LOGE(TAG, "Dummy draw blit failed: %d", ret);
-        }
-    }
 }

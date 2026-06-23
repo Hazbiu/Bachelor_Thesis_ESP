@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 #include "esp_err.h"
-#include "face_detect_wrapper.h"
+#include "services/vision/face_detector.h"
 
 #ifdef __cplusplus
 extern "C" {

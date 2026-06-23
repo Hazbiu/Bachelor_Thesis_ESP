@@ -16,7 +16,7 @@
 #include "esp_log.h"
 #include "linux/videodev2.h"
 #include "esp_video_init.h"
-#include "app_video.h"
+#include "platform/camera/video_capture.h"
 
 static const char *TAG = "app_video";
 
