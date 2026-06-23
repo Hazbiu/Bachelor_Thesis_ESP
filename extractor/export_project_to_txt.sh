@@ -1,35 +1,48 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-OUT="project_content_without_managed_components.txt"
+# Folder where this script is located
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# Remove old output file
+# Target folder: ../src/main relative to extractor/
+TARGET_DIR="$SCRIPT_DIR/../src/main"
+
+# Output file beside this script
+OUT="$SCRIPT_DIR/main_folder_content.txt"
+
+# Check target exists
+if [[ ! -d "$TARGET_DIR" ]]; then
+    echo "Error: Target folder not found: $TARGET_DIR"
+    exit 1
+fi
+
+# Remove old export
 rm -f "$OUT"
 
-echo "Project export without managed_components" > "$OUT"
-echo "Generated on: $(date)" >> "$OUT"
-echo "Root: $(pwd)" >> "$OUT"
-echo "==================================================" >> "$OUT"
-echo "" >> "$OUT"
+{
+    echo "Main folder export"
+    echo "Generated on: $(date)"
+    echo "Source: $TARGET_DIR"
+    echo "=================================================="
+} > "$OUT"
 
-find . \
-  -path "./managed_components" -prune -o \
-  -path "./build" -prune -o \
-  -path "./.git" -prune -o \
-  -path "./dependencies.lock" -prune -o \
-  -type f \
-  -print | sort | while read -r file; do
+# Export every file in src/main, including its relative path
+while IFS= read -r -d '' file; do
+    relative_path="${file#$TARGET_DIR/}"
 
-    echo "" >> "$OUT"
-    echo "==================================================" >> "$OUT"
-    echo "FILE: $file" >> "$OUT"
-    echo "==================================================" >> "$OUT"
+    {
+        echo
+        echo "=================================================="
+        echo "FILE: src/main/$relative_path"
+        echo "=================================================="
+    } >> "$OUT"
 
-    if file "$file" | grep -q "text"; then
-        cat "$file" >> "$OUT"
+    # Include text files; mark binaries instead of dumping them
+    if grep -Iq . "$file"; then
+        cat -- "$file" >> "$OUT"
     else
         echo "[Skipped binary/non-text file]" >> "$OUT"
     fi
-
-done
+done < <(find "$TARGET_DIR" -type f -print0 | sort -z)
 
 echo "Done. Created: $OUT"
