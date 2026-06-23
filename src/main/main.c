@@ -19,6 +19,7 @@
 #include "face_detect_wrapper.h"
 #include "face_recognition_wrapper.h"
 #include "esp_spiffs.h"
+#include "core_trace.h"
 
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -151,6 +152,7 @@ static esp_err_t mount_spiffs(void)
 
 void app_main(void)
 {
+    core_trace(TAG, "APP_MAIN_START");
     disp = bsp_display_start();
     bsp_display_backlight_on();
 
@@ -228,6 +230,8 @@ void app_main(void)
     ESP_ERROR_CHECK(app_video_set_bufs(video_cam_fd0, 2, (void *)camera_buf));
 
     ESP_ERROR_CHECK(app_video_register_frame_operation_cb(camera_video_frame_operation));
+
+    ESP_LOGI(TAG, "[CORE-PROOF] Requesting video stream task on CPU0");
 
     ESP_ERROR_CHECK(app_video_stream_task_start(video_cam_fd0, 0, NULL));
 
@@ -307,9 +311,14 @@ static void camera_video_frame_operation(
     frame_count++;
 
     if ((frame_count % 100) == 0) {
-        ESP_LOGI(TAG, "Frame count=%" PRIu32, frame_count);
+        ESP_LOGI(TAG,
+                "[CORE-PROOF] MAIN_SW frame=%" PRIu32
+                " cpu=%d task=%s affinity=%d",
+                frame_count,
+                xPortGetCoreID(),
+                pcTaskGetName(NULL),
+                xTaskGetCoreID(xTaskGetCurrentTaskHandle()));
     }
-
     if ((frame_count % FACE_DETECT_INTERVAL) == 0) {
         face_box_t boxes[MAX_FACE_BOXES];
 
@@ -360,7 +369,7 @@ static void camera_video_frame_operation(
                         boxes[i].y2);
                 
 
-                if ((frame_count % FACE_RECOG_INTERVAL) == 0 && i == 0) {
+                if (i == 0 && boxes[i].score > 0.85f) {
                     char name[FACE_RECOG_MAX_NAME_LEN];
                     float recog_score = 0.0f;
 

@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "human_face_detect.hpp"
 #include "dl_image_define.hpp"
+#include "core_trace.h"
 
 static const char *TAG_FACE = "face_detect_wrapper";
 
@@ -43,7 +44,15 @@ static int face_detect_run_common(
         .pix_type = pix_type,
     };
 
+    core_trace(TAG_FACE, "DETECT_BEGIN");
+    int64_t start_us = esp_timer_get_time();
+
     auto &results = s_face_detect->run(img);
+
+    ESP_LOGI(TAG_FACE,
+            "[CORE-PROOF] DETECT_END cpu=%d duration_us=%lld",
+            xPortGetCoreID(),
+            (long long)(esp_timer_get_time() - start_us));
 
     int count = 0;
 

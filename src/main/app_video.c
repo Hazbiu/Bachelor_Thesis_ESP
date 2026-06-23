@@ -325,6 +325,10 @@ errout:
 
 static void video_stream_task(void *arg)
 {
+    ESP_LOGI(TAG,
+         "[CORE-PROOF] Video task running: actual_cpu=%d task=%s",
+         xPortGetCoreID(),
+         pcTaskGetName(NULL));
     int video_fd = *((int *)arg);
 
     while (1) {
@@ -350,6 +354,9 @@ esp_err_t app_video_stream_task_start(int video_fd, int core_id, void *user_data
     app_camera_video.video_fd = video_fd;
 
     video_stream_start(video_fd);
+    ESP_LOGI(TAG,
+         "[CORE-PROOF] Creating video stream task: requested_core=%d",
+         core_id);
 
     BaseType_t result = xTaskCreatePinnedToCore(
         video_stream_task,

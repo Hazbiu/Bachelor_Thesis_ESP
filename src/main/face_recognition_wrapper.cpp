@@ -16,6 +16,7 @@
 
 #include "app_video.h"
 #include "face_detect_wrapper.h"
+#include "core_trace.h"
 
 static const char *TAG_RECOG = "face_recognition_wrapper";
 
@@ -32,7 +33,7 @@ static HumanFaceRecognizer *s_recognizer = nullptr;
  *
  * Good test values: 0.65, 0.70, 0.75
  */
-#define FACE_SIMILARITY_THRESHOLD 0.70f
+#define FACE_SIMILARITY_THRESHOLD 0.55f
 
 /*
  * SD-card image build settings.
@@ -343,8 +344,16 @@ extern "C" esp_err_t face_recognition_recognize(
 
     std::list<dl::detect::result_t> detect_res = make_detect_result_from_box(box);
 
+    core_trace(TAG_RECOG, "RECOGNITION_BEGIN");
+    int64_t start_us = esp_timer_get_time();
+
     std::vector<dl::recognition::result_t> results =
         s_recognizer->recognize(img, detect_res);
+
+    ESP_LOGI(TAG_RECOG,
+            "[CORE-PROOF] RECOGNITION_END cpu=%d duration_us=%lld",
+            xPortGetCoreID(),
+            (long long)(esp_timer_get_time() - start_us));
 
     if (results.empty()) {
         strncpy(out_name, "unknown", out_name_len - 1);
