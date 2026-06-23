@@ -1,5 +1,5 @@
 Project export without managed_components
-Generated on: Tue Jun 23 11:01:30 AM CEST 2026
+Generated on: Tue Jun 23 04:48:57 PM CEST 2026
 Root: /home/hazbiu/Programming/Bachelor_Thesis_ESP/src
 ==================================================
 
@@ -29489,6 +29489,716 @@ FILE: ./components/espressif__esp_cam_sensor/test_apps/xclk_generator/sdkconfig.
 CONFIG_CAMERA_XCLK_USE_LEDC=y
 CONFIG_CAMERA_XCLK_USE_ESP_CLOCK=y
 ==================================================
+FILE: ./cpu_proof.log
+==================================================
+Executing action: all (aliases: build)
+Running ninja in directory /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build
+Executing "ninja all"...
+[1/4] cd /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/esp-idf/esptool_py && /home/hazbiu/.espressif/tools/python/v5.5.4/venv/bin/python /home/hazbiu/.espressif/v5.5.4/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/partition_table/partition-table.bin /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/video_lcd_display.bin
+video_lcd_display.bin binary size 0x4762d0 bytes. Smallest app partition is 0xf00000 bytes. 0xa89d30 bytes (70%) free.
+[2/4] Performing build step for 'bootloader'
+[1/1] cd /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/bootloader/esp-idf/esptool_py && /home/hazbiu/.espressif/tools/python/v5.5.4/venv/bin/python /home/hazbiu/.espressif/v5.5.4/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x2000 /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/bootloader/bootloader.bin
+Bootloader binary size 0x5d90 bytes. 0x270 bytes (3%) free.
+[3/4] No install step for 'bootloader'
+[4/4] Completed 'bootloader'
+Executing action: flash
+Serial port /dev/ttyS9
+/dev/ttyS9 failed to connect: Could not open /dev/ttyS9, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS8
+/dev/ttyS8 failed to connect: Could not open /dev/ttyS8, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS7
+/dev/ttyS7 failed to connect: Could not open /dev/ttyS7, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS6
+/dev/ttyS6 failed to connect: Could not open /dev/ttyS6, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS5
+/dev/ttyS5 failed to connect: Could not open /dev/ttyS5, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS4
+Connecting.......................
+/dev/ttyS4 failed to connect: Failed to connect to Espressif device: No serial data received.
+For troubleshooting steps visit: https://docs.espressif.com/projects/esptool/en/latest/troubleshooting.html
+Serial port /dev/ttyS31
+/dev/ttyS31 failed to connect: Could not open /dev/ttyS31, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS30
+/dev/ttyS30 failed to connect: Could not open /dev/ttyS30, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS3
+/dev/ttyS3 failed to connect: Could not open /dev/ttyS3, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS29
+/dev/ttyS29 failed to connect: Could not open /dev/ttyS29, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS28
+/dev/ttyS28 failed to connect: Could not open /dev/ttyS28, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS27
+/dev/ttyS27 failed to connect: Could not open /dev/ttyS27, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS26
+/dev/ttyS26 failed to connect: Could not open /dev/ttyS26, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS25
+/dev/ttyS25 failed to connect: Could not open /dev/ttyS25, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS24
+/dev/ttyS24 failed to connect: Could not open /dev/ttyS24, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS23
+/dev/ttyS23 failed to connect: Could not open /dev/ttyS23, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS22
+/dev/ttyS22 failed to connect: Could not open /dev/ttyS22, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS21
+/dev/ttyS21 failed to connect: Could not open /dev/ttyS21, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS20
+/dev/ttyS20 failed to connect: Could not open /dev/ttyS20, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS2
+/dev/ttyS2 failed to connect: Could not open /dev/ttyS2, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS19
+/dev/ttyS19 failed to connect: Could not open /dev/ttyS19, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS18
+/dev/ttyS18 failed to connect: Could not open /dev/ttyS18, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS17
+/dev/ttyS17 failed to connect: Could not open /dev/ttyS17, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS16
+/dev/ttyS16 failed to connect: Could not open /dev/ttyS16, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS15
+/dev/ttyS15 failed to connect: Could not open /dev/ttyS15, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS14
+/dev/ttyS14 failed to connect: Could not open /dev/ttyS14, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS13
+/dev/ttyS13 failed to connect: Could not open /dev/ttyS13, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS12
+/dev/ttyS12 failed to connect: Could not open /dev/ttyS12, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS11
+/dev/ttyS11 failed to connect: Could not open /dev/ttyS11, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS10
+/dev/ttyS10 failed to connect: Could not open /dev/ttyS10, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS1
+/dev/ttyS1 failed to connect: Could not open /dev/ttyS1, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyS0
+/dev/ttyS0 failed to connect: Could not open /dev/ttyS0, the port is busy or doesn't exist.
+(Could not configure port: (5, 'Input/output error'))
+
+Serial port /dev/ttyACM0
+Connecting....
+Detecting chip type... ESP32-P4
+Running ninja in directory /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build
+Executing "ninja flash"...
+[1/5] cd /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/esp-idf/esptool_py && /home/hazbiu/.espressif/tools/python/v5.5.4/venv/bin/python /home/hazbiu/.espressif/v5.5.4/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/partition_table/partition-table.bin /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/video_lcd_display.bin
+video_lcd_display.bin binary size 0x4762d0 bytes. Smallest app partition is 0xf00000 bytes. 0xa89d30 bytes (70%) free.
+[2/5] Performing build step for 'bootloader'
+[1/1] cd /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/bootloader/esp-idf/esptool_py && /home/hazbiu/.espressif/tools/python/v5.5.4/venv/bin/python /home/hazbiu/.espressif/v5.5.4/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x2000 /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/bootloader/bootloader.bin
+Bootloader binary size 0x5d90 bytes. 0x270 bytes (3%) free.
+[3/5] No install step for 'bootloader'
+[4/5] Completed 'bootloader'
+[4/5] cd /home/hazbiu/.espressif/v5.5.4/esp-idf/components/esptool_py && /usr/bin/cmake -D IDF_PATH=/home/hazbiu/.espressif/v5.5.4/esp-idf -D "SERIAL_TOOL=/home/hazbiu/.espressif/tools/python/v5.5.4/venv/bin/python;;/home/hazbiu/.espressif/v5.5.4/esp-idf/components/esptool_py/esptool/esptool.py;--chip;esp32p4" -D "SERIAL_TOOL_ARGS=--before=default_reset;--after=hard_reset;write_flash;@flash_args" -D WORKING_DIRECTORY=/home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build -P /home/hazbiu/.espressif/v5.5.4/esp-idf/components/esptool_py/run_serial_tool.cmake
+esptool.py --chip esp32p4 -p /dev/ttyACM0 -b 460800 --before=default_reset --after=hard_reset write_flash --flash_mode dio --flash_freq 80m --flash_size 16MB 0x2000 bootloader/bootloader.bin 0x20000 video_lcd_display.bin 0x8000 partition_table/partition-table.bin
+esptool.py v4.12.dev2
+Serial port /dev/ttyACM0
+Connecting....
+Chip is ESP32-P4 (revision v1.3)
+Features: High-Performance MCU
+Crystal is 40MHz
+MAC: 80:f1:b2:d2:da:71
+Uploading stub...
+Running stub...
+Stub running...
+Changing baud rate to 460800
+Changed.
+Configuring flash size...
+Flash will be erased from 0x00002000 to 0x00007fff...
+Flash will be erased from 0x00020000 to 0x00496fff...
+Flash will be erased from 0x00008000 to 0x00008fff...
+SHA digest in image updated
+Compressed 23952 bytes to 14841...
+Writing at 0x00002000... (100 %)
+Wrote 23952 bytes (14841 compressed) at 0x00002000 in 0.7 seconds (effective 280.4 kbit/s)...
+Hash of data verified.
+Compressed 4678352 bytes to 2366952...
+Writing at 0x00020000... (0 %)
+Writing at 0x0002f182... (1 %)
+Writing at 0x0003dc67... (2 %)
+Writing at 0x00045b0d... (2 %)
+Writing at 0x0004a8de... (3 %)
+Writing at 0x0004f6e1... (4 %)
+Writing at 0x000543b8... (4 %)
+Writing at 0x00059495... (5 %)
+Writing at 0x0005e41c... (6 %)
+Writing at 0x00062e0f... (6 %)
+Writing at 0x00067a7c... (7 %)
+Writing at 0x0006cbd1... (8 %)
+Writing at 0x0007201a... (8 %)
+Writing at 0x000774f8... (9 %)
+Writing at 0x0007c722... (10 %)
+Writing at 0x00082065... (11 %)
+Writing at 0x00087257... (11 %)
+Writing at 0x0008c2bc... (12 %)
+Writing at 0x0009129c... (13 %)
+Writing at 0x000964cc... (13 %)
+Writing at 0x0009b62f... (14 %)
+Writing at 0x000a0919... (15 %)
+Writing at 0x000a5c21... (15 %)
+Writing at 0x000aa95d... (16 %)
+Writing at 0x000afaad... (17 %)
+Writing at 0x000b5023... (17 %)
+Writing at 0x000ba706... (18 %)
+Writing at 0x000c021c... (19 %)
+Writing at 0x000c5cb7... (20 %)
+Writing at 0x000cab19... (20 %)
+Writing at 0x000cf470... (21 %)
+Writing at 0x000d4e4f... (22 %)
+Writing at 0x000d9e61... (22 %)
+Writing at 0x000df580... (23 %)
+Writing at 0x000e51ce... (24 %)
+Writing at 0x000ea9b0... (24 %)
+Writing at 0x000efa88... (25 %)
+Writing at 0x000f51d1... (26 %)
+Writing at 0x000fb019... (26 %)
+Writing at 0x00100307... (27 %)
+Writing at 0x00104fac... (28 %)
+Writing at 0x0010a9ab... (28 %)
+Writing at 0x001102c2... (29 %)
+Writing at 0x00114f76... (30 %)
+Writing at 0x00119e74... (31 %)
+Writing at 0x0011ed56... (31 %)
+Writing at 0x00123ffd... (32 %)
+Writing at 0x0012931f... (33 %)
+Writing at 0x0012e613... (33 %)
+Writing at 0x00133904... (34 %)
+Writing at 0x00138c0f... (35 %)
+Writing at 0x0013df0a... (35 %)
+Writing at 0x00143214... (36 %)
+Writing at 0x0014852c... (37 %)
+Writing at 0x0014d828... (37 %)
+Writing at 0x00152ad5... (38 %)
+Writing at 0x00157dec... (39 %)
+Writing at 0x0015d09c... (40 %)
+Writing at 0x001627b7... (40 %)
+Writing at 0x00167e6b... (41 %)
+Writing at 0x0016d38f... (42 %)
+Writing at 0x001727fd... (42 %)
+Writing at 0x0017c352... (43 %)
+Writing at 0x001840a1... (44 %)
+Writing at 0x0018967c... (44 %)
+Writing at 0x0018f0b8... (45 %)
+Writing at 0x001953b6... (46 %)
+Writing at 0x0019b511... (46 %)
+Writing at 0x001a384d... (47 %)
+Writing at 0x001ae8e5... (48 %)
+Writing at 0x001b6ee6... (48 %)
+Writing at 0x001bd47a... (49 %)
+Writing at 0x001c309c... (50 %)
+Writing at 0x001c9774... (51 %)
+Writing at 0x001d03c7... (51 %)
+Writing at 0x001d7a27... (52 %)
+Writing at 0x001dfdb5... (53 %)
+Writing at 0x001e710e... (53 %)
+Writing at 0x001ee8c7... (54 %)
+Writing at 0x001f91c9... (55 %)
+Writing at 0x0020047c... (55 %)
+Writing at 0x002063ff... (56 %)
+Writing at 0x0020d4b9... (57 %)
+Writing at 0x00215d96... (57 %)
+Writing at 0x0021c993... (58 %)
+Writing at 0x002231b6... (59 %)
+Writing at 0x002290c6... (60 %)
+Writing at 0x0023189b... (60 %)
+Writing at 0x002380b7... (61 %)
+Writing at 0x00242daf... (62 %)
+Writing at 0x0024bde5... (62 %)
+Writing at 0x00251a5e... (63 %)
+Writing at 0x00257e66... (64 %)
+Writing at 0x0025ef76... (64 %)
+Writing at 0x00267af6... (65 %)
+Writing at 0x0026f690... (66 %)
+Writing at 0x00277059... (66 %)
+Writing at 0x00282ab6... (67 %)
+Writing at 0x00295050... (68 %)
+Writing at 0x0029dac4... (68 %)
+Writing at 0x002a6db6... (69 %)
+Writing at 0x002af513... (70 %)
+Writing at 0x002bbf6f... (71 %)
+Writing at 0x002c2a80... (71 %)
+Writing at 0x002cba9a... (72 %)
+Writing at 0x002d9d4c... (73 %)
+Writing at 0x002e29e9... (73 %)
+Writing at 0x002ec896... (74 %)
+Writing at 0x002f3c80... (75 %)
+Writing at 0x002fe7e8... (75 %)
+Writing at 0x00306682... (76 %)
+Writing at 0x0030fe9c... (77 %)
+Writing at 0x00320ae0... (77 %)
+Writing at 0x0032c55b... (78 %)
+Writing at 0x0033c86e... (79 %)
+Writing at 0x003463a0... (80 %)
+Writing at 0x0038092d... (80 %)
+Writing at 0x003eabbb... (81 %)
+Writing at 0x003f3eb9... (82 %)
+Writing at 0x003f982d... (82 %)
+Writing at 0x003ff884... (83 %)
+Writing at 0x0040568b... (84 %)
+Writing at 0x0040b9b1... (84 %)
+Writing at 0x004110d5... (85 %)
+Writing at 0x00416d63... (86 %)
+Writing at 0x0041c2a6... (86 %)
+Writing at 0x00421813... (87 %)
+Writing at 0x00426f4b... (88 %)
+Writing at 0x0042dbed... (88 %)
+Writing at 0x004331e4... (89 %)
+Writing at 0x00438645... (90 %)
+Writing at 0x0043e28e... (91 %)
+Writing at 0x00444314... (91 %)
+Writing at 0x00449fe9... (92 %)
+Writing at 0x0044f919... (93 %)
+Writing at 0x0045633a... (93 %)
+Writing at 0x0045ceaa... (94 %)
+Writing at 0x00463bf0... (95 %)
+Writing at 0x00469c90... (95 %)
+Writing at 0x0046fa37... (96 %)
+Writing at 0x00477685... (97 %)
+Writing at 0x0047e197... (97 %)
+Writing at 0x0048478e... (98 %)
+Writing at 0x0048abe5... (99 %)
+Writing at 0x00490e4f... (100 %)
+Wrote 4678352 bytes (2366952 compressed) at 0x00020000 in 55.7 seconds (effective 672.3 kbit/s)...
+Hash of data verified.
+Compressed 3072 bytes to 122...
+Writing at 0x00008000... (100 %)
+Wrote 3072 bytes (122 compressed) at 0x00008000 in 0.1 seconds (effective 457.1 kbit/s)...
+Hash of data verified.
+
+Leaving...
+Hard resetting via RTS pin...
+Executing action: monitor
+Running idf_monitor in directory /home/hazbiu/Programming/Bachelor_Thesis_ESP/src
+Executing "/home/hazbiu/.espressif/tools/python/v5.5.4/venv/bin/python /home/hazbiu/.espressif/v5.5.4/esp-idf/tools/idf_monitor.py -p /dev/ttyACM0 -b 115200 --toolchain-prefix riscv32-esp-elf- --target esp32p4 --revision 1 --decode-panic backtrace /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/video_lcd_display.elf /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/build/bootloader/bootloader.elf -m '/home/hazbiu/.espressif/tools/python/v5.5.4/venv/bin/python' '/home/hazbiu/.espressif/v5.5.4/esp-idf/tools/idf.py'"...
+ESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0x1 (POWERON),boot:0x30f (SPI_FAST_FLASH_BOOT)
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x173c
+load:0x4ff29ed0,len:0xff0
+load:0x4ff2cbd0,len:0x3608
+entry 0x4ff29eda
+[0;32mI (26) boot: ESP-IDF v5.5.4 2nd stage bootloader[0m
+[0;32mI (26) boot: compile time Jun 17 2026 19:42:39[0m
+[0;32mI (26) boot: Multicore bootloader[0m
+[0;32mI (28) boot: chip revision: v1.3[0m
+[0;32mI (29) boot: efuse block revision: v0.3[0m
+[0;32mI (32) qio_mode: Enabling default flash chip QIO[0m
+[0;32mI (37) boot.esp32p4: SPI Speed      : 80MHz[0m
+[0;32mI (41) boot.esp32p4: SPI Mode       : QIO[0m
+[0;32mI (44) boot.esp32p4: SPI Flash Size : 16MB[0m
+[0;32mI (48) boot: Enabling RNG early entropy source...[0m
+[0;32mI (53) boot: Partition Table:[0m
+[0;32mI (55) boot: ## Label            Usage          Type ST Offset   Length[0m
+[0;32mI (62) boot:  0 nvs              WiFi data        01 02 0000b000 00006000[0m
+[0;32mI (68) boot:  1 phy_init         RF data          01 01 00011000 00001000[0m
+[0;32mI (75) boot:  2 storage          Unknown data     01 82 00012000 0000e000[0m
+[0;32mI (81) boot:  3 factory          factory app      00 00 00020000 00f00000[0m
+[0;32mI (89) boot: End of partition table[0m
+[0;32mI (91) esp_image: segment 0: paddr=00020020 vaddr=482d0020 size=198cd4h (1674452) map[0m
+[0;32mI (335) esp_image: segment 1: paddr=001b8cfc vaddr=30100000 size=00068h (   104) load[0m
+[0;32mI (337) esp_image: segment 2: paddr=001b8d6c vaddr=4ff00000 size=072ach ( 29356) load[0m
+[0;32mI (345) esp_image: segment 3: paddr=001c0020 vaddr=48000020 size=2c28e0h (2894048) map[0m
+[0;32mI (755) esp_image: segment 4: paddr=00482908 vaddr=4ff072ac size=0f5d0h ( 62928) load[0m
+[0;32mI (767) esp_image: segment 5: paddr=00491ee0 vaddr=4ff16880 size=043cch ( 17356) load[0m
+[0;32mI (777) boot: Loaded app from partition at offset 0x20000[0m
+[0;32mI (777) boot: Disabling RNG early entropy source...[0m
+[0;32mI (788) hex_psram: vendor id    : 0x0d (AP)[0m
+[0;32mI (788) hex_psram: Latency      : 0x01 (Fixed)[0m
+[0;32mI (788) hex_psram: DriveStr.    : 0x00 (25 Ohm)[0m
+[0;32mI (789) hex_psram: dev id       : 0x03 (generation 4)[0m
+[0;32mI (794) hex_psram: density      : 0x07 (256 Mbit)[0m
+[0;32mI (798) hex_psram: good-die     : 0x06 (Pass)[0m
+[0;32mI (802) hex_psram: SRF          : 0x02 (Slow Refresh)[0m
+[0;32mI (807) hex_psram: BurstType    : 0x00 ( Wrap)[0m
+[0;32mI (811) hex_psram: BurstLen     : 0x03 (2048 Byte)[0m
+[0;32mI (816) hex_psram: BitMode      : 0x01 (X16 Mode)[0m
+[0;32mI (820) hex_psram: Readlatency  : 0x04 (14 cycles@Fixed)[0m
+[0;32mI (825) hex_psram: DriveStrength: 0x00 (1/1)[0m
+[0;32mI (829) MSPI Timing: Enter psram timing tuning[0m
+I esp_psram: Found 32MB PSRAM device
+I esp_psram: Speed: 200MHz
+[0;32mI (1082) mmu_psram: .rodata xip on psram[0m
+[0;32mI (1221) mmu_psram: .text xip on psram[0m
+[0;32mI (1221) hex_psram: psram CS IO is dedicated[0m
+[0;32mI (1221) cpu_start: Multicore app[0m
+[0;32mI (1632) esp_psram: SPI SRAM memory test OK[0m
+[0;32mI (1641) cpu_start: GPIO 38 and 37 are used as console UART I/O pins[0m
+[0;32mI (1641) cpu_start: Pro cpu start user code[0m
+[0;32mI (1641) cpu_start: cpu freq: 360000000 Hz[0m
+[0;32mI (1643) app_init: Application information:[0m
+[0;32mI (1647) app_init: Project name:     video_lcd_display[0m
+[0;32mI (1652) app_init: App version:      64c9fae-dirty[0m
+[0;32mI (1657) app_init: Compile time:     Jun 17 2026 21:28:38[0m
+[0;32mI (1662) app_init: ELF file SHA256:  eb1d3151d...[0m
+[0;32mI (1666) app_init: ESP-IDF:          v5.5.4[0m
+[0;32mI (1670) efuse_init: Min chip rev:     v0.1[0m
+[0;32mI (1674) efuse_init: Max chip rev:     v1.99 [0m
+[0;32mI (1678) efuse_init: Chip rev:         v1.3[0m
+[0;32mI (1682) heap_init: Initializing. RAM available for dynamic allocation:[0m
+[0;32mI (1688) heap_init: At 4FF1CFE0 len 0001DFE0 (119 KiB): RETENT_RAM[0m
+[0;32mI (1694) heap_init: At 4FF3AFC0 len 00004BF0 (18 KiB): RAM[0m
+[0;32mI (1699) heap_init: At 4FF40000 len 00040000 (256 KiB): RAM[0m
+[0;32mI (1705) heap_init: At 50108080 len 00007F80 (31 KiB): RTCRAM[0m
+[0;32mI (1710) heap_init: At 30100068 len 00001F98 (7 KiB): TCM[0m
+[0;32mI (1715) esp_psram: Adding pool of 28224K of PSRAM memory to heap allocator[0m
+[0;32mI (1722) esp_psram: Adding pool of 53K of PSRAM memory gap generated due to end address alignment of irom to the heap allocator[0m
+[0;32mI (1733) esp_psram: Adding pool of 28K of PSRAM memory gap generated due to end address alignment of drom to the heap allocator[0m
+[0;32mI (1745) spi_flash: detected chip: gd[0m
+[0;32mI (1748) spi_flash: flash io: qio[0m
+[0;32mI (1751) sleep_gpio: Configure to isolate all GPIO pins in sleep state[0m
+[0;32mI (1757) sleep_gpio: Enable automatic switching of GPIO sleep configuration[0m
+[0;32mI (1764) main_task: Started on CPU0[0m
+[0;32mI (1768) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations[0m
+[0;32mI (1775) main_task: Calling app_main()[0m
+[0;32mI (1778) app_main: [CORE-PROOF] stage=APP_MAIN_START cpu=0 task=main affinity=0 time_us=63099[0m
+[0;32mI (1787) esp_lvgl:adapter: LVGL adapter initialized successfully[0m
+[0;33mW (1792) i2c.master: Please check pull-up resistances whether be connected properly. Otherwise unexpected behavior would happen. For more detailed information, please read docs[0m
+[0;32mI (1808) ESP32_P4_PLATFORM: MIPI DSI PHY Powered on[0m
+[0;32mI (1813) ESP32_P4_PLATFORM: Install MIPI DSI LCD control panel[0m
+[0;32mI (1818) ESP32_P4_PLATFORM: Install Waveshare LCD control panel[0m
+[0;32mI (1824) jd9365: version: 1.0.6[0m
+[0;32mI (1826) i2c_bus: I2C Bus V2 uses the externally initialized bus handle[0m
+[0;32mI (3086) jd9365: LCD ID: 93 65 04[0m
+[0;32mI (3228) ESP32_P4_PLATFORM: Display initialized[0m
+[0;32mI (3230) esp_lvgl:bridge_v9: Initializing hardware resources[0m
+[0;32mI (3230) esp_lvgl:bridge_v9: Hardware resources initialized successfully[0m
+[0;32mI (3233) ESP32_P4_PLATFORM: Touch 0x5d found[0m
+[0;32mI (3236) GT911: I2C address initialization procedure skipped - using default GT9xx setup[0m
+[0;32mI (3245) GT911: TouchPad_ID:0x39,0x32,0x37[0m
+[0;32mI (3248) GT911: TouchPad_Config_Version:130[0m
+[0;32mI (3252) esp_lvgl:touch: Touch input device registered successfully (IRQ mode: disabled)[0m
+[0;32mI (3260) esp_lvgl:adapter: LVGL task started successfully[0m
+[0;32mI (3261) esp_lvgl:bridge: Initializing hardware resources[0m
+[0;32mI (3270) esp_lvgl:bridge: Hardware resources initialized successfully[0m
+[0;32mI (3281) app_main: SPIFFS mounted: total=45431 used=502[0m
+[0;33mW (3281) ldo: The voltage value 0 is out of the recommended range [500, 2700][0m
+[0;32mI (3559) app_main: SD card mounted at /sdcard[0m
+[0;32mI (3570) app_main: Wrote /sdcard/test.txt[0m
+[0;32mI (3570) face_detect_wrapper: HumanFaceDetect initialized[0m
+[0;33mW (3570) FbsLoader: There is only one model in the flatbuffers, ignore the input model name![0m
+[0;33mW (3576) FbsLoader: CONFIG_SPIRAM_RODATA or CONFIG_SPIRAM_XIP_FROM_PSRAM option is on, fbs model is copied to PSRAM.[0m
+[0;33mW (3650) dl::Model: Minimize() will delete variables not used in model inference, which will make it impossible to test or debug the model.[0m
+[0;32mI (3570) face_recognition_wrapper: HumanFaceRecognizer initialized from /sdcard/face.db, enrolled=2[0m
+[0;32mI (3661) ov5647: Detected Camera sensor PID=0x5647[0m
+[0;32mI (3693) app_video: version: 0.8.0[0m
+[0;32mI (3693) app_video: driver:  MIPI-CSI[0m
+[0;32mI (3693) app_video: card:    MIPI-CSI[0m
+[0;32mI (3693) app_video: bus:     esp32p4:MIPI-CSI[0m
+[0;32mI (3696) app_video: width=1280 height=960[0m
+[0;32mI (3700) app_main: Using user defined buffer[0m
+[0;32mI (3745) app_main: [CORE-PROOF] Requesting video stream task on CPU0[0m
+[0;32mI (3745) app_video: Video Stream Start[0m
+[0;32mI (3746) app_video: [CORE-PROOF] Creating video stream task: requested_core=0[0m
+[0;32mI (3750) app_video: [CORE-PROOF] Video task running: actual_cpu=0 task=video stream ta[0m
+[0;32mI (3758) main_task: Returned from app_main()[0m
+[0;32mI (4220) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=2504834[0m
+[0;33mW (4221) FbsLoader: CONFIG_SPIRAM_RODATA or CONFIG_SPIRAM_XIP_FROM_PSRAM option is on, fbs model is copied to PSRAM.[0m
+[0;33mW (4257) dl::Model: Minimize() will delete variables not used in model inference, which will make it impossible to test or debug the model.[0m
+[0;33mW (4260) FbsLoader: CONFIG_SPIRAM_RODATA or CONFIG_SPIRAM_XIP_FROM_PSRAM option is on, fbs model is copied to PSRAM.[0m
+[0;33mW (4280) dl::Model: Minimize() will delete variables not used in model inference, which will make it impossible to test or debug the model.[0m
+[0;32mI (4303) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=82767[0m
+[0;32mI (4303) app_main: Detection ran, face_count=0[0m
+[0;32mI (4776) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=3060519[0m
+[0;32mI (4797) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20838[0m
+[0;32mI (4797) app_main: Detection ran, face_count=0[0m
+[0;32mI (5262) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=3546931[0m
+[0;32mI (5283) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20958[0m
+[0;32mI (5283) app_main: Detection ran, face_count=0[0m
+[0;32mI (5748) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=4032619[0m
+[0;32mI (5769) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20945[0m
+[0;32mI (5769) app_main: Detection ran, face_count=0[0m
+[0;32mI (6234) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=4518784[0m
+[0;32mI (6256) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21611[0m
+[0;32mI (6256) app_main: Detection ran, face_count=0[0m
+[0;32mI (6721) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=5005273[0m
+[0;32mI (6741) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20565[0m
+[0;32mI (6741) app_main: Detection ran, face_count=0[0m
+[0;32mI (7206) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=5491099[0m
+[0;32mI (7227) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20822[0m
+[0;32mI (7227) app_main: Detection ran, face_count=0[0m
+[0;32mI (7692) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=5977206[0m
+[0;32mI (7714) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21034[0m
+[0;32mI (7714) app_main: Detection ran, face_count=0[0m
+[0;32mI (8179) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=6463736[0m
+[0;32mI (8200) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20659[0m
+[0;32mI (8200) app_main: Detection ran, face_count=0[0m
+[0;32mI (8665) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=6949554[0m
+[0;32mI (8686) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21129[0m
+[0;32mI (8686) app_main: Detection ran, face_count=0[0m
+[0;32mI (9151) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=7436055[0m
+[0;32mI (9172) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20725[0m
+[0;32mI (9172) app_main: Detection ran, face_count=0[0m
+[0;32mI (9637) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=7921746[0m
+[0;32mI (9658) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20870[0m
+[0;32mI (9658) app_main: Detection ran, face_count=0[0m
+[0;32mI (10123) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=8407833[0m
+[0;32mI (10145) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21936[0m
+[0;32mI (10145) app_main: Detection ran, face_count=0[0m
+[0;32mI (10610) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=8894371[0m
+[0;32mI (10630) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20568[0m
+[0;32mI (10630) app_main: Detection ran, face_count=0[0m
+[0;32mI (11095) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=9380162[0m
+[0;32mI (11117) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21208[0m
+[0;32mI (11117) app_main: Detection ran, face_count=0[0m
+[0;32mI (11582) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=9866508[0m
+[0;32mI (11603) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20857[0m
+[0;32mI (11603) app_main: Detection ran, face_count=0[0m
+[0;32mI (12068) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=10352566[0m
+[0;32mI (12089) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21150[0m
+[0;32mI (12089) app_main: Detection ran, face_count=0[0m
+[0;32mI (12554) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=10838575[0m
+[0;32mI (12575) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20943[0m
+[0;32mI (12575) app_main: Detection ran, face_count=0[0m
+[0;32mI (13040) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=11325090[0m
+[0;32mI (13061) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20622[0m
+[0;32mI (13061) app_main: Detection ran, face_count=0[0m
+[0;32mI (13526) app_main: [CORE-PROOF] MAIN_SW frame=100 cpu=0 task=video stream ta affinity=0[0m
+[0;32mI (13526) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=11810931[0m
+[0;32mI (13554) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20735[0m
+[0;32mI (13554) app_main: Detection ran, face_count=0[0m
+[0;32mI (14012) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=12296994[0m
+[0;32mI (14034) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21195[0m
+[0;32mI (14034) app_main: Detection ran, face_count=0[0m
+[0;32mI (14499) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=12783547[0m
+[0;32mI (14520) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20893[0m
+[0;32mI (14520) app_main: Detection ran, face_count=0[0m
+[0;32mI (14985) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=13269335[0m
+[0;32mI (15006) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20839[0m
+[0;32mI (15006) app_main: Detection ran, face_count=0[0m
+[0;32mI (15471) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=13755867[0m
+[0;32mI (15492) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20749[0m
+[0;32mI (15492) app_main: Detection ran, face_count=0[0m
+[0;32mI (15957) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=14241496[0m
+[0;32mI (15978) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21184[0m
+[0;32mI (15978) app_main: Detection ran, face_count=0[0m
+[0;32mI (16443) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=14727690[0m
+[0;32mI (16464) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20913[0m
+[0;32mI (16464) app_main: Detection ran, face_count=0[0m
+[0;32mI (16929) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=15214153[0m
+[0;32mI (16950) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20963[0m
+[0;32mI (16951) app_main: Detection ran, face_count=0[0m
+[0;32mI (17415) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=15699910[0m
+[0;32mI (17436) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20889[0m
+[0;32mI (17436) app_main: Detection ran, face_count=0[0m
+[0;32mI (17901) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=16186130[0m
+[0;32mI (17922) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20812[0m
+[0;32mI (17922) app_main: Detection ran, face_count=0[0m
+[0;32mI (18388) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=16672615[0m
+[0;32mI (18409) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20982[0m
+[0;32mI (18409) app_main: Detection ran, face_count=0[0m
+[0;32mI (18874) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=17158343[0m
+[0;32mI (18895) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20872[0m
+[0;32mI (18895) app_main: Detection ran, face_count=0[0m
+[0;32mI (19360) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=17644881[0m
+[0;32mI (19381) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21046[0m
+[0;32mI (19381) app_main: Detection ran, face_count=0[0m
+[0;32mI (19846) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=18130584[0m
+[0;32mI (19867) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20901[0m
+[0;32mI (19867) app_main: Detection ran, face_count=0[0m
+[0;32mI (20332) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=18616794[0m
+[0;32mI (20353) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21295[0m
+[0;32mI (20354) app_main: Detection ran, face_count=0[0m
+[0;32mI (20819) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=19103276[0m
+[0;32mI (20839) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20777[0m
+[0;32mI (20840) app_main: Detection ran, face_count=0[0m
+[0;32mI (21304) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=19589117[0m
+[0;32mI (21325) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20846[0m
+[0;32mI (21325) app_main: Detection ran, face_count=0[0m
+[0;32mI (21790) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=20075150[0m
+[0;32mI (21812) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21186[0m
+[0;32mI (21812) app_main: Detection ran, face_count=0[0m
+[0;32mI (22277) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=20561681[0m
+[0;32mI (22298) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20627[0m
+[0;32mI (22298) app_main: Detection ran, face_count=0[0m
+[0;32mI (22763) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=21047559[0m
+[0;32mI (22784) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20819[0m
+[0;32mI (22784) app_main: Detection ran, face_count=0[0m
+[0;32mI (23249) app_main: [CORE-PROOF] MAIN_SW frame=200 cpu=0 task=video stream ta affinity=0[0m
+[0;32mI (23249) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=21534127[0m
+[0;32mI (23277) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20537[0m
+[0;32mI (23277) app_main: Detection ran, face_count=0[0m
+[0;32mI (23735) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=22019757[0m
+[0;32mI (23756) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20963[0m
+[0;32mI (23756) app_main: Detection ran, face_count=0[0m
+[0;32mI (24221) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=22505873[0m
+[0;32mI (24243) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=22019[0m
+[0;32mI (24243) app_main: Detection ran, face_count=0[0m
+[0;32mI (24708) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=22992413[0m
+[0;32mI (24728) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20577[0m
+[0;32mI (24728) app_main: Detection ran, face_count=0[0m
+[0;32mI (25193) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=23478174[0m
+[0;32mI (25214) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20808[0m
+[0;32mI (25214) app_main: Detection ran, face_count=0[0m
+[0;32mI (25680) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=23964487[0m
+[0;32mI (25701) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20970[0m
+[0;32mI (25701) app_main: Detection ran, face_count=0[0m
+[0;32mI (26166) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=24450567[0m
+[0;32mI (26187) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20758[0m
+[0;32mI (26187) app_main: Detection ran, face_count=0[0m
+[0;32mI (26652) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=24936598[0m
+[0;32mI (26673) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21210[0m
+[0;32mI (26673) app_main: Detection ran, face_count=0[0m
+[0;32mI (27138) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=25423059[0m
+[0;32mI (27159) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20642[0m
+[0;32mI (27159) app_main: Detection ran, face_count=0[0m
+[0;32mI (27624) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=25908808[0m
+[0;32mI (27645) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21204[0m
+[0;32mI (27645) app_main: Detection ran, face_count=0[0m
+[0;32mI (28110) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=26394940[0m
+[0;32mI (28131) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21185[0m
+[0;32mI (28132) app_main: Detection ran, face_count=0[0m
+[0;32mI (28597) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=26881473[0m
+[0;32mI (28617) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20511[0m
+[0;32mI (28617) app_main: Detection ran, face_count=0[0m
+[0;32mI (29083) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=27367272[0m
+[0;32mI (29104) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21121[0m
+[0;32mI (29104) app_main: Detection ran, face_count=0[0m
+[0;32mI (29569) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=27853762[0m
+[0;32mI (29590) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20894[0m
+[0;32mI (29590) app_main: Detection ran, face_count=0[0m
+[0;32mI (30055) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=28339561[0m
+[0;32mI (30081) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=26309[0m
+[0;32mI (30081) app_main: Detection ran, face_count=1[0m
+[0;32mI (30081) app_main: Face 0 score=1.00 box=[537,132,1190,959][0m
+[0;32mI (30087) face_recognition_wrapper: [CORE-PROOF] stage=RECOGNITION_BEGIN cpu=0 task=video stream ta affinity=0 time_us=28371566[0m
+[0;32mI (30226) face_recognition_wrapper: [CORE-PROOF] RECOGNITION_END cpu=0 duration_us=128388[0m
+[0;32mI (30226) face_recognition_wrapper: Face rejected: id=1 similarity=0.524 threshold=0.55[0m
+[0;32mI (30231) app_main: Recognition result: name=unknown score=0.524[0m
+[0;32mI (30703) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=28987860[0m
+[0;32mI (30730) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=26608[0m
+[0;32mI (30730) app_main: Detection ran, face_count=1[0m
+[0;32mI (30730) app_main: Face 0 score=1.00 box=[243,0,898,902][0m
+[0;32mI (30735) face_recognition_wrapper: [CORE-PROOF] stage=RECOGNITION_BEGIN cpu=0 task=video stream ta affinity=0 time_us=29019949[0m
+[0;32mI (30876) face_recognition_wrapper: [CORE-PROOF] RECOGNITION_END cpu=0 duration_us=130134[0m
+[0;32mI (30877) face_recognition_wrapper: Face rejected: id=1 similarity=0.547 threshold=0.55[0m
+[0;32mI (30881) app_main: Recognition result: name=unknown score=0.547[0m
+[0;32mI (31345) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=29630013[0m
+[0;32mI (31367) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21313[0m
+[0;32mI (31367) app_main: Detection ran, face_count=0[0m
+[0;32mI (31837) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=30122218[0m
+[0;32mI (31859) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21049[0m
+[0;32mI (31859) app_main: Detection ran, face_count=0[0m
+[0;32mI (32324) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=30608852[0m
+[0;32mI (32346) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=22033[0m
+[0;32mI (32346) app_main: Detection ran, face_count=0[0m
+[0;32mI (32810) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=31094328[0m
+[0;32mI (32831) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21017[0m
+[0;32mI (32831) app_main: Detection ran, face_count=0[0m
+[0;32mI (33296) app_main: [CORE-PROOF] MAIN_SW frame=300 cpu=0 task=video stream ta affinity=0[0m
+[0;32mI (33296) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=31580521[0m
+[0;32mI (33324) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20946[0m
+[0;32mI (33324) app_main: Detection ran, face_count=0[0m
+[0;32mI (33782) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=32067032[0m
+[0;32mI (33803) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20976[0m
+[0;32mI (33803) app_main: Detection ran, face_count=0[0m
+[0;32mI (34268) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=32552668[0m
+[0;32mI (34289) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20964[0m
+[0;32mI (34289) app_main: Detection ran, face_count=0[0m
+[0;32mI (34754) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=33039165[0m
+[0;32mI (34776) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21082[0m
+[0;32mI (34776) app_main: Detection ran, face_count=0[0m
+[0;32mI (35240) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=33524964[0m
+[0;32mI (35261) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20963[0m
+[0;32mI (35261) app_main: Detection ran, face_count=0[0m
+[0;32mI (35726) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=34011187[0m
+[0;32mI (35753) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=26303[0m
+[0;32mI (35753) app_main: Detection ran, face_count=1[0m
+[0;32mI (35753) app_main: Face 0 score=1.00 box=[438,83,1092,933][0m
+[0;32mI (35758) face_recognition_wrapper: [CORE-PROOF] stage=RECOGNITION_BEGIN cpu=0 task=video stream ta affinity=0 time_us=34043093[0m
+[0;32mI (35898) face_recognition_wrapper: [CORE-PROOF] RECOGNITION_END cpu=0 duration_us=128385[0m
+[0;32mI (35898) face_recognition_wrapper: Face rejected: id=1 similarity=0.529 threshold=0.55[0m
+[0;32mI (35903) app_main: Recognition result: name=unknown score=0.529[0m
+[0;32mI (36375) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=34659797[0m
+[0;32mI (36402) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=26379[0m
+[0;32mI (36402) app_main: Detection ran, face_count=1[0m
+[0;32mI (36402) app_main: Face 0 score=0.98 box=[538,58,1168,933][0m
+[0;32mI (36407) face_recognition_wrapper: [CORE-PROOF] stage=RECOGNITION_BEGIN cpu=0 task=video stream ta affinity=0 time_us=34691806[0m
+[0;32mI (36548) face_recognition_wrapper: [CORE-PROOF] RECOGNITION_END cpu=0 duration_us=130052[0m
+[0;32mI (36548) face_recognition_wrapper: Recognition result: unknown, no database match[0m
+[0;32mI (36552) app_main: Recognition result: name=unknown score=0.000[0m
+[0;32mI (37023) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=35307672[0m
+[0;32mI (37049) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=26204[0m
+[0;32mI (37049) app_main: Detection ran, face_count=1[0m
+[0;32mI (37049) app_main: Face 0 score=1.00 box=[509,98,1153,959][0m
+[0;32mI (37055) face_recognition_wrapper: [CORE-PROOF] stage=RECOGNITION_BEGIN cpu=0 task=video stream ta affinity=0 time_us=35339552[0m
+[0;32mI (37196) face_recognition_wrapper: [CORE-PROOF] RECOGNITION_END cpu=0 duration_us=130214[0m
+[0;32mI (37196) face_recognition_wrapper: Face rejected: id=2 similarity=0.525 threshold=0.55[0m
+[0;32mI (37201) app_main: Recognition result: name=unknown score=0.525[0m
+[0;32mI (37671) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=35956071[0m
+[0;32mI (37692) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21009[0m
+[0;32mI (37693) app_main: Detection ran, face_count=0[0m
+[0;32mI (38157) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=36442049[0m
+[0;32mI (38179) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21106[0m
+[0;32mI (38179) app_main: Detection ran, face_count=0[0m
+[0;32mI (38644) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=36928772[0m
+[0;32mI (38665) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=21150[0m
+[0;32mI (38665) app_main: Detection ran, face_count=0[0m
+[0;32mI (39129) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=37414047[0m
+[0;32mI (39150) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20994[0m
+[0;32mI (39151) app_main: Detection ran, face_count=0[0m
+[0;32mI (39616) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=37900278[0m
+[0;32mI (39636) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20845[0m
+[0;32mI (39637) app_main: Detection ran, face_count=0[0m
+[0;32mI (40102) face_detect_wrapper: [CORE-PROOF] stage=DETECT_BEGIN cpu=0 task=video stream ta affinity=0 time_us=38386756[0m
+[0;32mI (40123) face_detect_wrapper: [CORE-PROOF] DETECT_END cpu=0 duration_us=20922[0m
+[0;32mI (40123) app_main: Detection ran, face_count=0[0m
+Done
+
+==================================================
 FILE: ./export_project_to_txt.sh
 ==================================================
 #!/usr/bin/env bash
@@ -29857,6 +30567,10 @@ errout:
 
 static void video_stream_task(void *arg)
 {
+    ESP_LOGI(TAG,
+         "[CORE-PROOF] Video task running: actual_cpu=%d task=%s",
+         xPortGetCoreID(),
+         pcTaskGetName(NULL));
     int video_fd = *((int *)arg);
 
     while (1) {
@@ -29882,6 +30596,9 @@ esp_err_t app_video_stream_task_start(int video_fd, int core_id, void *user_data
     app_camera_video.video_fd = video_fd;
 
     video_stream_start(video_fd);
+    ESP_LOGI(TAG,
+         "[CORE-PROOF] Creating video stream task: requested_core=%d",
+         core_id);
 
     BaseType_t result = xTaskCreatePinnedToCore(
         video_stream_task,
@@ -30102,6 +30819,29 @@ idf_component_register(
     INCLUDE_DIRS "."
 )
 ==================================================
+FILE: ./main/core_trace.h
+==================================================
+#pragma once
+
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+static inline void core_trace(const char *tag, const char *stage)
+{
+    TaskHandle_t task = xTaskGetCurrentTaskHandle();
+
+    ESP_LOGI(tag,
+             "[CORE-PROOF] stage=%s cpu=%d task=%s affinity=%d time_us=%lld",
+             stage,
+             xPortGetCoreID(),                 // actual CPU executing this line
+             pcTaskGetName(task),
+             xTaskGetCoreID(task),             // task's configured affinity
+             (long long)esp_timer_get_time());
+}
+
+==================================================
 FILE: ./main/face_detect_wrapper.cpp
 ==================================================
 #include "face_detect_wrapper.h"
@@ -30109,6 +30849,7 @@ FILE: ./main/face_detect_wrapper.cpp
 #include "esp_log.h"
 #include "human_face_detect.hpp"
 #include "dl_image_define.hpp"
+#include "core_trace.h"
 
 static const char *TAG_FACE = "face_detect_wrapper";
 
@@ -30149,7 +30890,15 @@ static int face_detect_run_common(
         .pix_type = pix_type,
     };
 
+    core_trace(TAG_FACE, "DETECT_BEGIN");
+    int64_t start_us = esp_timer_get_time();
+
     auto &results = s_face_detect->run(img);
+
+    ESP_LOGI(TAG_FACE,
+            "[CORE-PROOF] DETECT_END cpu=%d duration_us=%lld",
+            xPortGetCoreID(),
+            (long long)(esp_timer_get_time() - start_us));
 
     int count = 0;
 
@@ -30266,6 +31015,7 @@ FILE: ./main/face_recognition_wrapper.cpp
 
 #include "app_video.h"
 #include "face_detect_wrapper.h"
+#include "core_trace.h"
 
 static const char *TAG_RECOG = "face_recognition_wrapper";
 
@@ -30593,8 +31343,16 @@ extern "C" esp_err_t face_recognition_recognize(
 
     std::list<dl::detect::result_t> detect_res = make_detect_result_from_box(box);
 
+    core_trace(TAG_RECOG, "RECOGNITION_BEGIN");
+    int64_t start_us = esp_timer_get_time();
+
     std::vector<dl::recognition::result_t> results =
         s_recognizer->recognize(img, detect_res);
+
+    ESP_LOGI(TAG_RECOG,
+            "[CORE-PROOF] RECOGNITION_END cpu=%d duration_us=%lld",
+            xPortGetCoreID(),
+            (long long)(esp_timer_get_time() - start_us));
 
     if (results.empty()) {
         strncpy(out_name, "unknown", out_name_len - 1);
@@ -30709,6 +31467,7 @@ FILE: ./main/main.c
 #include "face_detect_wrapper.h"
 #include "face_recognition_wrapper.h"
 #include "esp_spiffs.h"
+#include "core_trace.h"
 
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -30841,6 +31600,7 @@ static esp_err_t mount_spiffs(void)
 
 void app_main(void)
 {
+    core_trace(TAG, "APP_MAIN_START");
     disp = bsp_display_start();
     bsp_display_backlight_on();
 
@@ -30918,6 +31678,8 @@ void app_main(void)
     ESP_ERROR_CHECK(app_video_set_bufs(video_cam_fd0, 2, (void *)camera_buf));
 
     ESP_ERROR_CHECK(app_video_register_frame_operation_cb(camera_video_frame_operation));
+
+    ESP_LOGI(TAG, "[CORE-PROOF] Requesting video stream task on CPU0");
 
     ESP_ERROR_CHECK(app_video_stream_task_start(video_cam_fd0, 0, NULL));
 
@@ -30997,9 +31759,14 @@ static void camera_video_frame_operation(
     frame_count++;
 
     if ((frame_count % 100) == 0) {
-        ESP_LOGI(TAG, "Frame count=%" PRIu32, frame_count);
+        ESP_LOGI(TAG,
+                "[CORE-PROOF] MAIN_SW frame=%" PRIu32
+                " cpu=%d task=%s affinity=%d",
+                frame_count,
+                xPortGetCoreID(),
+                pcTaskGetName(NULL),
+                xTaskGetCoreID(xTaskGetCurrentTaskHandle()));
     }
-
     if ((frame_count % FACE_DETECT_INTERVAL) == 0) {
         face_box_t boxes[MAX_FACE_BOXES];
 
