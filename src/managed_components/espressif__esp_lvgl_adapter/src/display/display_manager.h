@@ -78,6 +78,13 @@ esp_err_t display_manager_set_dummy_draw_callbacks(lv_display_t *disp,
                                                    const esp_lv_adapter_dummy_draw_callbacks_t *cbs,
                                                    void *user_ctx);
 
+/**
+ * @brief Register draw bitmap callbacks for a display
+ */
+esp_err_t display_manager_set_draw_bitmap_callbacks(lv_display_t *disp,
+                                                    const esp_lv_adapter_draw_bitmap_callbacks_t *cbs,
+                                                    void *user_ctx);
+
 esp_err_t display_manager_dummy_draw_blit(lv_display_t *disp,
                                           int x_start,
                                           int y_start,
@@ -113,6 +120,16 @@ void display_manager_flush_ready(lv_display_t *disp);
 #else
 void display_manager_flush_ready(lv_disp_drv_t *drv);
 #endif
+
+/**
+ * @brief Notify bridge that LCD color transfer completed from an ISR.
+ */
+bool display_manager_notify_color_trans_done_from_isr(lv_display_t *disp);
+
+/**
+ * @brief Notify bridge that LCD frame refresh completed from an ISR.
+ */
+bool display_manager_notify_frame_done_from_isr(lv_display_t *disp);
 
 /**
  * @brief Calculate number of panel frame buffers required

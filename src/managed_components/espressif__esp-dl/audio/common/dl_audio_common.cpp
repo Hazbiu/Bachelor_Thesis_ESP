@@ -1,4 +1,5 @@
 #include "dl_audio_common.hpp"
+#include "dl_base_dotprod.hpp"
 
 namespace dl {
 namespace audio {
@@ -171,7 +172,7 @@ float compute_energy(float *x, int len, float epsilon)
     }
 
     // Return log of the energy
-    return logf(MAX(sum_squares, epsilon));
+    return logf(DL_MAX(sum_squares, epsilon));
 }
 
 mel_filter_t *mel_filter_init(int nfft, int nfilter, int low_freq, int high_freq, int sample_rate, uint32_t caps)
@@ -204,7 +205,7 @@ mel_filter_t *mel_filter_init(int nfft, int nfilter, int low_freq, int high_freq
         for (int j = bands_to_zero; j < feat_width; j++) {
             float lower_slope = (bin_mel[j] - bin[i]) / (bin[i + 1] - bin[i]);
             float upper_slope = (bin[i + 2] - bin_mel[j]) / (bin[i + 2] - bin[i + 1]);
-            float temp = MIN(lower_slope, upper_slope);
+            float temp = DL_MIN(lower_slope, upper_slope);
             if (lower_slope > 0 && start == -1)
                 start = j;
             if (upper_slope <= 0 && stop == -1)
@@ -280,13 +281,6 @@ float *compute_spectrum(float *x, int win_len, bool use_power)
     return x; // x: [nfft//2+1], power or magnitude
 }
 
-float dotprod_f32(float *x1, float *x2, int len)
-{
-    float sum = 0;
-    for (int i = 0; i < len; i++) sum += x1[i] * x2[i];
-    return sum;
-}
-
 float *mel_dotprod(float *x, mel_filter_t *mel_filter, float *output)
 {
     float *coeff = mel_filter->coeff;
@@ -298,7 +292,7 @@ float *mel_dotprod(float *x, mel_filter_t *mel_filter, float *output)
     for (int j = 0; j < nfilter; j++) {
         len = bank_pos[j * 2 + 1] - bank_pos[j * 2] + 1;
         x_shift = bank_pos[j * 2];
-        output[j] = dotprod_f32(coeff + coeff_shift, x + x_shift, len);
+        dl::base::dotprod(coeff + coeff_shift, x + x_shift, output + j, len, 0);
         coeff_shift += len;
     }
 

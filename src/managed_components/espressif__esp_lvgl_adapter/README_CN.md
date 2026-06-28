@@ -225,10 +225,12 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 | RGB | `ESP_LV_ADAPTER_DISPLAY_RGB_DEFAULT_CONFIG(...)` | `ESP_LV_ADAPTER_TEAR_AVOID_MODE_DEFAULT_RGB` |
 | SPI/I2C/I80/QSPI (带 PSRAM) | `ESP_LV_ADAPTER_DISPLAY_SPI_WITH_PSRAM_DEFAULT_CONFIG(...)` | `ESP_LV_ADAPTER_TEAR_AVOID_MODE_DEFAULT` (即 `NONE`) |
 | SPI/I2C/I80/QSPI (无 PSRAM) | `ESP_LV_ADAPTER_DISPLAY_SPI_WITHOUT_PSRAM_DEFAULT_CONFIG(...)` | `ESP_LV_ADAPTER_TEAR_AVOID_MODE_DEFAULT` (即 `NONE`) |
+| MONO (单色显示) | `ESP_LV_ADAPTER_DISPLAY_PROFILE_MONO_DEFAULT_CONFIG(...)` | `ESP_LV_ADAPTER_TEAR_AVOID_MODE_DEFAULT` (即 `NONE`) |
 
 **注意**：
 - 仅 MIPI DSI 和 RGB 支持防撕裂模式
 - SPI/I2C/I80/QSPI 等接口在适配器中统称为 "OTHER" 接口，仅支持 `NONE` 模式
+- MONO（单色显示）接口支持 I1 水平平铺 (HTILED) 和垂直平铺 (VTILED) 两种布局，且**支持旋转**
 
 #### 计算帧缓冲数量
 
@@ -263,6 +265,7 @@ uint8_t num_fbs = esp_lv_adapter_get_required_frame_buffer_count(
 **重要限制**：
 - RGB/MIPI DSI 在 `TEAR_AVOID_MODE_NONE` 下**不支持旋转**（任何非 0 旋转会被拒绝）
 - OTHER (SPI/I2C/I80/QSPI) 接口支持 `NONE` 和 `TE_SYNC` 模式；如需旋转，请在 LCD 初始化阶段配置面板方向（交换 XY/镜像），并相应调整触摸坐标映射
+- MONO (单色显示) 接口**支持软件旋转**（0°/90°/180°/270°），通过 LVGL 进行像素级旋转处理
 - `TE_SYNC` 模式要求面板提供 TE 输出信号，并将 TE 引脚连接到 ESP GPIO；使用 `ESP_LV_ADAPTER_DISPLAY_SPI_WITH_PSRAM_TE_DEFAULT_CONFIG` 宏进行配置。`examples/display/gui/lvgl_common_demo` 会自动检测并在可用时使用 TE 同步
 
 #### 内存估算
@@ -374,6 +377,15 @@ assert(touch != NULL);
 - `touch_handle`：通过 `esp_lcd_touch` API 创建的触摸句柄
 - 默认缩放比例：x = 1.0, y = 1.0
 
+如需在 LVGL v9 下为离散控件启用独立多点控制，可额外设置：
+
+```c
+touch_cfg.multi_touch.mode = ESP_LV_ADAPTER_TOUCH_MODE_MULTI_CONTROL;
+touch_cfg.multi_touch.pointers = 2;
+```
+
+`pointers` 至少为 `2`，不能超过 `CONFIG_ESP_LCD_TOUCH_MAX_POINTS`，同时还会受到适配器当前可用 display input slot 数量限制。
+
 #### 旋钮/编码器
 
 需要启用 Kconfig 选项 `ESP_LV_ADAPTER_ENABLE_KNOB`。详见 `esp_lv_adapter_input.h`。
@@ -459,6 +471,10 @@ lv_obj_set_style_text_font(label, font30, 0);
 | v8 | `CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768` | 字体初始化在调用线程执行 |
 | v9 | `CONFIG_LV_DRAW_THREAD_STACK_SIZE=32768` | 字体渲染在绘图线程执行 |
 
+启用 `ESP_LVGL_ADAPTER_FREETYPE_SMALL_RENDER_POOL` 可将 FreeType 的 render pool 从 16KB 降到 4KB；在 LVGL v9 下，这也会去掉 LVGL 对较小绘图线程栈的保守 32KB 构建期提示。
+
+启用 `ESP_LVGL_ADAPTER_FREETYPE_MINIMAL_BUILD` 可在 LVGL v8 和 v9 下减少 FreeType 的 flash 占用。该模式仅保留 LVGL 常见运行时字体路径所需的 `TTF/OTF`、`sfnt`、平滑渲染器以及 CFF/OpenType 相关依赖，并从最终链接结果中裁掉 legacy 字体驱动及可选压缩流/渲染辅助。如果项目依赖 Type1/CID/PFR/Type42/BDF/PCF/FNT、压缩字体流或 SVG/SDF 渲染，请保持关闭。
+
 **限制**：
 - LVGL v8：不支持 LVGL 虚拟文件系统（`lv_fs`），需使用直接文件路径或内存缓冲区
 - LVGL v9：支持虚拟文件系统路径（如 `"F:font.ttf"`）
@@ -489,6 +505,8 @@ ESP_ERROR_CHECK(esp_lv_adapter_set_dummy_draw(disp, true));
 ESP_ERROR_CHECK(esp_lv_adapter_dummy_draw_blit(disp, 0, 0, 800, 480, framebuffer, true));
 ESP_ERROR_CHECK(esp_lv_adapter_set_dummy_draw(disp, false));
 ```
+
+注意：进入 Dummy Draw 模式时，应用需要停止 LVGL 渲染。
 
 完整示例请参考 `examples/display/gui/lvgl_dummy_draw`。
 
@@ -545,7 +563,12 @@ ESP_ERROR_CHECK(esp_lv_adapter_set_area_rounder_cb(disp, NULL, NULL));
 
 在保持 UI 状态的同时安全地关闭显示以降低功耗。适配器提供了与 ESP-IDF Light Sleep 配合使用的睡眠机制。
 
-**基本流程：**
+适配器的职责边界刻意保持精简：
+- 适配器负责判断 LVGL 何时可以进入睡眠、何时可以恢复
+- 应用负责 LCD、背光、触摸供电和板级唤醒源的具体控制
+- 适配器不会主动调用 `esp_lcd_panel_disp_sleep()`、`esp_lcd_panel_disp_on_off()` 或板级 LCD deinit/reinit 接口
+
+**手动完整睡眠流程：**
 
 ```c
 // 进入睡眠
@@ -553,9 +576,28 @@ esp_lv_adapter_sleep_prepare();      // 暂停 worker，等待刷新完成
 esp_lcd_panel_del(panel);             // 删除硬件
 esp_light_sleep_start();              // 进入 Light Sleep（CPU 暂停，外设保持状态）
 
-// 从睡眠恢复（Light Sleep 唤醒后自动执行）
+// Light Sleep 返回后，重新初始化并恢复：
 panel = /* 重新初始化 LCD 硬件 */;
 esp_lv_adapter_sleep_recover(disp, panel, panel_io);  // 重新绑定面板，恢复 worker
+```
+
+**自动睡眠流程：**
+
+```c
+esp_lv_adapter_config_t cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG();
+cfg.auto_sleep.enable = true;
+cfg.auto_sleep.idle_timeout_ms = 5000;
+
+// 仅暂停的流程：适配器暂停 LVGL，用户回调负责面板休眠/点亮。
+cfg.auto_sleep.mode = ESP_LV_ADAPTER_AUTO_SLEEP_MODE_PAUSE;
+cfg.auto_sleep.callbacks.on_enter_sleep = panel_sleep_cb;
+cfg.auto_sleep.callbacks.on_exit_sleep = panel_wake_cb;
+
+// 用户完全托管流程：回调负责完整的休眠/唤醒/恢复流程。
+// cfg.auto_sleep.mode = ESP_LV_ADAPTER_AUTO_SLEEP_MODE_USER;
+// cfg.auto_sleep.callbacks.on_enter_sleep = board_light_sleep_cycle_cb;
+
+ESP_ERROR_CHECK(esp_lv_adapter_init(&cfg));
 ```
 
 **配合 Light Sleep 使用：**
@@ -565,6 +607,42 @@ esp_lv_adapter_sleep_recover(disp, panel, panel_io);  // 重新绑定面板，�
 3. **进入 Light Sleep**：调用 `esp_light_sleep_start()`，系统将暂停 CPU 并保持外设状态
 4. **唤醒后恢复**：重新初始化 LCD 硬件，然后调用 `esp_lv_adapter_sleep_recover()` 恢复适配器运行
 
+**使用自动睡眠 Pause 模式：**
+
+1. 在 ESP-IDF 中启用 `CONFIG_PM_ENABLE` 和 tickless idle
+2. 配置 `cfg.auto_sleep.mode = ESP_LV_ADAPTER_AUTO_SLEEP_MODE_PAUSE`
+3. 提供只负责面板或背光状态切换的回调
+4. 已注册的触摸/按键/旋钮输入会自动通知适配器；对于自定义唤醒源，调用 `esp_lv_adapter_request_wake()` 或 `esp_lv_adapter_request_wake_from_isr()`
+
+**使用自动睡眠 User 模式：**
+
+1. 配置 `cfg.auto_sleep.mode = ESP_LV_ADAPTER_AUTO_SLEEP_MODE_USER`
+2. 在 `on_enter_sleep()` 中执行完整板级流程：
+   `esp_lv_adapter_sleep_prepare()` -> LCD deinit -> `esp_light_sleep_start()` -> LCD init -> `esp_lv_adapter_sleep_recover()`
+3. 面板和板级相关动作仍放在应用回调中，不放进适配器
+
+**Pause 模式：触摸/按键唤醒**
+
+Pause 模式空闲时释放 `ESP_PM_NO_LIGHT_SLEEP` 锁，系统自动进入 tickless light sleep。从触摸或按键中断唤醒需要两步——缺一不可：
+
+- **MCU 唤醒**（应用）：在 `on_enter_sleep` 中配置 `gpio_wakeup_enable()` + `esp_sleep_enable_gpio_wakeup()`
+- **适配器恢复**（内置）：触摸驱动在 ISR 中调用 `esp_lv_adapter_request_wake_from_isr()`；按键/旋钮驱动在 task 回调中调用 `esp_lv_adapter_request_wake()`
+
+```c
+static void panel_sleep_cb(void *user_data)
+{
+    bsp_display_backlight_off();
+    gpio_wakeup_enable(TOUCH_INT_GPIO, GPIO_INTR_LOW_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
+}
+
+static void panel_wake_cb(void *user_data)
+{
+    gpio_wakeup_disable(TOUCH_INT_GPIO);
+    bsp_display_backlight_on();
+}
+```
+
 **主要特性：**
 - UI 状态保留（无需重建控件）
 - 触摸设备保持注册（需要时单独关闭电源）
@@ -572,6 +650,15 @@ esp_lv_adapter_sleep_recover(disp, panel, panel_io);  // 重新绑定面板，�
 - 与 Light Sleep 无缝配合，实现低功耗待机
 
 **⚠️ 高级用法：** 可使用 `esp_lv_adapter_pause()`/`resume()` 实现自定义流程，但请勿与 `sleep_prepare()` 混用
+
+### 配合 Tickless 自动 Light Sleep 使用 `pause()` / `resume()`
+
+如果系统已经启用了 tickless 自动 Light Sleep，则可以不手动调用 `esp_light_sleep_start()`，只通过 `esp_lv_adapter_pause()` / `resume()` 让系统自然进入 Light Sleep。
+
+**注意事项：**
+- 仅需要暂停 LVGL 并依赖 tickless 自动睡眠时，使用 `esp_lv_adapter_pause()` / `resume()`；如果还要删除并重建 LCD 硬件，请使用 `sleep_prepare()` / `sleep_recover()`
+- 暂停后内部 `LVGL tick` timer 会停止；在 `esp_timer_dump(stdout)` 中它可能仍可见，但应为停止状态（`Period = 0`、`Alarm = 0`）
+- 不要将手动 `pause()` 与 `sleep_prepare()` 混用
 
 ---
 
@@ -587,6 +674,7 @@ esp_lv_adapter_sleep_recover(disp, panel, panel_io);  // 重新绑定面板，�
 | `ESP_LV_ADAPTER_ENABLE_FPS_STATS` | 启用 FPS 统计功能 |
 | `ESP_LV_ADAPTER_ENABLE_BUTTON` | 启用按键导航输入 |
 | `ESP_LV_ADAPTER_ENABLE_KNOB` | 启用旋钮/编码器输入 |
+| `ESP_LV_ADAPTER_PARTIAL_AUX_IMG_CACHE` | 解决局部刷新下的重复解码问题，将图片缓存设置为最大 |
 
 **默认任务栈大小**：
 - LVGL 适配器任务栈：8KB
@@ -606,11 +694,17 @@ esp_lv_adapter_sleep_recover(disp, panel, panel_io);  // 重新绑定面板，�
 
 - **RGB/MIPI DSI**：
   - 在 `TEAR_AVOID_MODE_NONE` 下**不支持旋转**（任何非 0 旋转会被拒绝）
-  
+
 - **OTHER (SPI/I2C/I80/QSPI)**：
   - 适配器不对 90°/270° 进行旋转处理
   - 如需旋转，请在 LCD 初始化阶段配置面板方向（交换 XY/镜像）
   - 同时需要相应调整触摸坐标映射
+
+- **MONO (单色显示)**：
+  - **完全支持旋转**（0°/90°/180°/270°）
+  - 旋转由 LVGL 在软件层面处理
+  - 支持 I1 水平平铺 (HTILED) 和垂直平铺 (VTILED) 两种布局
+  - 无需额外配置，直接通过 `rotation` 参数设置
 
 ### 缓冲与渲染模式
 
@@ -644,12 +738,17 @@ esp_lv_adapter_sleep_recover(disp, panel, panel_io);  // 重新绑定面板，�
 关闭 UI 时的推荐资源释放顺序：
 
 ```c
-// 1. 注销输入设备
+// 1. （可选）提前显式注销输入设备。
+//    若跳过此步骤，esp_lv_adapter_deinit() 会自动完成清理，
+//    并通过各设备类型的专用 unregister 路径释放资源。
 esp_lv_adapter_unregister_touch(touch);
 // esp_lv_adapter_unregister_encoder(encoder);
 // esp_lv_adapter_unregister_navigation_buttons(buttons);
 
-// 2. 注销显示设备
+// 2. （可选）提前显式注销显示设备。
+//    esp_lv_adapter_unregister_display() 内部会自动 pause 适配器，
+//    等待当前 flush 完成后再注销，无需调用方手动 pause。
+//    若跳过此步骤，esp_lv_adapter_deinit() 会清理剩余显示设备。
 esp_lv_adapter_unregister_display(disp);
 
 // 3. 卸载文件系统（如果使用）
@@ -657,8 +756,11 @@ esp_lv_adapter_fs_unmount(fs_handle);
 // 释放 mmap 资源
 mmap_assets_del(assets);
 
-// 4. 反初始化适配器
-// 注意：如果启用了 FreeType，字体资源会自动清理
+// 4. 反初始化适配器。
+//    内部流程：pause 适配器任务 → 等待所有 flush 完成 →
+//    注销剩余输入设备和显示设备 → 停止 tick timer →
+//    在适用条件下调用 lv_deinit()。
+//    若启用了 FreeType，字体资源会自动清理。
 esp_lv_adapter_deinit();
 ```
 
@@ -675,9 +777,9 @@ esp_lv_adapter_deinit();
 
 如果您在 ESP32-P4 上使用 `ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL` 模式并启用屏幕旋转时遇到画面卡死问题，需要应用以下补丁：
 
-**适用版本**：ESP-IDF release/v5.5 (commit `62beeae461bd3692c2028f96a93c84f11291e155`)
+**适用版本**：ESP-IDF `tags/v6.0` (commit `662a3be354759d9487bf4b1a629fadb766cb1800`)
 
-**补丁文件**：`0001-bugfix-lcd-Fixed-PPA-freeze.patch`
+**补丁文件**：`0001-bugfix-ppa-Temporary-fix-for-the-PPA-hang-issue.patch`
 
 **应用方法**：
 
@@ -685,7 +787,7 @@ esp_lv_adapter_deinit();
 
 ```bash
 cd $IDF_PATH
-git apply /path/to/esp_lvgl_adapter/0001-bugfix-lcd-Fixed-PPA-freeze.patch
+git apply /path/to/esp_lvgl_adapter/0001-bugfix-ppa-Temporary-fix-for-the-PPA-hang-issue.patch
 ```
 
 **问题说明**：
@@ -701,7 +803,7 @@ git apply /path/to/esp_lvgl_adapter/0001-bugfix-lcd-Fixed-PPA-freeze.patch
 检查 `components/esp_driver_ppa/src/ppa_srm.c` 文件中是否包含以下代码：
 
 ```c
-PPA.sr_byte_order.sr_macro_bk_ro_bypass = 1;
+ppa_ll_srm_bypass_mb_order(platform->hal.dev, true);
 ```
 
 ---
@@ -724,6 +826,8 @@ PPA.sr_byte_order.sr_macro_bk_ro_bypass = 1;
 
 **解决方法**：
 - 确认 LVGL 配置中已启用 FreeType（`CONFIG_LV_USE_FREETYPE=y`）
+- 如果使用较小的 LVGL v9 绘图线程栈，启用 `CONFIG_ESP_LVGL_ADAPTER_FREETYPE_SMALL_RENDER_POOL`
+- 如果启用了 `CONFIG_ESP_LVGL_ADAPTER_FREETYPE_MINIMAL_BUILD`，确认所用字体格式仍在保留的 TTF/OTF 常见子集内
 - LVGL v8：设置 `CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768`
 - LVGL v9：设置 `CONFIG_LV_DRAW_THREAD_STACK_SIZE=32768`
 
@@ -781,9 +885,9 @@ if (esp_lv_adapter_lock(-1) == ESP_OK) {
 
 ## 参考
 
-- [ESP LV FS 组件文档](../../esp_lv_fs/README.md)
-- [ESP LV Decoder 组件文档](../../esp_lv_decoder/README.md)
-- [ESP Mmap Assets 组件文档](../../esp_mmap_assets/README.md)
+- [ESP LV FS 组件文档](../esp_lv_fs/README.md)
+- [ESP LV Decoder 组件文档](../esp_lv_decoder/README.md)
+- [ESP Mmap Assets 组件文档](../esp_mmap_assets/README.md)
 
 ---
 

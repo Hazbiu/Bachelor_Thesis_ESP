@@ -1,4 +1,5 @@
 #pragma once
+#include "dl_base_dotprod.hpp"
 #include "dl_fft.hpp"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -9,11 +10,6 @@
 
 namespace dl {
 namespace audio {
-
-#define MAX(x, y) ((x) > (y) ? (x) : (y))
-#define MIN(x, y) ((x) < (y) ? (x) : (y))
-#define M_2PI 6.283185307179586476925286766559005
-
 /**
  * @brief Window function type enumeration.
  */
@@ -180,16 +176,6 @@ float mel2hz(float x);
  * @return float*   Pointer to output spectrum.
  */
 float *compute_spectrum(float *x, int win_len, bool use_power);
-
-/**
- * @brief Dot product of two float arrays.
- *
- * @param x1 First array.
- * @param x2 Second array.
- * @param len Length of arrays.
- * @return float Dot product result.
- */
-float dotprod_f32(float *x1, float *x2, int len);
 
 } // namespace audio
 } // namespace dl

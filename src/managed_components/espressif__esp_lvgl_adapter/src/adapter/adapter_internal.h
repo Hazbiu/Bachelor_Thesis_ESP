@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2025 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2025-2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -16,10 +16,12 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <sys/queue.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "esp_pm.h"
 #include "esp_lv_adapter.h"
 #include "driver/gpio.h"
 
@@ -39,7 +41,25 @@ struct esp_lv_adapter_te_sync_context;
 #define ESP_LV_ADAPTER_MAX_FRAME_BUFFERS      3
 #define ESP_LV_ADAPTER_MAX_DISPLAY_INPUTS     8
 #define ESP_LV_ADAPTER_MAX_SLEEP_DISPLAYS     8
-#define ESP_LV_ADAPTER_MAX_SLEEP_INPUTS       32
+
+/**
+ * @brief Pipeline buffer element node for tear-avoidance buffer management
+ */
+struct display_pipeline_buf {
+    STAILQ_ENTRY(display_pipeline_buf) entry;
+    void *buffer;
+};
+
+/**
+ * @brief Pipeline buffer management state for tear-avoidance modes
+ */
+typedef struct {
+    STAILQ_HEAD(, display_pipeline_buf) busy_list;   /*!< DMA in-flight, FIFO */
+    STAILQ_HEAD(, display_pipeline_buf) empty_list;  /*!< Free buffer pool, FIFO */
+    struct display_pipeline_buf *elems;               /*!< Pre-allocated element array */
+    uint8_t elem_count;                               /*!< Number of elements */
+    portMUX_TYPE lock;                                /*!< ISR/task shared spinlock */
+} esp_lv_adapter_display_pipeline_t;
 
 /*****************************************************************************
  *                         Internal Data Structures                          *
@@ -60,14 +80,20 @@ typedef struct {
     size_t frame_buffer_size;               /*!< Size of each frame buffer in bytes */
     bool dummy_draw_enabled;                /*!< Dummy draw mode flag */
     bool panel_detached;                    /*!< Panel detached flag for sleep management */
+    esp_lv_adapter_mono_layout_t mono_layout;      /*!< Monochrome layout selection */
+    uint8_t *mono_buf;                      /*!< Monochrome conversion buffer (VTILED) */
     esp_lv_adapter_dummy_draw_callbacks_t dummy_draw_cbs; /*!< Dummy draw callback collection */
     void *dummy_draw_user_ctx;              /*!< User context for dummy draw callbacks */
     void (*rounder_cb)(lv_area_t *, void *); /*!< Area rounding callback */
     void *rounder_user_data;                /*!< User data for rounder callback */
+    esp_lv_adapter_draw_bitmap_callbacks_t draw_bitmap_cbs; /*!< Draw bitmap callback collection */
+    void *draw_bitmap_user_ctx;             /*!< User context for draw bitmap callbacks */
     lv_display_t *lv_disp;                   /*!< Associated LVGL display handle */
     struct esp_lv_adapter_te_sync_context *te_ctx; /*!< TE sync runtime context */
     gpio_int_type_t te_intr_type;           /*!< Computed TE interrupt type */
     bool te_prefer_refresh_end;             /*!< Prefer TE falling edge (end of VBlank) */
+    bool idf_callback_registration_enabled; /*!< Initial adapter-owned ESP-IDF callback registration mode */
+
 } esp_lv_adapter_display_runtime_config_t;
 
 /**
@@ -79,7 +105,6 @@ typedef struct esp_lv_adapter_display_node {
     esp_lv_adapter_display_runtime_config_t cfg;  /*!< Display runtime configuration */
     lv_display_t *lv_disp;                  /*!< LVGL display object */
     struct esp_lv_adapter_display_bridge *bridge; /*!< Display bridge for hardware interface */
-    uint8_t prev_flush_status;              /*!< Previous flush status (thread-safe per display) */
 #if LVGL_VERSION_MAJOR < 9
     lv_disp_draw_buf_t draw_buf;            /*!< LVGL v8 draw buffer */
     lv_disp_drv_t disp_drv;                 /*!< LVGL v8 display driver */
@@ -169,11 +194,30 @@ typedef struct esp_lv_adapter_input_node {
 typedef struct {
     lv_display_t *all_displays[ESP_LV_ADAPTER_MAX_SLEEP_DISPLAYS];  /*!< All display handles to restore */
     struct esp_lv_adapter_display_node *display_nodes[ESP_LV_ADAPTER_MAX_SLEEP_DISPLAYS]; /*!< Cached nodes for detach/rebind */
-    lv_indev_t *all_inputs[ESP_LV_ADAPTER_MAX_SLEEP_INPUTS];     /*!< All input devices to restore */
-    uint8_t input_count;             /*!< Input device count */
     uint8_t display_count;           /*!< Display count before sleep */
     bool is_sleeping;                /*!< Sleep state flag */
 } esp_lv_adapter_sleep_state_t;
+
+/**
+ * @brief Auto sleep runtime state
+ */
+typedef enum {
+    ESP_LV_ADAPTER_AUTO_SLEEP_STATE_DISABLED = 0,
+    ESP_LV_ADAPTER_AUTO_SLEEP_STATE_ACTIVE,
+    ESP_LV_ADAPTER_AUTO_SLEEP_STATE_ENTERING,
+    ESP_LV_ADAPTER_AUTO_SLEEP_STATE_SLEEPING,
+    ESP_LV_ADAPTER_AUTO_SLEEP_STATE_WAKING,
+} esp_lv_adapter_auto_sleep_state_t;
+
+typedef struct {
+    esp_lv_adapter_auto_sleep_config_t config;          /*!< Auto sleep configuration */
+    volatile esp_lv_adapter_auto_sleep_state_t state;   /*!< Current auto sleep state */
+    esp_pm_lock_handle_t pm_lock;                       /*!< PM lock used in pause mode */
+    bool pm_lock_held;                             /*!< Whether the PM lock is currently held */
+    volatile bool wake_requested;                  /*!< Wake request flag */
+    volatile bool activity_pending;                /*!< Activity reported from ISR and pending timestamp update */
+    int64_t last_activity_us;                      /*!< Last reported activity timestamp */
+} esp_lv_adapter_auto_sleep_ctx_t;
 
 typedef struct {
     bool inited;                            /*!< Initialization flag */
@@ -189,6 +233,9 @@ typedef struct {
     esp_lv_adapter_display_node_t *display_list;  /*!< Linked list of registered displays */
     esp_lv_adapter_input_node_t *input_list;      /*!< Linked list of registered input devices */
     esp_lv_adapter_sleep_state_t sleep_state;     /*!< Sleep state tracking */
+    bool default_display_idf_callback_registration_enabled; /*!< Initial display callback ownership for new displays */
+    bool default_touch_idf_interrupt_callback_registration_enabled; /*!< Initial touch IRQ callback ownership */
+    esp_lv_adapter_auto_sleep_ctx_t auto_sleep;   /*!< Auto sleep state tracking */
 #if CONFIG_ESP_LVGL_ADAPTER_ENABLE_DECODER
     esp_lv_decoder_handle_t decoder_handle; /*!< Image decoder handle */
 #endif

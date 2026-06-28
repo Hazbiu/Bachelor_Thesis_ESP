@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2025 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2025-2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -11,14 +11,156 @@
  *********************/
 #include "display_bridge_common.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_cache.h"
 #include "esp_private/esp_cache_private.h"
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+#include "esp_efuse.h"
+#else
+#include "esp_flash_encrypt.h"
+#endif
 #include "esp_heap_caps.h"
+#include "esp_idf_version.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
+#include "esp_psram.h"
+#include "esp_timer.h"
+#include "soc/soc_caps.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
+#include "freertos/task.h"
 
 static const char *TAG = "esp_lvgl:bridge";
+
+/**********************
+ *  FLASH ENC DMA ALIGN
+ **********************/
+
+#if defined(SOC_GDMA_EXT_MEM_ENC_ALIGNMENT)
+#define DISPLAY_BRIDGE_ENC_DMA_ALIGN  SOC_GDMA_EXT_MEM_ENC_ALIGNMENT
+#else
+#define DISPLAY_BRIDGE_ENC_DMA_ALIGN  16
+#endif
+
+bool display_bridge_flash_encryption_active(void)
+{
+    static int s_state = -1;
+    if (s_state < 0) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+        s_state = esp_efuse_is_flash_encryption_enabled() ? 1 : 0;
+#else
+        s_state = esp_flash_encryption_enabled() ? 1 : 0;
+#endif
+    }
+    return s_state == 1;
+}
+
+size_t display_bridge_dma2d_ext_mem_alignment(void)
+{
+    return DISPLAY_BRIDGE_ENC_DMA_ALIGN;
+}
+
+static bool display_bridge_psram_is_no_enc(const void *buffer)
+{
+#if CONFIG_SPIRAM_ENC_EXEMPT
+    return buffer && esp_psram_ptr_is_no_enc(buffer);
+#else
+    (void)buffer;
+    return false;
+#endif
+}
+
+static size_t display_bridge_gcd_size(size_t a, size_t b)
+{
+    while (b != 0) {
+        size_t t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+static size_t display_bridge_dma2d_align_pixels(uint8_t color_bytes)
+{
+    size_t align = display_bridge_dma2d_ext_mem_alignment();
+    size_t gcd = display_bridge_gcd_size(align, color_bytes);
+    return align / gcd;
+}
+
+bool display_bridge_dma2d_buffer_needs_alignment(const void *buffer)
+{
+    if (!buffer || !display_bridge_flash_encryption_active()) {
+        return false;
+    }
+
+    if (!esp_ptr_external_ram(buffer)) {
+        return false;
+    }
+
+    return !display_bridge_psram_is_no_enc(buffer);
+}
+
+bool display_bridge_dma2d_x_rounding_sufficient(const void *buffer,
+                                                size_t stride_px,
+                                                uint8_t color_bytes)
+{
+    if (!display_bridge_dma2d_buffer_needs_alignment(buffer) || color_bytes == 0) {
+        return false;
+    }
+
+    size_t stride_bytes = stride_px * color_bytes;
+    return (stride_bytes & (display_bridge_dma2d_ext_mem_alignment() - 1)) == 0;
+}
+
+bool display_bridge_dma2d_window_is_compatible(const void *buffer,
+                                               size_t stride_px,
+                                               size_t offset_x_px,
+                                               size_t copy_width_px,
+                                               uint8_t color_bytes)
+{
+    if (!buffer || color_bytes == 0) {
+        return false;
+    }
+
+    if (!display_bridge_dma2d_buffer_needs_alignment(buffer)) {
+        return true;
+    }
+
+    const size_t align = display_bridge_dma2d_ext_mem_alignment();
+    const uintptr_t base = (uintptr_t)buffer;
+    const size_t stride_bytes = stride_px * color_bytes;
+    const size_t offset_bytes = offset_x_px * color_bytes;
+    const size_t width_bytes = copy_width_px * color_bytes;
+
+    return ((base & (align - 1)) == 0) &&
+           ((stride_bytes & (align - 1)) == 0) &&
+           ((offset_bytes & (align - 1)) == 0) &&
+           ((width_bytes & (align - 1)) == 0);
+}
+
+void display_bridge_align_area_for_enc_dma(lv_area_t *area, int hor_res, uint8_t color_bytes)
+{
+    if (!area || color_bytes == 0) {
+        return;
+    }
+
+    const int align_px = (int)display_bridge_dma2d_align_pixels(color_bytes);
+    int x1 = ((int)area->x1 / align_px) * align_px;
+    int x2 = ((((int)area->x2 + 1) + align_px - 1) / align_px) * align_px - 1;
+
+    if (x1 < 0) {
+        x1 = 0;
+    }
+    if (hor_res > 0 && x2 > hor_res - 1) {
+        x2 = hor_res - 1;
+    }
+
+    area->x1 = x1;
+    area->x2 = x2;
+}
 
 /**********************
  *   CACHE PROFILE
@@ -104,19 +246,19 @@ void display_dirty_region_capture(esp_lv_adapter_display_dirty_region_t *dst,
  *
  * Uses block-based copying for better cache locality
  */
-void display_rotate_copy_region(const void *src,
-                                void *dst_fb,
-                                uint16_t lv_x_start,
-                                uint16_t lv_y_start,
-                                uint16_t lv_x_end,
-                                uint16_t lv_y_end,
-                                uint16_t src_stride_px,
-                                uint16_t hor_res,
-                                uint16_t ver_res,
-                                esp_lv_adapter_rotation_t rotation,
-                                uint8_t color_bytes,
-                                int block_size_small,
-                                int block_size_large)
+void IRAM_ATTR display_rotate_copy_region(const void *src,
+                                          void *dst_fb,
+                                          uint16_t lv_x_start,
+                                          uint16_t lv_y_start,
+                                          uint16_t lv_x_end,
+                                          uint16_t lv_y_end,
+                                          uint16_t src_stride_px,
+                                          uint16_t hor_res,
+                                          uint16_t ver_res,
+                                          esp_lv_adapter_rotation_t rotation,
+                                          uint8_t color_bytes,
+                                          int block_size_small,
+                                          int block_size_large)
 {
     const int rect_w = lv_x_end - lv_x_start + 1;
     const int rect_h = lv_y_end - lv_y_start + 1;
@@ -223,14 +365,14 @@ void display_rotate_copy_region(const void *src,
  *
  * Uses block-based rotation for better cache locality
  */
-void display_rotate_image(const void *src,
-                          void *dst,
-                          int width,
-                          int height,
-                          int rotation,
-                          uint8_t color_bytes,
-                          int block_size_small,
-                          int block_size_large)
+void IRAM_ATTR display_rotate_image(const void *src,
+                                    void *dst,
+                                    int width,
+                                    int height,
+                                    int rotation,
+                                    uint8_t color_bytes,
+                                    int block_size_small,
+                                    int block_size_large)
 {
     /* Select block size based on rotation */
     int block_w = (rotation == 90 || rotation == 270) ? block_size_small : block_size_large;
@@ -281,6 +423,25 @@ void display_rotate_image(const void *src,
  *   CACHE MANAGEMENT
  **********************/
 
+size_t display_bridge_get_cache_line_size_by_addr(const void *addr)
+{
+    if (!addr) {
+        return 0;
+    }
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+    return esp_cache_get_line_size_by_addr(addr);
+#else
+    size_t align = 0;
+    uint32_t caps = esp_ptr_external_ram(addr) ? MALLOC_CAP_SPIRAM :
+                    esp_ptr_internal(addr)      ? MALLOC_CAP_INTERNAL : 0;
+    if (caps == 0 || esp_cache_get_alignment(caps, &align) != ESP_OK) {
+        return 0;
+    }
+    return align;
+#endif
+}
+
 /**
  * @brief Synchronize cache for a specific memory range
  *
@@ -290,9 +451,16 @@ void display_cache_msync_range(const void *addr,
                                size_t size,
                                size_t cache_line_size)
 {
-    if (!addr || size == 0 || cache_line_size == 0) {
+    if (!addr || size == 0) {
         return;
     }
+
+    size_t line_size = display_bridge_get_cache_line_size_by_addr(addr);
+    if (line_size == 0) {
+        return;
+    }
+
+    cache_line_size = line_size;
 
     /* Align to cache line boundaries */
     uintptr_t start_addr = (uintptr_t)addr;
@@ -312,6 +480,10 @@ void display_cache_msync_framebuffer(void *buffer,
                                      size_t size)
 {
     if (!buffer || size == 0) {
+        return;
+    }
+
+    if (display_bridge_get_cache_line_size_by_addr(buffer) == 0) {
         return;
     }
 
@@ -441,10 +613,42 @@ size_t display_bridge_get_cache_line_size(void)
 #endif
 
 #if SOC_DMA2D_SUPPORTED
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+#include "esp_async_color_convert.h"
+#else
 #include "esp_async_fbcpy.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#if CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP
+#include "esp_private/sleep_retention.h"
 #endif
+
+#if CONFIG_SOC_DMA2D_SUPPORTED
+static inline esp_err_t s_dma2d_install(void **out_handle)
+{
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+    async_color_convert_config_t cfg = {
+        .dma_burst_size = 128,
+    };
+    return esp_async_color_convert_install_dma2d(&cfg, (async_color_convert_handle_t *)out_handle);
+#else
+    esp_async_fbcpy_config_t cfg = {};
+    return esp_async_fbcpy_install(&cfg, (esp_async_fbcpy_handle_t *)out_handle);
+#endif
+}
+
+static inline void s_dma2d_uninstall(void *handle)
+{
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+    esp_async_color_convert_uninstall((async_color_convert_handle_t)handle);
+#else
+    esp_async_fbcpy_uninstall((esp_async_fbcpy_handle_t)handle);
+#endif
+}
+#endif /* CONFIG_SOC_DMA2D_SUPPORTED */
+#endif /* SOC_DMA2D_SUPPORTED */
 
 /**
  * @brief Initialize runtime information from configuration
@@ -497,52 +701,10 @@ void display_bridge_init_runtime_info(esp_lv_adapter_display_runtime_info_t *run
                  runtime->frame_buffer_size, total_pixels, color_bytes * 8);
     }
 
-    if (runtime->color_bytes != 2 && runtime->color_bytes != 3) {
+    if (runtime->color_bytes != 2 && runtime->color_bytes != 3 &&
+            cfg->base.profile.mono_layout == ESP_LV_ADAPTER_MONO_LAYOUT_NONE) {
         ESP_LOGW(TAG, "color depth %u bytes not HW-accelerated; using CPU fallback",
                  runtime->color_bytes);
-    }
-}
-
-/**
- * @brief Initialize frame buffer pointers
- *
- * This function is 100% identical in both v8 and v9 implementations
- */
-void display_bridge_init_frame_buffer_pointers(
-    void **front_fb,
-    void **back_fb,
-    void **spare_fb,
-    void **rgb_last_buf,
-    void **rgb_next_buf,
-    void **rgb_flush_next_buf,
-    const esp_lv_adapter_display_runtime_info_t *runtime)
-{
-    if (!runtime) {
-        return;
-    }
-
-    uint8_t fb_count = runtime->frame_buffer_count;
-    void * const *frame_buffers = runtime->frame_buffers;
-
-    if (front_fb) {
-        *front_fb = (fb_count > 0) ? frame_buffers[0] : NULL;
-    }
-    if (back_fb) {
-        *back_fb = (fb_count > 1) ? frame_buffers[1] : NULL;
-    }
-    if (spare_fb) {
-        *spare_fb = (fb_count > 2) ? frame_buffers[2] : NULL;
-    }
-
-    void *rgb_last = (fb_count > 0) ? frame_buffers[0] : NULL;
-    if (rgb_last_buf) {
-        *rgb_last_buf = rgb_last;
-    }
-    if (rgb_next_buf) {
-        *rgb_next_buf = rgb_last;
-    }
-    if (rgb_flush_next_buf) {
-        *rgb_flush_next_buf = (fb_count > 2) ? frame_buffers[2] : NULL;
     }
 }
 
@@ -552,6 +714,7 @@ void display_bridge_init_frame_buffer_pointers(
 static esp_lv_adapter_display_bridge_hw_resource_t s_hw_resource = {0};
 static bool s_hw_resource_initialized = false;
 static uint8_t s_hw_resource_ref_count = 0;
+static bool s_hw_resource_sleep_guard_active = false;
 
 /**
  * @brief Get global hardware resource singleton
@@ -573,9 +736,7 @@ esp_lv_adapter_display_bridge_hw_resource_t *display_bridge_get_hw_resource(void
 #endif
 
 #if CONFIG_SOC_DMA2D_SUPPORTED
-        esp_async_fbcpy_config_t cfg_dma = { };
-        esp_err_t ret = esp_async_fbcpy_install(&cfg_dma,
-                                                (esp_async_fbcpy_handle_t *)&s_hw_resource.fbcpy_handle);
+        esp_err_t ret = s_dma2d_install(&s_hw_resource.fbcpy_handle);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to install DMA2D (ret=%d)", ret);
             return NULL;
@@ -593,7 +754,7 @@ esp_lv_adapter_display_bridge_hw_resource_t *display_bridge_get_hw_resource(void
             if (s_hw_resource.dma2d_done_sem) {
                 vSemaphoreDelete((SemaphoreHandle_t)s_hw_resource.dma2d_done_sem);
             }
-            esp_async_fbcpy_uninstall((esp_async_fbcpy_handle_t)s_hw_resource.fbcpy_handle);
+            s_dma2d_uninstall(s_hw_resource.fbcpy_handle);
             return NULL;
         }
 #endif
@@ -612,7 +773,7 @@ esp_lv_adapter_display_bridge_hw_resource_t *display_bridge_get_hw_resource(void
                 /* Cleanup DMA2D resources */
                 vSemaphoreDelete((SemaphoreHandle_t)s_hw_resource.dma2d_mutex);
                 vSemaphoreDelete((SemaphoreHandle_t)s_hw_resource.dma2d_done_sem);
-                esp_async_fbcpy_uninstall((esp_async_fbcpy_handle_t)s_hw_resource.fbcpy_handle);
+                s_dma2d_uninstall(s_hw_resource.fbcpy_handle);
 #endif
                 return NULL;
             }
@@ -628,6 +789,11 @@ esp_lv_adapter_display_bridge_hw_resource_t *display_bridge_get_hw_resource(void
     ESP_LOGD(TAG, "Hardware resource acquired (ref_count=%d)", s_hw_resource_ref_count);
 
     return &s_hw_resource;
+}
+
+esp_lv_adapter_display_bridge_hw_resource_t *display_bridge_peek_hw_resource(void)
+{
+    return s_hw_resource_initialized ? &s_hw_resource : NULL;
 }
 
 /**
@@ -676,13 +842,20 @@ esp_err_t display_bridge_release_hw_resource(void)
         }
 
         if (s_hw_resource.fbcpy_handle) {
-            esp_async_fbcpy_uninstall((esp_async_fbcpy_handle_t)s_hw_resource.fbcpy_handle);
+            if (s_hw_resource_sleep_guard_active) {
+#if CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP
+                sleep_retention_power_lock_release();
+#endif
+                s_hw_resource_sleep_guard_active = false;
+            }
+            s_dma2d_uninstall(s_hw_resource.fbcpy_handle);
             s_hw_resource.fbcpy_handle = NULL;
             ESP_LOGI(TAG, "DMA2D resources released");
         }
 #endif
 
         s_hw_resource_initialized = false;
+        s_hw_resource_sleep_guard_active = false;
         memset(&s_hw_resource, 0, sizeof(s_hw_resource));
         ESP_LOGI(TAG, "Hardware resources cleaned up successfully");
     }
@@ -695,9 +868,15 @@ esp_err_t display_bridge_release_hw_resource(void)
  *
  * IRAM: Executed in ISR context for fast response
  */
-bool display_bridge_dma2d_done_callback(esp_async_fbcpy_handle_t mcp,
-                                        esp_async_fbcpy_event_data_t *event_data,
-                                        void *cb_args)
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+bool IRAM_ATTR display_bridge_dma2d_done_callback(async_color_convert_handle_t mcp,
+                                                  async_color_convert_event_data_t *event_data,
+                                                  void *cb_args)
+#else
+bool IRAM_ATTR display_bridge_dma2d_done_callback(esp_async_fbcpy_handle_t mcp,
+                                                  esp_async_fbcpy_event_data_t *event_data,
+                                                  void *cb_args)
+#endif
 {
     BaseType_t high_task_woken = pdFALSE;
     (void)mcp;
@@ -719,7 +898,7 @@ bool display_bridge_dma2d_done_callback(esp_async_fbcpy_handle_t mcp,
 esp_err_t display_bridge_dma2d_copy_sync(void *trans_desc, uint32_t timeout_ms)
 {
     esp_err_t ret = ESP_OK;
-    esp_lv_adapter_display_bridge_hw_resource_t *hw = display_bridge_get_hw_resource();
+    esp_lv_adapter_display_bridge_hw_resource_t *hw = display_bridge_peek_hw_resource();
     ESP_RETURN_ON_FALSE(hw, ESP_ERR_INVALID_STATE, TAG, "DMA2D resource not initialized");
 
     ESP_GOTO_ON_FALSE(xSemaphoreTake((SemaphoreHandle_t)hw->dma2d_mutex,
@@ -729,10 +908,17 @@ esp_err_t display_bridge_dma2d_copy_sync(void *trans_desc, uint32_t timeout_ms)
     /* Clear completion semaphore */
     xSemaphoreTake((SemaphoreHandle_t)hw->dma2d_done_sem, 0);
 
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+    ret = esp_async_color_convert(hw->fbcpy_handle,
+                                  (const async_color_convert_request_t *)trans_desc,
+                                  display_bridge_dma2d_done_callback,
+                                  NULL);
+#else
     ret = esp_async_fbcpy(hw->fbcpy_handle,
                           trans_desc,
                           display_bridge_dma2d_done_callback,
                           NULL);
+#endif
     ESP_GOTO_ON_ERROR(ret, release_mutex, TAG, "DMA2D transfer start failed (%d)", ret);
 
     ESP_GOTO_ON_FALSE(xSemaphoreTake((SemaphoreHandle_t)hw->dma2d_done_sem,
@@ -747,6 +933,57 @@ out:
 }
 
 #endif /* SOC_DMA2D_SUPPORTED */
+
+/**
+ * @brief Prepare shared bridge HW resources for a board-managed light sleep cycle
+ *
+ * Defined unconditionally and a no-op on targets without DMA2D. When DMA2D is
+ * present and peripheral power-down is enabled, it forces the peripheral power
+ * domain to stay on across sleep, since 2D-DMA has no sleep retention.
+ */
+esp_err_t display_bridge_prepare_hw_resource_for_sleep(void)
+{
+#if CONFIG_SOC_DMA2D_SUPPORTED
+    if (!s_hw_resource_initialized || s_hw_resource_sleep_guard_active) {
+        return ESP_OK;
+    }
+
+#if CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP
+    ESP_LOGI(TAG, "Guarding DMA2D bridge resources for light sleep");
+    ESP_RETURN_ON_ERROR(sleep_retention_power_lock_acquire(), TAG,
+                        "Failed to acquire sleep retention power lock");
+    s_hw_resource_sleep_guard_active = true;
+    ESP_LOGI(TAG, "DMA2D bridge resources guarded for light sleep");
+#endif
+#endif
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Release any shared bridge HW guard acquired for a light sleep cycle
+ *
+ * Defined unconditionally and safe to call even when no guard was activated
+ * during sleep preparation (including on targets without DMA2D).
+ */
+esp_err_t display_bridge_resume_hw_resource_after_sleep(void)
+{
+#if CONFIG_SOC_DMA2D_SUPPORTED
+    if (!s_hw_resource_sleep_guard_active) {
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Releasing DMA2D light-sleep guard");
+#if CONFIG_PM_POWER_DOWN_PERIPHERAL_IN_LIGHT_SLEEP
+    ESP_RETURN_ON_ERROR(sleep_retention_power_lock_release(), TAG,
+                        "Failed to release sleep retention power lock");
+#endif
+    s_hw_resource_sleep_guard_active = false;
+    ESP_LOGI(TAG, "DMA2D light-sleep guard released");
+#endif
+
+    return ESP_OK;
+}
 
 /**
  * @brief Destroy display bridge and release resources
@@ -772,52 +1009,218 @@ void display_bridge_common_destroy(esp_lv_adapter_display_bridge_t *bridge)
     free(bridge);
 }
 
-/**
- * @brief Probe flush type to determine copy strategy (thread-safe)
- *
- * Thread-safe: prev_status is now per-display instead of global static
- * IRAM: Called every frame during rendering for performance
- */
-esp_lv_adapter_display_flush_probe_t display_bridge_flush_copy_probe(
-    const lv_area_t *inv_areas,
-    const uint8_t *inv_area_joined,
-    uint16_t inv_p,
-    uint16_t hor_res,
-    uint16_t ver_res,
-    uint8_t *prev_status)
+/**********************
+ *   PIPELINE HELPERS
+ **********************/
+
+int display_bridge_pipeline_init_from_cfg(esp_lv_adapter_display_pipeline_t *pipeline,
+                                          esp_lv_adapter_display_runtime_config_t *cfg,
+                                          void **out_disp_fb, void **out_draw_fb)
 {
-    esp_lv_adapter_display_flush_status_t cur_status;
-    esp_lv_adapter_display_flush_probe_t probe_result;
+    int ret = 1;
 
-    if (!prev_status) {
-        return ESP_LV_ADAPTER_DISPLAY_FLUSH_PROBE_PART_COPY;
+    if (!pipeline || !cfg || !out_disp_fb || !out_draw_fb) {
+        return 0;
+    }
+    *out_disp_fb = NULL;
+    *out_draw_fb = NULL;
+
+    const esp_lv_adapter_tear_avoid_mode_t mode = cfg->base.tear_avoid_mode;
+    const bool rotated = (cfg->base.profile.rotation != ESP_LV_ADAPTER_ROTATE_0);
+    const bool use_pipeline = (mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_PARTIAL ||
+                               mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL ||
+                               mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_FULL ||
+                               mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_FULL ||
+                               (rotated && mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_DIRECT));
+    if (!use_pipeline || cfg->frame_buffer_count == 0) {
+        return 0;
     }
 
-    uint32_t flush_ver = 0;
-    uint32_t flush_hor = 0;
+    void **fb = cfg->frame_buffers;
+    uint8_t fb_count = cfg->frame_buffer_count;
 
-    for (int i = 0; i < inv_p; i++) {
-        if (inv_area_joined[i] == 0) {
-            flush_ver = (inv_areas[i].y2 + 1 - inv_areas[i].y1);
-            flush_hor = (inv_areas[i].x2 + 1 - inv_areas[i].x1);
-            break;
+    pipeline->lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
+    STAILQ_INIT(&pipeline->busy_list);
+    STAILQ_INIT(&pipeline->empty_list);
+    pipeline->elem_count = fb_count;
+    pipeline->elems = calloc(fb_count, sizeof(struct display_pipeline_buf));
+    if (!pipeline->elems) {
+        ESP_LOGE(TAG, "Failed to alloc pipeline elements");
+        return -1;
+    }
+    for (int i = 0; i < fb_count; i++) {
+        pipeline->elems[i].buffer = fb[i];
+    }
+
+    if (mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_PARTIAL ||
+            mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL) {
+        /* partial: independent buffers used for draw; fb[0],fb[1], fb[2..] in empty_list */
+        uint8_t required = (mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL) ? 3 : 2;
+        if (fb_count < required) {
+            ESP_LOGE(TAG, "PARTIAL mode %d requires %d frame buffers, got %d", mode, required, fb_count);
+            ret = -1;
+            goto err;
+        }
+        *out_disp_fb = fb[0];
+        *out_draw_fb = fb[1];
+        for (int i = 2; i < fb_count; i++) {
+            STAILQ_INSERT_TAIL(&pipeline->empty_list, &pipeline->elems[i], entry);
+        }
+    } else if (rotated) {
+        /*
+         * rotated non-partial:
+         *   fb[0]=render, fb[1]=disp, fb[2]=draw
+         *
+         * model:
+         *   render path: fb[0] -> fb[2]
+         *   panel ring : fb[1] <-> fb[2]
+         */
+        if (fb_count < 3) {
+            ESP_LOGE(TAG, "Rotated mode %d requires 3 frame buffers, got %d", mode, fb_count);
+            ret = -1;
+            goto err;
+        }
+        *out_disp_fb = fb[1];
+        *out_draw_fb = fb[2];
+    } else if (mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_FULL ||
+               mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_FULL) {
+        /* non-rotated full: fb[0]=disp, fb[1]=draw, fb[2..]=free */
+        uint8_t required = (mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_FULL) ? 3 : 2;
+        if (fb_count < required) {
+            ESP_LOGE(TAG, "FULL mode %d requires %d frame buffers, got %d", mode, required, fb_count);
+            ret = -1;
+            goto err;
+        }
+
+        *out_disp_fb = fb[0];
+        *out_draw_fb = fb[1];
+        for (int i = 1; i < fb_count; i++) {
+            STAILQ_INSERT_TAIL(&pipeline->empty_list, &pipeline->elems[i], entry);
         }
     }
 
-    /* Check if the current full screen refreshes */
-    cur_status = ((flush_ver == ver_res) && (flush_hor == hor_res)) ?
-                 ESP_LV_ADAPTER_DISPLAY_FLUSH_STATUS_FULL : ESP_LV_ADAPTER_DISPLAY_FLUSH_STATUS_PART;
+    return 1;
 
-    if (*prev_status == ESP_LV_ADAPTER_DISPLAY_FLUSH_STATUS_FULL) {
-        if (cur_status == ESP_LV_ADAPTER_DISPLAY_FLUSH_STATUS_PART) {
-            probe_result = ESP_LV_ADAPTER_DISPLAY_FLUSH_PROBE_FULL_COPY;
-        } else {
-            probe_result = ESP_LV_ADAPTER_DISPLAY_FLUSH_PROBE_SKIP_COPY;
-        }
-    } else {
-        probe_result = ESP_LV_ADAPTER_DISPLAY_FLUSH_PROBE_PART_COPY;
+err:
+    free(pipeline->elems);
+    pipeline->elems = NULL;
+    pipeline->elem_count = 0;
+    return ret;
+}
+
+void display_bridge_pipeline_mark_buf_busy(esp_lv_adapter_display_pipeline_t *p, void *buf)
+{
+    if (!p) {
+        return;
     }
-    *prev_status = cur_status;
+    for (int i = 0; i < p->elem_count; i++) {
+        if (p->elems[i].buffer == buf) {
+            portENTER_CRITICAL(&p->lock);
+            STAILQ_INSERT_TAIL(&p->busy_list, &p->elems[i], entry);
+            portEXIT_CRITICAL(&p->lock);
+            return;
+        }
+    }
+}
 
-    return probe_result;
+void IRAM_ATTR display_bridge_pipeline_release_buf_isr(esp_lv_adapter_display_pipeline_t *p)
+{
+    if (!p || !p->elems) {
+        return;
+    }
+    portENTER_CRITICAL_ISR(&p->lock);
+    struct display_pipeline_buf *elem = STAILQ_FIRST(&p->busy_list);
+    if (elem) {
+        STAILQ_REMOVE_HEAD(&p->busy_list, entry);
+        STAILQ_INSERT_TAIL(&p->empty_list, elem, entry);
+    }
+    portEXIT_CRITICAL_ISR(&p->lock);
+}
+
+struct display_pipeline_buf *display_bridge_pipeline_take_free_buf(esp_lv_adapter_display_pipeline_t *p)
+{
+    struct display_pipeline_buf *next = NULL;
+    if (!p) {
+        return NULL;
+    }
+    portENTER_CRITICAL(&p->lock);
+    next = STAILQ_FIRST(&p->empty_list);
+    if (next) {
+        STAILQ_REMOVE_HEAD(&p->empty_list, entry);
+    }
+    portEXIT_CRITICAL(&p->lock);
+    return next;
+}
+
+struct display_pipeline_buf *display_bridge_pipeline_wait_free_buf(esp_lv_adapter_display_pipeline_t *p)
+{
+    if (!p) {
+        return NULL;
+    }
+
+    /* Clear any stale notification BEFORE checking the list,
+     * so that an ISR firing after this point will not be lost. */
+    ulTaskNotifyValueClear(NULL, ULONG_MAX);
+    struct display_pipeline_buf *next = display_bridge_pipeline_take_free_buf(p);
+    while (!next) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        next = display_bridge_pipeline_take_free_buf(p);
+        if (!next) {
+            ESP_LOGW(TAG, "without free buffer");
+        }
+    }
+    return next;
+}
+
+/**********************
+ *   VSYNC HELPERS
+ **********************/
+
+void display_bridge_vsync_record_flush_post(esp_lv_adapter_vsync_timing_t *t)
+{
+    if (t) {
+        t->flush_post_ts_us = esp_timer_get_time();
+    }
+}
+
+bool IRAM_ATTR display_bridge_vsync_on_isr(esp_lv_adapter_vsync_timing_t *t)
+{
+    if (!t) {
+        return false;
+    }
+    const int64_t now_us = esp_timer_get_time();
+
+    /* Update measured refresh period */
+    if (t->vsync_prev_ts_us != 0) {
+        const int64_t interval_us = now_us - t->vsync_prev_ts_us;
+        if (interval_us > 0) {
+            t->refresh_period_us = (uint32_t)interval_us;
+        }
+    }
+    t->vsync_prev_ts_us = now_us;
+
+    /* Jitter Shield Logic */
+    if (t->shield_enabled && t->refresh_period_us != 0 && t->flush_post_ts_us != 0) {
+        const int64_t dt = now_us - t->flush_post_ts_us;
+        if (dt > 0 && (uint64_t)dt < (uint64_t)t->shield_threshold_us) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void display_bridge_vsync_config_jitter_shield(esp_lv_adapter_vsync_timing_t *t, uint32_t threshold_us)
+{
+    if (t) {
+        t->shield_threshold_us = threshold_us;
+        t->shield_enabled = (threshold_us > 0);
+    }
+}
+
+uint32_t display_bridge_vsync_get_refresh_rate_hz(esp_lv_adapter_vsync_timing_t *t)
+{
+    if (!t || t->refresh_period_us == 0) {
+        return 0;
+    }
+    return 1000000U / t->refresh_period_us;
 }

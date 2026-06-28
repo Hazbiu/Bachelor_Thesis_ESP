@@ -229,10 +229,12 @@ Choose the configuration macro based on your display interface:
 | RGB | `ESP_LV_ADAPTER_DISPLAY_RGB_DEFAULT_CONFIG(...)` | `ESP_LV_ADAPTER_TEAR_AVOID_MODE_DEFAULT_RGB` |
 | SPI/I2C/I80/QSPI (with PSRAM) | `ESP_LV_ADAPTER_DISPLAY_SPI_WITH_PSRAM_DEFAULT_CONFIG(...)` | `ESP_LV_ADAPTER_TEAR_AVOID_MODE_DEFAULT` (i.e., `NONE`) |
 | SPI/I2C/I80/QSPI (without PSRAM) | `ESP_LV_ADAPTER_DISPLAY_SPI_WITHOUT_PSRAM_DEFAULT_CONFIG(...)` | `ESP_LV_ADAPTER_TEAR_AVOID_MODE_DEFAULT` (i.e., `NONE`) |
+| MONO (Monochrome) | `ESP_LV_ADAPTER_DISPLAY_PROFILE_MONO_DEFAULT_CONFIG(...)` | `ESP_LV_ADAPTER_TEAR_AVOID_MODE_DEFAULT` (i.e., `NONE`) |
 
 **Notes**:
 - Only MIPI DSI and RGB support tearing modes
 - SPI/I2C/I80/QSPI are collectively called "OTHER" interfaces in the adapter and support only `NONE` mode
+- MONO (Monochrome) interface supports I1 horizontal tiled (HTILED) and vertical tiled (VTILED) layouts, and **supports rotation**
 
 #### Computing Frame Buffer Count
 
@@ -267,6 +269,7 @@ Choose the appropriate tearing mode based on your use case:
 **Important Limitations**:
 - RGB/MIPI DSI with `TEAR_AVOID_MODE_NONE` **forbids rotation** (any non-zero rotation is rejected)
 - OTHER (SPI/I2C/I80/QSPI) interfaces support `NONE` and `TE_SYNC` modes; for rotation, configure panel orientation (swap XY/mirror) during LCD initialization and adjust touch mapping accordingly
+- MONO (Monochrome) interface **supports software rotation** (0°/90°/180°/270°) with pixel-level rotation handled by LVGL
 - `TE_SYNC` mode requires panel to provide TE output signal and connect TE pin to ESP GPIO; use `ESP_LV_ADAPTER_DISPLAY_SPI_WITH_PSRAM_TE_DEFAULT_CONFIG` macro for configuration. The `examples/display/gui/lvgl_common_demo` automatically detects and uses TE synchronization if available
 
 #### Memory Estimation
@@ -378,6 +381,15 @@ assert(touch != NULL);
 - `touch_handle`: Touch handle created via `esp_lcd_touch` API
 - Default scale factors: x = 1.0, y = 1.0
 
+To enable independent multi-touch control for discrete widgets on LVGL v9:
+
+```c
+touch_cfg.multi_touch.mode = ESP_LV_ADAPTER_TOUCH_MODE_MULTI_CONTROL;
+touch_cfg.multi_touch.pointers = 2;
+```
+
+`pointers` must be at least `2`, must not exceed `CONFIG_ESP_LCD_TOUCH_MAX_POINTS`, and is also limited by the remaining display input slots managed by the adapter.
+
 #### Encoder/Knob
 
 Requires Kconfig option `ESP_LV_ADAPTER_ENABLE_KNOB`. See `esp_lv_adapter_input.h` for `esp_lv_adapter_encoder_config_t`.
@@ -460,8 +472,14 @@ lv_obj_set_style_text_font(label, font30, 0);
 
 | LVGL Version | Required Setting | Explanation |
 |--------------|------------------|-------------|
-| v8 | `CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768` | Font initialization runs on calling thread |
-| v9 | `CONFIG_LV_DRAW_THREAD_STACK_SIZE=32768` | Font rendering runs on draw threads |
+| v8 | Ensure the caller task has enough stack | Font initialization runs on calling thread |
+| v9 | Ensure LVGL draw threads have enough stack | Font rendering runs on draw threads |
+
+Enable `ESP_LVGL_ADAPTER_FREETYPE_SMALL_RENDER_POOL` to reduce FreeType's render pool from 16KB to 4KB. With LVGL v9, this also removes LVGL's conservative 32KB build-time diagnostic when a smaller draw-thread stack is configured.
+
+Enable `ESP_LVGL_ADAPTER_FREETYPE_MINIMAL_BUILD` to reduce FreeType flash usage on both LVGL v8 and v9 by keeping only the common LVGL runtime font path (`TTF/OTF`, `sfnt`, `smooth` renderer, CFF/OpenType helpers) and dropping legacy font drivers plus optional compressed stream/renderer helpers from the final linked image. Keep this disabled if your project depends on Type1/CID/PFR/Type42/BDF/PCF/FNT fonts, compressed font streams, or SVG/SDF rendering.
+
+Enable `ESP_LVGL_ADAPTER_LVGL_THREAD_STACK_IN_PSRAM` only after validating PSRAM stack safety for the target. This experimental option moves LVGL-created FreeRTOS thread stacks, including LVGL v9 draw threads, to PSRAM.
 
 **Limitations**:
 - LVGL v8: Does not support LVGL virtual filesystem (`lv_fs`), use direct file paths or memory buffers
@@ -493,6 +511,8 @@ ESP_ERROR_CHECK(esp_lv_adapter_set_dummy_draw(disp, true));
 ESP_ERROR_CHECK(esp_lv_adapter_dummy_draw_blit(disp, 0, 0, 800, 480, framebuffer, true));
 ESP_ERROR_CHECK(esp_lv_adapter_set_dummy_draw(disp, false));
 ```
+
+Note: When entering Dummy Draw mode, the application must stop LVGL rendering.
 
 See `examples/display/gui/lvgl_dummy_draw` for details.
 
@@ -549,7 +569,12 @@ ESP_ERROR_CHECK(esp_lv_adapter_set_area_rounder_cb(disp, NULL, NULL));
 
 Safely power down displays while preserving UI state to reduce power consumption. The adapter provides a sleep mechanism that works seamlessly with ESP-IDF Light Sleep.
 
-**Basic Flow:**
+The adapter boundary is intentionally narrow:
+- The adapter decides when LVGL can sleep or wake.
+- The application decides what to do with the LCD, backlight, touch power, and board-specific wake sources.
+- The adapter does not call `esp_lcd_panel_disp_sleep()`, `esp_lcd_panel_disp_on_off()`, or board LCD deinit/reinit APIs for you.
+
+**Manual Full Sleep Flow:**
 
 ```c
 // Enter sleep
@@ -557,9 +582,28 @@ esp_lv_adapter_sleep_prepare();      // Pauses worker, waits for flush
 esp_lcd_panel_del(panel);             // Delete hardware
 esp_light_sleep_start();              // Enter Light Sleep (CPU paused, peripherals maintained)
 
-// Recover from sleep (executed automatically after Light Sleep wake-up)
+// After Light Sleep returns, reinitialize and recover:
 panel = /* reinit LCD hardware */;
 esp_lv_adapter_sleep_recover(disp, panel, panel_io);  // Rebinds panel, resumes worker
+```
+
+**Auto Sleep Flow:**
+
+```c
+esp_lv_adapter_config_t cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG();
+cfg.auto_sleep.enable = true;
+cfg.auto_sleep.idle_timeout_ms = 5000;
+
+// Pause-only flow: adapter pauses LVGL, user callback handles panel blank/sleep.
+cfg.auto_sleep.mode = ESP_LV_ADAPTER_AUTO_SLEEP_MODE_PAUSE;
+cfg.auto_sleep.callbacks.on_enter_sleep = panel_sleep_cb;
+cfg.auto_sleep.callbacks.on_exit_sleep = panel_wake_cb;
+
+// User-managed flow: callback performs the complete sleep/deinit/wake/recover sequence.
+// cfg.auto_sleep.mode = ESP_LV_ADAPTER_AUTO_SLEEP_MODE_USER;
+// cfg.auto_sleep.callbacks.on_enter_sleep = board_light_sleep_cycle_cb;
+
+ESP_ERROR_CHECK(esp_lv_adapter_init(&cfg));
 ```
 
 **Using with Light Sleep:**
@@ -569,6 +613,42 @@ esp_lv_adapter_sleep_recover(disp, panel, panel_io);  // Rebinds panel, resumes 
 3. **Enter Light Sleep**: Call `esp_light_sleep_start()`, which pauses the CPU while maintaining peripheral state
 4. **Recover after wake-up**: Reinitialize LCD hardware, then call `esp_lv_adapter_sleep_recover()` to resume adapter operation
 
+**Using Auto Sleep Pause Mode:**
+
+1. Enable `CONFIG_PM_ENABLE` and tickless idle in ESP-IDF
+2. Configure `cfg.auto_sleep.mode = ESP_LV_ADAPTER_AUTO_SLEEP_MODE_PAUSE`
+3. Provide callbacks that only manage panel or backlight state
+4. Registered touch/button/knob inputs automatically notify the adapter on activity; for custom wake sources call `esp_lv_adapter_request_wake()` or `esp_lv_adapter_request_wake_from_isr()`
+
+**Using Auto Sleep User Mode:**
+
+1. Configure `cfg.auto_sleep.mode = ESP_LV_ADAPTER_AUTO_SLEEP_MODE_USER`
+2. Implement `on_enter_sleep()` to run your full board flow:
+   `esp_lv_adapter_sleep_prepare()` -> LCD deinit -> `esp_light_sleep_start()` -> LCD init -> `esp_lv_adapter_sleep_recover()`
+3. Keep panel-specific or board-specific actions in the application callback, not in the adapter
+
+**PAUSE Mode: Touch/Button Wake**
+
+PAUSE mode releases `ESP_PM_NO_LIGHT_SLEEP` when idle; the system enters tickless light sleep automatically. Waking from a touch or button interrupt requires two steps — both are required:
+
+- **MCU wake** (app): configure `gpio_wakeup_enable()` + `esp_sleep_enable_gpio_wakeup()` in `on_enter_sleep`
+- **Adapter resume** (built-in): touch drivers call `esp_lv_adapter_request_wake_from_isr()` from ISR; button/knob drivers call `esp_lv_adapter_request_wake()` from their task callbacks
+
+```c
+static void panel_sleep_cb(void *user_data)
+{
+    bsp_display_backlight_off();
+    gpio_wakeup_enable(TOUCH_INT_GPIO, GPIO_INTR_LOW_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
+}
+
+static void panel_wake_cb(void *user_data)
+{
+    gpio_wakeup_disable(TOUCH_INT_GPIO);
+    bsp_display_backlight_on();
+}
+```
+
 **Key Features:**
 - UI state preserved (no need to recreate widgets)
 - Touch inputs remain registered (power down separately if needed)
@@ -576,6 +656,15 @@ esp_lv_adapter_sleep_recover(disp, panel, panel_io);  // Rebinds panel, resumes 
 - Seamless integration with Light Sleep for low-power standby
 
 **⚠️ Advanced:** Use `esp_lv_adapter_pause()`/`resume()` for custom flows, but do NOT mix with `sleep_prepare()`
+
+### Using `pause()` / `resume()` with Tickless Auto Light Sleep
+
+If tickless auto Light Sleep is enabled, `esp_lv_adapter_pause()` / `resume()` can be used without calling `esp_light_sleep_start()` manually.
+
+**Notes:**
+- Use `pause()` / `resume()` for pause-only auto sleep flows; use `sleep_prepare()` / `sleep_recover()` when LCD hardware must be deleted and recreated
+- While paused, the internal `LVGL tick` timer is stopped; in `esp_timer_dump(stdout)` it may remain visible but should be disarmed (`Period = 0`, `Alarm = 0`)
+- Do not mix manual `pause()` with `sleep_prepare()`
 
 ---
 
@@ -591,6 +680,7 @@ Configure via `idf.py menuconfig`:
 | `ESP_LV_ADAPTER_ENABLE_FPS_STATS` | Enable FPS monitoring APIs |
 | `ESP_LV_ADAPTER_ENABLE_BUTTON` | Enable navigation button input support |
 | `ESP_LV_ADAPTER_ENABLE_KNOB` | Enable rotary encoder input support |
+| `ESP_LV_ADAPTER_PARTIAL_AUX_IMG_CACHE` | Resolve repeated decoding issues in partial modes by setting image cache to max |
 
 **Default Task Stack Size**:
 - LVGL adapter task stack: 8KB
@@ -610,11 +700,17 @@ Configure via `idf.py menuconfig`:
 
 - **RGB/MIPI DSI**:
   - `TEAR_AVOID_MODE_NONE` **forbids rotation** (any non-zero rotation is rejected)
-  
+
 - **OTHER (SPI/I2C/I80/QSPI)**:
   - Adapter does not apply 90°/270° rotation
   - For rotation, configure panel orientation (swap XY/mirror) during LCD initialization
   - Must also adjust touch coordinate mapping
+
+- **MONO (Monochrome)**:
+  - **Fully supports rotation** (0°/90°/180°/270°)
+  - Rotation is handled at the software level by LVGL
+  - Supports both I1 horizontal tiled (HTILED) and vertical tiled (VTILED) layouts
+  - No additional configuration needed, just set via the `rotation` parameter
 
 ### Buffering and Render Modes
 
@@ -648,12 +744,17 @@ Configure via `idf.py menuconfig`:
 Recommended cleanup order when shutting down UI:
 
 ```c
-// 1. Unregister input devices
+// 1. (Optional) Explicitly unregister input devices ahead of deinit.
+//    If skipped, esp_lv_adapter_deinit() handles this automatically
+//    via each device type's dedicated unregister path.
 esp_lv_adapter_unregister_touch(touch);
 // esp_lv_adapter_unregister_encoder(encoder);
 // esp_lv_adapter_unregister_navigation_buttons(buttons);
 
-// 2. Unregister display(s)
+// 2. (Optional) Explicitly unregister display(s) ahead of deinit.
+//    esp_lv_adapter_unregister_display() internally pauses the adapter,
+//    waits for the current flush to complete, then unregisters safely.
+//    If skipped, esp_lv_adapter_deinit() clears remaining displays.
 esp_lv_adapter_unregister_display(disp);
 
 // 3. Unmount filesystem(s) (if used)
@@ -661,8 +762,11 @@ esp_lv_adapter_fs_unmount(fs_handle);
 // Release mmap assets
 mmap_assets_del(assets);
 
-// 4. Deinitialize adapter
-// Note: FreeType fonts are auto-cleaned if enabled
+// 4. Deinitialize adapter.
+//    Internally: pauses the adapter task, waits for all pending flushes
+//    to complete, unregisters any remaining input devices and displays,
+//    stops the LVGL tick timer, and calls lv_deinit() where applicable.
+//    FreeType fonts are auto-cleaned if enabled.
 esp_lv_adapter_deinit();
 ```
 
@@ -679,9 +783,9 @@ esp_lv_adapter_deinit();
 
 If you encounter display freeze when using `ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL` mode with screen rotation enabled on ESP32-P4, you need to apply the following patch:
 
-**Target Version**: ESP-IDF release/v5.5 (commit `62beeae461bd3692c2028f96a93c84f11291e155`)
+**Target Version**: ESP-IDF `tags/v6.0` (commit `662a3be354759d9487bf4b1a629fadb766cb1800`)
 
-**Patch File**: `0001-bugfix-lcd-Fixed-PPA-freeze.patch`
+**Patch File**: `0001-bugfix-ppa-Temporary-fix-for-the-PPA-hang-issue.patch`
 
 **How to Apply**:
 
@@ -689,7 +793,7 @@ In your ESP-IDF repository root directory:
 
 ```bash
 cd $IDF_PATH
-git apply /path/to/esp_lvgl_adapter/0001-bugfix-lcd-Fixed-PPA-freeze.patch
+git apply /path/to/esp_lvgl_adapter/0001-bugfix-ppa-Temporary-fix-for-the-PPA-hang-issue.patch
 ```
 
 **Issue Description**:
@@ -705,7 +809,7 @@ git apply /path/to/esp_lvgl_adapter/0001-bugfix-lcd-Fixed-PPA-freeze.patch
 Check if `components/esp_driver_ppa/src/ppa_srm.c` contains the following code:
 
 ```c
-PPA.sr_byte_order.sr_macro_bk_ro_bypass = 1;
+ppa_ll_srm_bypass_mb_order(platform->hal.dev, true);
 ```
 
 ---
@@ -728,8 +832,9 @@ PPA.sr_byte_order.sr_macro_bk_ro_bypass = 1;
 
 **Solutions**:
 - Ensure LVGL FreeType is enabled (`CONFIG_LV_USE_FREETYPE=y`)
-- LVGL v8: Set `CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768`
-- LVGL v9: Set `CONFIG_LV_DRAW_THREAD_STACK_SIZE=32768`
+- If using a smaller LVGL v9 draw-thread stack, enable `CONFIG_ESP_LVGL_ADAPTER_FREETYPE_SMALL_RENDER_POOL`.
+- If using `CONFIG_ESP_LVGL_ADAPTER_FREETYPE_MINIMAL_BUILD`, verify the font format is still within the retained TTF/OTF-focused subset.
+- If crashes persist, increase the caller task stack on LVGL v8 or `CONFIG_LV_DRAW_THREAD_STACK_SIZE` on LVGL v9.
 
 ### Screen Tearing or Flicker
 
@@ -785,9 +890,9 @@ if (esp_lv_adapter_lock(-1) == ESP_OK) {
 
 ## See Also
 
-- [ESP LV FS Component](../../esp_lv_fs/README.md)
-- [ESP LV Decoder Component](../../esp_lv_decoder/README.md)
-- [ESP Mmap Assets Component](../../esp_mmap_assets/README.md)
+- [ESP LV FS Component](../esp_lv_fs/README.md)
+- [ESP LV Decoder Component](../esp_lv_decoder/README.md)
+- [ESP Mmap Assets Component](../esp_mmap_assets/README.md)
 
 ---
 

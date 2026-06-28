@@ -6,9 +6,9 @@ description: ESP LCD JD9365(MIPI-DSI)
 issues: https://github.com/espressif/esp-iot-solution/issues
 repository: git://github.com/waveshareteam/Waveshare-ESP32-components.git
 repository_info:
-  commit_sha: 19cbe6611d763184dd04cd2676d042ff13a86cf3
+  commit_sha: 9daffb7168b3c093a330da700988a22092294eef
   path: display/lcd/esp_lcd_jd9365
 targets:
 - esp32p4
 url: https://github.com/espressif/esp-iot-solution/tree/master/components/display/lcd/esp_lcd_jd9365
-version: 1.0.6
+version: 2.0.0

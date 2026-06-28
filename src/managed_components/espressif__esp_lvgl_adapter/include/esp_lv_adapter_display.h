@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2025 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2025-2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -7,6 +7,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_io.h"
 #include "driver/gpio.h"
@@ -38,6 +39,15 @@ typedef enum {
 } esp_lv_adapter_panel_interface_t;
 
 /**
+ * @brief Monochrome buffer layout
+ */
+typedef enum {
+    ESP_LV_ADAPTER_MONO_LAYOUT_NONE = 0,  /*!< Not monochrome */
+    ESP_LV_ADAPTER_MONO_LAYOUT_HTILED,    /*!< I1 horizontal tiled layout (LVGL native) */
+    ESP_LV_ADAPTER_MONO_LAYOUT_VTILED,    /*!< I1 vertical tiled layout (page mode) */
+} esp_lv_adapter_mono_layout_t;
+
+/**
  * @brief Display rotation angle enumeration
  */
 typedef enum {
@@ -57,6 +67,7 @@ typedef enum {
     ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_DIRECT  = 3,    /*!< Double buffering with direct mode */
     ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL = 4,    /*!< Triple buffering with partial refresh */
     ESP_LV_ADAPTER_TEAR_AVOID_MODE_TE_SYNC        = 5,    /*!< TE GPIO based tear avoidance for SPI/I80/QSPI */
+    ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_PARTIAL = 6,    /*!< Double buffering with partial refresh */
 } esp_lv_adapter_tear_avoid_mode_t;
 
 #define ESP_LV_ADAPTER_TEAR_AVOID_MODE_DEFAULT_MIPI_DSI     ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL
@@ -114,6 +125,7 @@ typedef struct {
     bool use_psram;                         /*!< Use PSRAM for buffers if available */
     bool enable_ppa_accel;                  /*!< Enable PPA hardware acceleration */
     bool require_double_buffer;             /*!< Require double buffering */
+    esp_lv_adapter_mono_layout_t mono_layout;      /*!< Monochrome layout selection */
 } esp_lv_adapter_display_profile_t;
 
 /**
@@ -137,7 +149,8 @@ typedef struct {
     .buffer_height         = 50,                                                          \
     .use_psram             = false,                                                       \
     .enable_ppa_accel      = false,                                                       \
-    .require_double_buffer = false
+    .require_double_buffer = false,                                                       \
+    .mono_layout           = ESP_LV_ADAPTER_MONO_LAYOUT_NONE
 
 /* RGB interface default configuration */
 #define ESP_LV_ADAPTER_DISPLAY_PROFILE_RGB_DEFAULT_CONFIG(_hor_res, _ver_res, _rotation)  \
@@ -146,7 +159,8 @@ typedef struct {
     .buffer_height         = 50,                                                          \
     .use_psram             = false,                                                       \
     .enable_ppa_accel      = false,                                                       \
-    .require_double_buffer = false
+    .require_double_buffer = false,                                                       \
+    .mono_layout           = ESP_LV_ADAPTER_MONO_LAYOUT_NONE
 
 /* SPI/I2C and other interfaces default configuration with PSRAM*/
 #define ESP_LV_ADAPTER_DISPLAY_PROFILE_SPI_WITH_PSRAM_BASE_CONFIG(_hor_res, _ver_res, _rotation)     \
@@ -158,11 +172,13 @@ typedef struct {
 
 #define ESP_LV_ADAPTER_DISPLAY_PROFILE_SPI_WITH_PSRAM_DEFAULT_CONFIG(_hor_res, _ver_res, _rotation)    \
     ESP_LV_ADAPTER_DISPLAY_PROFILE_SPI_WITH_PSRAM_BASE_CONFIG(_hor_res, _ver_res, _rotation),          \
-    .require_double_buffer = true
+    .require_double_buffer = true,                                                                     \
+    .mono_layout           = ESP_LV_ADAPTER_MONO_LAYOUT_NONE
 
 #define ESP_LV_ADAPTER_DISPLAY_PROFILE_SPI_WITH_PSRAM_TE_DEFAULT_CONFIG(_hor_res, _ver_res, _rotation) \
     ESP_LV_ADAPTER_DISPLAY_PROFILE_SPI_WITH_PSRAM_BASE_CONFIG(_hor_res, _ver_res, _rotation),          \
-    .require_double_buffer = false
+    .require_double_buffer = false,                                                                    \
+    .mono_layout           = ESP_LV_ADAPTER_MONO_LAYOUT_NONE
 
 /* SPI/I2C and other interfaces default configuration without PSRAM*/
 #define ESP_LV_ADAPTER_DISPLAY_PROFILE_SPI_WITHOUT_PSRAM_DEFAULT_CONFIG(_hor_res, _ver_res, _rotation) \
@@ -171,7 +187,17 @@ typedef struct {
     .buffer_height         = 10,                                                                       \
     .use_psram             = false,                                                                    \
     .enable_ppa_accel      = false,                                                                    \
-    .require_double_buffer = false
+    .require_double_buffer = false,                                                                    \
+    .mono_layout           = ESP_LV_ADAPTER_MONO_LAYOUT_NONE
+
+#define ESP_LV_ADAPTER_DISPLAY_PROFILE_MONO_DEFAULT_CONFIG(_hor_res, _ver_res, _rotation, _mono_layout) \
+    .interface             = ESP_LV_ADAPTER_PANEL_IF_OTHER,                                            \
+    ESP_LV_ADAPTER_DISPLAY_PROFILE_BASE_CONFIG(_hor_res, _ver_res, _rotation)                          \
+    .buffer_height         = (_ver_res),                                                               \
+    .use_psram             = false,                                                                    \
+    .enable_ppa_accel      = false,                                                                    \
+    .require_double_buffer = false,                                                                    \
+    .mono_layout           = (_mono_layout)
 
 /**
  * @brief Display configuration structure
@@ -218,6 +244,13 @@ typedef struct {
                                   ESP_LV_ADAPTER_DISPLAY_PROFILE_SPI_WITHOUT_PSRAM_DEFAULT_CONFIG(_hor_res, _ver_res, _rotation), \
                                   ESP_LV_ADAPTER_TEAR_AVOID_MODE_DEFAULT,                                                         \
                                   ESP_LV_ADAPTER_TE_SYNC_DISABLED())
+
+#define ESP_LV_ADAPTER_DISPLAY_SPI_MONO_DEFAULT_CONFIG(_panel, _panel_io, _hor_res, _ver_res, _rotation, _mono_layout)                 \
+    ESP_LV_ADAPTER_DISPLAY_CONFIG(_panel, _panel_io,                                                                                 \
+                                  ESP_LV_ADAPTER_DISPLAY_PROFILE_MONO_DEFAULT_CONFIG(_hor_res, _ver_res, _rotation, _mono_layout),    \
+                                  ESP_LV_ADAPTER_TEAR_AVOID_MODE_DEFAULT,                                                            \
+                                  ESP_LV_ADAPTER_TE_SYNC_DISABLED())
+
 /**
  * @brief SPI with PSRAM and TE synchronization default configuration
  *
@@ -314,6 +347,99 @@ esp_err_t esp_lv_adapter_unregister_display(lv_display_t *disp);
 esp_err_t esp_lv_adapter_set_area_rounder_cb(lv_display_t *disp,
                                              void (*rounder_cb)(lv_area_t *area, void *user_data),
                                              void *user_data);
+
+/**
+ * @brief Draw bitmap callback collection
+ *
+ * When @c custom_draw_bitmap is non-NULL it replaces the @c esp_lcd_panel_draw_bitmap call made
+ * by the adapter during normal LVGL flush (TEAR_AVOID_MODE_NONE only) and during dummy-draw blit.
+ * All surrounding flush-ready / ISR / task-notify logic remains unchanged.
+ *
+ * On success (ESP_OK) the callback must ensure the completion signal is triggered (e.g. by calling
+ * @c esp_lcd_panel_draw_bitmap internally so its done-ISR fires). On failure the adapter
+ * calls @c lv_display_flush_ready / task-notify itself as a fallback, so the flush handshake
+ * always completes.
+ *
+ * Not supported for TE-sync flush (TEAR_AVOID_MODE_TE_SYNC): the TE path always calls
+ * @c esp_lcd_panel_draw_bitmap directly and will not invoke this callback.
+ * RGB / MIPI-DSI frame-buffer modes do not call @c esp_lcd_panel_draw_bitmap either and will not
+ * invoke this callback.
+ *
+ * All members are optional; set to NULL to use default behaviour.
+ */
+typedef struct {
+    /**
+     * @brief Replace the default @c esp_lcd_panel_draw_bitmap call.
+     *
+     * Return ESP_OK to indicate the blit was successfully initiated (completion signal will arrive
+     * asynchronously). Return any other value to tell the adapter that the blit failed and no
+     * completion signal will come; the adapter will then unblock the flush handshake immediately.
+     *
+     * @param disp       LVGL display handle
+     * @param panel      LCD panel handle (pass to esp_lcd_panel_draw_bitmap if needed)
+     * @param x_start    Left boundary (inclusive)
+     * @param y_start    Top boundary (inclusive)
+     * @param x_end      Right boundary (exclusive)
+     * @param y_end      Bottom boundary (exclusive)
+     * @param color_map  Pixel data buffer
+     * @param user_ctx   User context passed to @c esp_lv_adapter_set_draw_bitmap_callbacks
+     * @return ESP_OK on success, any other value on failure
+     */
+    esp_err_t (*custom_draw_bitmap)(lv_display_t *disp,
+                                    esp_lcd_panel_handle_t panel,
+                                    int x_start, int y_start, int x_end, int y_end,
+                                    const void *color_map, void *user_ctx);
+} esp_lv_adapter_draw_bitmap_callbacks_t;
+
+/**
+ * @brief Register draw bitmap callbacks for a display
+ *
+ * Replaces any previously registered callbacks. Pass NULL to clear all callbacks.
+ *
+ * @param[in] disp     LVGL display handle
+ * @param[in] cbs      Callback collection (NULL to clear)
+ * @param[in] user_ctx User context pointer passed back to each callback
+ *
+ * @return
+ *      - ESP_OK: Success
+ *      - ESP_ERR_INVALID_ARG: Invalid display handle
+ *      - ESP_ERR_INVALID_STATE: Adapter not initialized
+ *      - ESP_ERR_NOT_FOUND: Display not found
+ */
+esp_err_t esp_lv_adapter_set_draw_bitmap_callbacks(lv_display_t *disp,
+                                                   const esp_lv_adapter_draw_bitmap_callbacks_t *cbs,
+                                                   void *user_ctx);
+
+/**
+ * @brief Set the default adapter-managed ESP-IDF LCD callback registration mode for new displays.
+ *
+ * This affects displays registered after the call. The default is enabled.
+ *
+ * @param[in] enable Whether newly registered displays should let the adapter register ESP-IDF LCD callbacks.
+ * @return
+ *      - ESP_OK: Success
+ *      - ESP_ERR_INVALID_STATE: Adapter not initialized
+ */
+esp_err_t esp_lv_adapter_set_default_display_idf_callback_registration_enabled(bool enable);
+
+/**
+ * @brief Notify adapter-side display logic that LCD color transfer completed from an ISR.
+ *
+ * This is useful when an external owner registers LCD panel callbacks and wants to reuse the adapter's default
+ * color-transfer-done handling without letting the adapter register the ESP-IDF callbacks itself.
+ *
+ * @param[in] disp LVGL display handle.
+ * @return Whether a high-priority task should yield.
+ */
+bool esp_lv_adapter_display_notify_color_trans_done_from_isr(lv_display_t *disp);
+
+/**
+ * @brief Notify adapter-side display logic that LCD frame refresh completed from an ISR.
+ *
+ * @param[in] disp LVGL display handle.
+ * @return Whether a high-priority task should yield.
+ */
+bool esp_lv_adapter_display_notify_frame_done_from_isr(lv_display_t *disp);
 
 #ifdef __cplusplus
 }

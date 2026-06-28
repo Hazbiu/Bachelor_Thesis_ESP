@@ -9,6 +9,7 @@
  * @brief LVGL adapter implementation for ESP-IDF
  */
 
+#include <inttypes.h>
 #include <string.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
@@ -17,6 +18,7 @@
 #include "freertos/idf_additions.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_idf_version.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "lvgl.h"
@@ -24,6 +26,7 @@
 #include "adapter_internal.h"
 #include "display_manager.h"
 #include "display_bridge.h"
+#include "bridge/common/display_bridge_common.h"
 
 /* Tag for logging */
 static const char *TAG = "esp_lvgl:adapter";
@@ -39,6 +42,14 @@ static bool s_freetype_initialized = false;
 /* Forward declarations of internal functions */
 static esp_err_t tick_init(void);
 static void lvgl_worker(void *arg);
+static esp_err_t adapter_wait_for_all_flush_done(int32_t timeout_ms);
+static esp_err_t adapter_unregister_all_inputs(void);
+static esp_err_t adapter_stop_tick_timer(void);
+static esp_err_t adapter_start_tick_timer(void);
+static esp_err_t adapter_auto_sleep_enter(uint32_t next_delay_ms_raw);
+static esp_err_t adapter_auto_sleep_exit(void);
+
+#define ESP_LV_ADAPTER_AUTO_SLEEP_FLUSH_TIMEOUT_MS 5000
 
 /*****************************************************************************
  *                         Public API Implementation                         *
@@ -49,6 +60,67 @@ static void adapter_sleep_state_reset(esp_lv_adapter_sleep_state_t *state)
     if (state) {
         memset(state, 0, sizeof(*state));
     }
+}
+
+static void adapter_sleep_prepare_cleanup(void)
+{
+    esp_lv_adapter_resume();
+    adapter_sleep_state_reset(&s_ctx.sleep_state);
+}
+
+static uint8_t adapter_sleep_count_tracked_inputs(const esp_lv_adapter_display_node_t *node)
+{
+    return node ? node->sleep.input_count : 0;
+}
+
+static esp_err_t adapter_sleep_snapshot_displays(void)
+{
+    uint8_t total_displays = 0;
+
+    for (esp_lv_adapter_display_node_t *node = s_ctx.display_list; node; node = node->next) {
+        total_displays++;
+        if (total_displays > ESP_LV_ADAPTER_MAX_SLEEP_DISPLAYS) {
+            ESP_LOGE(TAG, "Sleep prepare supports up to %d displays (found %u)",
+                     ESP_LV_ADAPTER_MAX_SLEEP_DISPLAYS, total_displays);
+            return ESP_ERR_INVALID_SIZE;
+        }
+    }
+
+    adapter_sleep_state_reset(&s_ctx.sleep_state);
+
+    esp_lv_adapter_display_node_t *node = s_ctx.display_list;
+    while (node && s_ctx.sleep_state.display_count < ESP_LV_ADAPTER_MAX_SLEEP_DISPLAYS) {
+        uint8_t idx = s_ctx.sleep_state.display_count++;
+        s_ctx.sleep_state.all_displays[idx] = node->lv_disp;
+        s_ctx.sleep_state.display_nodes[idx] = node;
+        node = node->next;
+    }
+
+    return ESP_OK;
+}
+
+static uint8_t adapter_sleep_count_snapshot_inputs(void)
+{
+    uint8_t total_inputs = 0;
+
+    for (uint8_t i = 0; i < s_ctx.sleep_state.display_count; i++) {
+        total_inputs += adapter_sleep_count_tracked_inputs(s_ctx.sleep_state.display_nodes[i]);
+    }
+
+    return total_inputs;
+}
+
+static uint8_t adapter_sleep_count_remaining_displays(void)
+{
+    uint8_t remaining = 0;
+
+    for (uint8_t i = 0; i < s_ctx.sleep_state.display_count; i++) {
+        if (s_ctx.sleep_state.all_displays[i] != NULL) {
+            remaining++;
+        }
+    }
+
+    return remaining;
 }
 
 static void adapter_detach_display_node(esp_lv_adapter_display_node_t *node)
@@ -71,20 +143,446 @@ static void adapter_detach_display_node(esp_lv_adapter_display_node_t *node)
     }
 }
 
+static esp_err_t adapter_wait_for_all_flush_done(int32_t timeout_ms)
+{
+    esp_lv_adapter_display_node_t *node = s_ctx.display_list;
+    while (node) {
+        if (node->lv_disp) {
+            esp_err_t ret = display_manager_wait_flush_done(node->lv_disp, timeout_ms);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+        }
+        node = node->next;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t adapter_unregister_all_inputs(void)
+{
+    uint32_t input_count = 0;
+
+    /* Each esp_lv_adapter_unregister_* call removes the node from s_ctx.input_list
+     * via esp_lv_adapter_unregister_input_device(), so re-reading s_ctx.input_list
+     * at the top of every iteration is intentional and required. */
+    while (s_ctx.input_list) {
+        lv_indev_t *indev = s_ctx.input_list->indev;
+        esp_lv_adapter_input_type_t type = s_ctx.input_list->type;
+        esp_err_t ret = ESP_OK;
+
+        if (!indev) {
+            /* Node has no associated LVGL device; its user_ctx sub-resources were
+             * never initialized, so only the node itself needs to be freed. */
+            esp_lv_adapter_input_node_t *orphan = s_ctx.input_list;
+            s_ctx.input_list = orphan->next;
+            free(orphan);
+            continue;
+        }
+
+        switch (type) {
+        case ESP_LV_ADAPTER_INPUT_TYPE_TOUCH:
+            ret = esp_lv_adapter_unregister_touch(indev);
+            break;
+#if CONFIG_ESP_LVGL_ADAPTER_ENABLE_BUTTON
+        case ESP_LV_ADAPTER_INPUT_TYPE_BUTTON:
+            ret = esp_lv_adapter_unregister_navigation_buttons(indev);
+            break;
+#endif
+#if CONFIG_ESP_LVGL_ADAPTER_ENABLE_KNOB
+        case ESP_LV_ADAPTER_INPUT_TYPE_ENCODER:
+            ret = esp_lv_adapter_unregister_encoder(indev);
+            break;
+#endif
+        default: {
+            /* Unknown type: no dedicated unregister path exists, so perform the
+             * minimum safe cleanup — remove from list, delete LVGL device.
+             * user_ctx sub-resources (if any) are the caller's responsibility;
+             * log a warning so the issue is visible during development. */
+            esp_lv_adapter_input_node_t *unknown_node = s_ctx.input_list;
+            s_ctx.input_list = unknown_node->next;
+
+            ret = esp_lv_adapter_lock((uint32_t) -1);
+            if (ret != ESP_OK) {
+                s_ctx.input_list = unknown_node;
+                return ret;
+            }
+
+            lv_indev_delete(indev);
+            esp_lv_adapter_unlock();
+
+            if (unknown_node->user_ctx) {
+                ESP_LOGW(TAG, "Unknown input type %d: user_ctx sub-resources may leak", type);
+            }
+            free(unknown_node);
+            ret = ESP_OK;
+            break;
+        }
+        }
+
+        if (ret != ESP_OK) {
+            return ret;
+        }
+
+        input_count++;
+    }
+
+    if (input_count > 0) {
+        ESP_LOGI(TAG, "%lu input device(s) cleaned up", input_count);
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t adapter_stop_tick_timer(void)
+{
+    if (!s_ctx.tick_timer) {
+        return ESP_OK;
+    }
+
+    esp_timer_handle_t timer = (esp_timer_handle_t)s_ctx.tick_timer;
+    esp_err_t ret;
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+    ret = esp_timer_stop_blocking(timer, portMAX_DELAY);
+    if (ret == ESP_ERR_NOT_FINISHED) {
+        ret = ESP_OK;
+    }
+#else
+    ret = esp_timer_stop(timer);
+#endif
+
+    if (ret == ESP_ERR_INVALID_STATE) {
+        return ESP_OK;
+    }
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to stop LVGL tick timer (%d)", ret);
+    }
+
+    return ret;
+}
+
+static esp_err_t adapter_start_tick_timer(void)
+{
+    if (!s_ctx.tick_timer) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = esp_timer_start_periodic((esp_timer_handle_t)s_ctx.tick_timer,
+                                             s_ctx.config.tick_period_ms * 1000);
+    if (ret == ESP_ERR_INVALID_STATE) {
+        return ESP_OK;
+    }
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to start LVGL tick timer (%d)", ret);
+    }
+
+    return ret;
+}
+
+static bool adapter_auto_sleep_is_enabled(void)
+{
+    const esp_lv_adapter_auto_sleep_config_t *cfg = &s_ctx.auto_sleep.config;
+    return cfg->enable &&
+           cfg->mode != ESP_LV_ADAPTER_AUTO_SLEEP_MODE_DISABLED &&
+           cfg->idle_timeout_ms > 0;
+}
+
+static bool adapter_auto_sleep_is_pause_mode(void)
+{
+    return adapter_auto_sleep_is_enabled() &&
+           s_ctx.auto_sleep.config.mode == ESP_LV_ADAPTER_AUTO_SLEEP_MODE_PAUSE;
+}
+
+static bool adapter_auto_sleep_should_latch_wake_request(void)
+{
+    if (!adapter_auto_sleep_is_pause_mode()) {
+        return false;
+    }
+
+    return s_ctx.auto_sleep.state == ESP_LV_ADAPTER_AUTO_SLEEP_STATE_ENTERING ||
+           s_ctx.auto_sleep.state == ESP_LV_ADAPTER_AUTO_SLEEP_STATE_SLEEPING ||
+           s_ctx.auto_sleep.state == ESP_LV_ADAPTER_AUTO_SLEEP_STATE_WAKING;
+}
+
+static void adapter_auto_sleep_consume_pending_activity(void)
+{
+    if (!adapter_auto_sleep_is_enabled() || !s_ctx.auto_sleep.activity_pending) {
+        return;
+    }
+
+    s_ctx.auto_sleep.activity_pending = false;
+    s_ctx.auto_sleep.last_activity_us = esp_timer_get_time();
+}
+
+static void adapter_auto_sleep_mark_activity_internal(void)
+{
+    if (!adapter_auto_sleep_is_enabled()) {
+        return;
+    }
+
+    if (s_ctx.auto_sleep.state == ESP_LV_ADAPTER_AUTO_SLEEP_STATE_ACTIVE) {
+        s_ctx.auto_sleep.wake_requested = false;
+    }
+
+    s_ctx.auto_sleep.activity_pending = false;
+    s_ctx.auto_sleep.last_activity_us = esp_timer_get_time();
+}
+
+static void adapter_auto_sleep_notify_task(void)
+{
+    if (s_ctx.task) {
+        xTaskNotifyGive(s_ctx.task);
+    }
+}
+
+static void adapter_auto_sleep_notify_task_from_isr(void)
+{
+    if (!s_ctx.task) {
+        return;
+    }
+
+    BaseType_t high_prio_woken = pdFALSE;
+    vTaskNotifyGiveFromISR(s_ctx.task, &high_prio_woken);
+    if (high_prio_woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+static esp_err_t adapter_auto_sleep_pm_lock_acquire(void)
+{
+    if (!adapter_auto_sleep_is_pause_mode() || !s_ctx.auto_sleep.pm_lock || s_ctx.auto_sleep.pm_lock_held) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = esp_pm_lock_acquire(s_ctx.auto_sleep.pm_lock);
+    if (ret == ESP_OK) {
+        s_ctx.auto_sleep.pm_lock_held = true;
+    } else {
+        ESP_LOGE(TAG, "Failed to acquire auto sleep PM lock (%s)", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+static esp_err_t adapter_auto_sleep_pm_lock_release(void)
+{
+    if (!adapter_auto_sleep_is_pause_mode() || !s_ctx.auto_sleep.pm_lock || !s_ctx.auto_sleep.pm_lock_held) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = esp_pm_lock_release(s_ctx.auto_sleep.pm_lock);
+    if (ret == ESP_OK) {
+        s_ctx.auto_sleep.pm_lock_held = false;
+    } else {
+        ESP_LOGE(TAG, "Failed to release auto sleep PM lock (%s)", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+static void adapter_auto_sleep_restore_sleeping_state(bool release_pm_lock)
+{
+    if (release_pm_lock) {
+        esp_err_t ret = adapter_auto_sleep_pm_lock_release();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to restore PM lock state after wake error (%s)",
+                     esp_err_to_name(ret));
+        }
+    }
+
+    s_ctx.auto_sleep.state = ESP_LV_ADAPTER_AUTO_SLEEP_STATE_SLEEPING;
+}
+
+static bool adapter_auto_sleep_should_enter(uint32_t next_delay_ms_raw)
+{
+    (void)next_delay_ms_raw;
+
+    if (!adapter_auto_sleep_is_enabled()) {
+        return false;
+    }
+
+    if (s_ctx.auto_sleep.state != ESP_LV_ADAPTER_AUTO_SLEEP_STATE_ACTIVE) {
+        return false;
+    }
+
+    if (s_ctx.paused || s_ctx.sleep_state.is_sleeping || s_ctx.auto_sleep.activity_pending) {
+        return false;
+    }
+
+    uint32_t idle_timeout_ms = s_ctx.auto_sleep.config.idle_timeout_ms;
+    int64_t elapsed_us = esp_timer_get_time() - s_ctx.auto_sleep.last_activity_us;
+    return elapsed_us >= ((int64_t)idle_timeout_ms * 1000);
+}
+
+static esp_err_t adapter_auto_sleep_call_enter_callback(void)
+{
+    if (!s_ctx.auto_sleep.config.callbacks.on_enter_sleep) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = s_ctx.auto_sleep.config.callbacks.on_enter_sleep(
+                        s_ctx.auto_sleep.config.callbacks.user_ctx);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Auto sleep enter callback failed (%s)", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+static esp_err_t adapter_auto_sleep_call_exit_callback(void)
+{
+    if (!s_ctx.auto_sleep.config.callbacks.on_exit_sleep) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = s_ctx.auto_sleep.config.callbacks.on_exit_sleep(
+                        s_ctx.auto_sleep.config.callbacks.user_ctx);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Auto sleep exit callback failed (%s)", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+static esp_err_t adapter_auto_sleep_enter(uint32_t next_delay_ms_raw)
+{
+    if (!adapter_auto_sleep_should_enter(next_delay_ms_raw)) {
+        return ESP_OK;
+    }
+
+    s_ctx.auto_sleep.state = ESP_LV_ADAPTER_AUTO_SLEEP_STATE_ENTERING;
+    ESP_LOGI(TAG, "Auto sleep enter requested (mode=%d, idle_timeout_ms=%" PRIu32 ")",
+             s_ctx.auto_sleep.config.mode, s_ctx.auto_sleep.config.idle_timeout_ms);
+
+    if (s_ctx.auto_sleep.config.mode == ESP_LV_ADAPTER_AUTO_SLEEP_MODE_USER) {
+        esp_err_t ret = adapter_auto_sleep_call_enter_callback();
+        s_ctx.auto_sleep.state = ESP_LV_ADAPTER_AUTO_SLEEP_STATE_ACTIVE;
+        adapter_auto_sleep_mark_activity_internal();
+        return ret;
+    }
+
+    esp_err_t ret = adapter_wait_for_all_flush_done(ESP_LV_ADAPTER_AUTO_SLEEP_FLUSH_TIMEOUT_MS);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Auto sleep flush wait failed (%s)", esp_err_to_name(ret));
+        s_ctx.auto_sleep.state = ESP_LV_ADAPTER_AUTO_SLEEP_STATE_ACTIVE;
+        return ret;
+    }
+
+    ret = adapter_auto_sleep_call_enter_callback();
+    if (ret != ESP_OK) {
+        s_ctx.auto_sleep.state = ESP_LV_ADAPTER_AUTO_SLEEP_STATE_ACTIVE;
+        adapter_auto_sleep_mark_activity_internal();
+        return ret;
+    }
+
+    ret = esp_lv_adapter_pause(-1);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to pause adapter for auto sleep (%s)", esp_err_to_name(ret));
+        s_ctx.auto_sleep.state = ESP_LV_ADAPTER_AUTO_SLEEP_STATE_ACTIVE;
+        adapter_auto_sleep_mark_activity_internal();
+        return ret;
+    }
+
+    ret = display_bridge_prepare_hw_resource_for_sleep();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to guard bridge HW resources for auto sleep (%s)", esp_err_to_name(ret));
+        (void)adapter_auto_sleep_call_exit_callback();
+        (void)esp_lv_adapter_resume();
+        s_ctx.auto_sleep.state = ESP_LV_ADAPTER_AUTO_SLEEP_STATE_ACTIVE;
+        adapter_auto_sleep_mark_activity_internal();
+        return ret;
+    }
+
+    ret = adapter_auto_sleep_pm_lock_release();
+    if (ret != ESP_OK) {
+        (void)display_bridge_resume_hw_resource_after_sleep();
+        (void)adapter_auto_sleep_call_exit_callback();
+        (void)esp_lv_adapter_resume();
+        s_ctx.auto_sleep.state = ESP_LV_ADAPTER_AUTO_SLEEP_STATE_ACTIVE;
+        adapter_auto_sleep_mark_activity_internal();
+        return ret;
+    }
+
+    s_ctx.auto_sleep.state = ESP_LV_ADAPTER_AUTO_SLEEP_STATE_SLEEPING;
+    if (s_ctx.auto_sleep.wake_requested) {
+        adapter_auto_sleep_notify_task();
+    }
+    ESP_LOGI(TAG, "Auto sleep entered");
+    return ESP_OK;
+}
+
+static esp_err_t adapter_auto_sleep_exit(void)
+{
+    if (!adapter_auto_sleep_is_pause_mode() ||
+            s_ctx.auto_sleep.state != ESP_LV_ADAPTER_AUTO_SLEEP_STATE_SLEEPING) {
+        return ESP_OK;
+    }
+
+    s_ctx.auto_sleep.state = ESP_LV_ADAPTER_AUTO_SLEEP_STATE_WAKING;
+    ESP_LOGI(TAG, "Auto sleep wake requested");
+
+    esp_err_t ret = adapter_auto_sleep_pm_lock_acquire();
+    if (ret != ESP_OK) {
+        s_ctx.auto_sleep.state = ESP_LV_ADAPTER_AUTO_SLEEP_STATE_SLEEPING;
+        return ret;
+    }
+
+    ret = adapter_auto_sleep_call_exit_callback();
+    if (ret != ESP_OK) {
+        adapter_auto_sleep_restore_sleeping_state(true);
+        return ret;
+    }
+
+    ret = esp_lv_adapter_resume();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to resume adapter from auto sleep (%s)", esp_err_to_name(ret));
+        adapter_auto_sleep_restore_sleeping_state(true);
+        return ret;
+    }
+
+    /* Release guard only after recovery succeeds, so error paths that fall back
+     * to SLEEPING keep it held */
+    esp_err_t guard_ret = display_bridge_resume_hw_resource_after_sleep();
+    if (guard_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to release bridge HW sleep guard on wake (%s)", esp_err_to_name(guard_ret));
+    }
+
+    s_ctx.auto_sleep.wake_requested = false;
+    s_ctx.auto_sleep.state = ESP_LV_ADAPTER_AUTO_SLEEP_STATE_ACTIVE;
+    adapter_auto_sleep_mark_activity_internal();
+    ESP_LOGI(TAG, "Auto sleep exited");
+    return ESP_OK;
+}
+
 esp_err_t esp_lv_adapter_init(const esp_lv_adapter_config_t *config)
 {
     ESP_RETURN_ON_FALSE(!s_ctx.inited, ESP_ERR_INVALID_STATE, TAG, "Adapter already initialized");
     ESP_RETURN_ON_FALSE(config, ESP_ERR_INVALID_ARG, TAG, "Invalid adapter configuration");
+    if (config->auto_sleep.enable) {
+        ESP_RETURN_ON_FALSE(config->auto_sleep.idle_timeout_ms > 0, ESP_ERR_INVALID_ARG,
+                            TAG, "Auto sleep timeout must be > 0");
+        ESP_RETURN_ON_FALSE(config->auto_sleep.mode == ESP_LV_ADAPTER_AUTO_SLEEP_MODE_PAUSE ||
+                            config->auto_sleep.mode == ESP_LV_ADAPTER_AUTO_SLEEP_MODE_USER,
+                            ESP_ERR_INVALID_ARG, TAG, "Invalid auto sleep mode");
+        if (config->auto_sleep.mode == ESP_LV_ADAPTER_AUTO_SLEEP_MODE_USER) {
+            ESP_RETURN_ON_FALSE(config->auto_sleep.callbacks.on_enter_sleep, ESP_ERR_INVALID_ARG,
+                                TAG, "User auto sleep mode requires on_enter_sleep callback");
+        }
+    }
+    bool lvgl_initialized = false;
 
     /* Initialize context */
     memset(&s_ctx, 0, sizeof(s_ctx));
     s_ctx.config = *config;
+    s_ctx.auto_sleep.config = config->auto_sleep;
     s_ctx.task_exit_requested = false;
     s_ctx.paused = false;
     s_ctx.pause_ack = false;
+    s_ctx.default_display_idf_callback_registration_enabled = true;
+    s_ctx.default_touch_idf_interrupt_callback_registration_enabled = true;
 
     /* Initialize LVGL library */
     lv_init();
+    lvgl_initialized = true;
 
     esp_err_t ret = ESP_OK;
 
@@ -109,11 +607,48 @@ esp_err_t esp_lv_adapter_init(const esp_lv_adapter_config_t *config)
     s_ctx.pause_done_sem = xSemaphoreCreateBinary();
     ESP_GOTO_ON_FALSE(s_ctx.pause_done_sem, ESP_ERR_NO_MEM, cleanup, TAG, "Failed to create pause semaphore");
 
+    if (adapter_auto_sleep_is_enabled()) {
+        s_ctx.auto_sleep.state = ESP_LV_ADAPTER_AUTO_SLEEP_STATE_ACTIVE;
+        s_ctx.auto_sleep.last_activity_us = esp_timer_get_time();
+
+        if (adapter_auto_sleep_is_pause_mode()) {
+#if CONFIG_PM_ENABLE
+            ret = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "esp_lvgl_adapter_auto_sleep",
+                                     &s_ctx.auto_sleep.pm_lock);
+            ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "Auto sleep PM lock create failed (%s)", esp_err_to_name(ret));
+            ret = adapter_auto_sleep_pm_lock_acquire();
+            ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "Auto sleep PM lock acquire failed (%s)", esp_err_to_name(ret));
+#else
+            ret = ESP_ERR_NOT_SUPPORTED;
+            ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "Auto sleep pause mode requires CONFIG_PM_ENABLE");
+#endif
+        }
+
+        ESP_LOGI(TAG, "Auto sleep enabled (mode=%d, idle_timeout_ms=%" PRIu32 ")",
+                 s_ctx.auto_sleep.config.mode, s_ctx.auto_sleep.config.idle_timeout_ms);
+    } else {
+        s_ctx.auto_sleep.state = ESP_LV_ADAPTER_AUTO_SLEEP_STATE_DISABLED;
+    }
+
     s_ctx.inited = true;
     ESP_LOGI(TAG, "LVGL adapter initialized successfully");
     return ESP_OK;
 
 cleanup:
+    if (s_ctx.auto_sleep.pm_lock) {
+        if (s_ctx.auto_sleep.pm_lock_held) {
+            (void)esp_pm_lock_release(s_ctx.auto_sleep.pm_lock);
+            s_ctx.auto_sleep.pm_lock_held = false;
+        }
+        (void)esp_pm_lock_delete(s_ctx.auto_sleep.pm_lock);
+        s_ctx.auto_sleep.pm_lock = NULL;
+    }
+    if (s_ctx.tick_timer) {
+        esp_timer_handle_t timer = (esp_timer_handle_t)s_ctx.tick_timer;
+        esp_timer_stop(timer);
+        esp_timer_delete(timer);
+        s_ctx.tick_timer = NULL;
+    }
     if (s_ctx.pause_done_sem) {
         vSemaphoreDelete(s_ctx.pause_done_sem);
         s_ctx.pause_done_sem = NULL;
@@ -132,6 +667,11 @@ cleanup:
         s_ctx.decoder_handle = NULL;
     }
 #endif
+    if (lvgl_initialized) {
+#if LVGL_VERSION_MAJOR >= 9 || LV_ENABLE_GC || !LV_MEM_CUSTOM
+        lv_deinit();
+#endif
+    }
     memset(&s_ctx, 0, sizeof(s_ctx));
     return ret;
 }
@@ -221,6 +761,48 @@ void esp_lv_adapter_unlock(void)
     }
 }
 
+esp_err_t esp_lv_adapter_report_activity(void)
+{
+    ESP_RETURN_ON_FALSE(s_ctx.inited, ESP_ERR_INVALID_STATE, TAG, "Adapter not initialized");
+    adapter_auto_sleep_mark_activity_internal();
+    return ESP_OK;
+}
+
+void esp_lv_adapter_report_activity_from_isr(void)
+{
+    if (!s_ctx.inited) {
+        return;
+    }
+
+    s_ctx.auto_sleep.activity_pending = true;
+}
+
+esp_err_t esp_lv_adapter_request_wake(void)
+{
+    ESP_RETURN_ON_FALSE(s_ctx.inited, ESP_ERR_INVALID_STATE, TAG, "Adapter not initialized");
+
+    adapter_auto_sleep_mark_activity_internal();
+    if (adapter_auto_sleep_should_latch_wake_request()) {
+        s_ctx.auto_sleep.wake_requested = true;
+        adapter_auto_sleep_notify_task();
+    }
+
+    return ESP_OK;
+}
+
+void esp_lv_adapter_request_wake_from_isr(void)
+{
+    if (!s_ctx.inited) {
+        return;
+    }
+
+    s_ctx.auto_sleep.activity_pending = true;
+    if (adapter_auto_sleep_should_latch_wake_request()) {
+        s_ctx.auto_sleep.wake_requested = true;
+        adapter_auto_sleep_notify_task_from_isr();
+    }
+}
+
 esp_err_t esp_lv_adapter_refresh_now(lv_display_t *disp)
 {
     ESP_RETURN_ON_FALSE(s_ctx.inited, ESP_ERR_INVALID_STATE, TAG, "Adapter not initialized");
@@ -234,6 +816,7 @@ esp_err_t esp_lv_adapter_refresh_now(lv_display_t *disp)
 
     /* Release lock */
     esp_lv_adapter_unlock();
+    adapter_auto_sleep_mark_activity_internal();
 
     return ESP_OK;
 }
@@ -256,11 +839,14 @@ esp_err_t esp_lv_adapter_pause(int32_t timeout_ms)
         if (s_ctx.pause_done_sem) {
             xSemaphoreGive(s_ctx.pause_done_sem);
         }
+        /* Stop the tick timer so tickless light sleep can enter naturally. */
+        (void)adapter_stop_tick_timer();
         return ESP_OK;
     }
 
     if (!s_ctx.task || !s_ctx.pause_done_sem) {
         s_ctx.pause_ack = true;
+        (void)adapter_stop_tick_timer();
         return ESP_OK;
     }
 
@@ -270,6 +856,7 @@ esp_err_t esp_lv_adapter_pause(int32_t timeout_ms)
         s_ctx.paused = false;
         return ESP_ERR_TIMEOUT;
     }
+    (void)adapter_stop_tick_timer();
     return ESP_OK;
 }
 
@@ -277,10 +864,14 @@ esp_err_t esp_lv_adapter_resume(void)
 {
     ESP_RETURN_ON_FALSE(s_ctx.inited, ESP_ERR_INVALID_STATE, TAG, "Adapter not initialized");
     if (!s_ctx.paused) {
+        adapter_auto_sleep_mark_activity_internal();
         return ESP_OK;
     }
 
     bool was_sleeping = s_ctx.sleep_state.is_sleeping;
+
+    /* Restart the periodic tick timer before unblocking the worker task. */
+    (void)adapter_start_tick_timer();
 
     s_ctx.paused = false;
     s_ctx.pause_ack = false;
@@ -313,6 +904,7 @@ esp_err_t esp_lv_adapter_resume(void)
         adapter_sleep_state_reset(&s_ctx.sleep_state);
     }
 
+    adapter_auto_sleep_mark_activity_internal();
     return ESP_OK;
 }
 
@@ -347,36 +939,15 @@ esp_err_t esp_lv_adapter_sleep_prepare(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint8_t total_displays = 0;
-    for (esp_lv_adapter_display_node_t *node = s_ctx.display_list; node; node = node->next) {
-        total_displays++;
-        if (total_displays > ESP_LV_ADAPTER_MAX_SLEEP_DISPLAYS) {
-            ESP_LOGE(TAG, "Sleep prepare supports up to %d displays (found %u)",
-                     ESP_LV_ADAPTER_MAX_SLEEP_DISPLAYS, total_displays);
-            return ESP_ERR_INVALID_SIZE;
-        }
-    }
-
-    adapter_sleep_state_reset(&s_ctx.sleep_state);
-
-    esp_lv_adapter_display_node_t *node = s_ctx.display_list;
-    while (node && s_ctx.sleep_state.display_count < ESP_LV_ADAPTER_MAX_SLEEP_DISPLAYS) {
-        uint8_t idx = s_ctx.sleep_state.display_count++;
-        s_ctx.sleep_state.all_displays[idx] = node->lv_disp;
-        s_ctx.sleep_state.display_nodes[idx] = node;
-
-        for (uint8_t i = 0; i < node->sleep.input_count &&
-                s_ctx.sleep_state.input_count < ESP_LV_ADAPTER_MAX_SLEEP_INPUTS; i++) {
-            s_ctx.sleep_state.all_inputs[s_ctx.sleep_state.input_count++] = node->sleep.associated_inputs[i];
-        }
-
-        node = node->next;
+    esp_err_t ret = adapter_sleep_snapshot_displays();
+    if (ret != ESP_OK) {
+        return ret;
     }
 
     ESP_LOGI(TAG, "Sleep prepare: %u displays, %u inputs",
-             s_ctx.sleep_state.display_count, s_ctx.sleep_state.input_count);
+             s_ctx.sleep_state.display_count, adapter_sleep_count_snapshot_inputs());
 
-    esp_err_t ret = esp_lv_adapter_pause(-1);
+    ret = esp_lv_adapter_pause(-1);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to pause adapter (%d)", ret);
         adapter_sleep_state_reset(&s_ctx.sleep_state);
@@ -387,8 +958,7 @@ esp_err_t esp_lv_adapter_sleep_prepare(void)
         ret = display_manager_wait_flush_done(s_ctx.sleep_state.all_displays[i], 5000);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Display %d flush wait failed (%d), auto-recovering", i, ret);
-            esp_lv_adapter_resume();
-            adapter_sleep_state_reset(&s_ctx.sleep_state);
+            adapter_sleep_prepare_cleanup();
             return ret;
         }
     }
@@ -401,6 +971,13 @@ esp_err_t esp_lv_adapter_sleep_prepare(void)
         }
 
         adapter_detach_display_node(detach_node);
+    }
+
+    ret = display_bridge_prepare_hw_resource_for_sleep();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to prepare bridge HW resources for sleep (%d), auto-recovering", ret);
+        adapter_sleep_prepare_cleanup();
+        return ret;
     }
 
     s_ctx.sleep_state.is_sleeping = true;
@@ -439,6 +1016,9 @@ esp_err_t esp_lv_adapter_sleep_recover(lv_display_t *disp,
     ESP_RETURN_ON_FALSE(panel, ESP_ERR_INVALID_ARG, TAG, "Invalid panel handle");
     ESP_RETURN_ON_FALSE(s_ctx.sleep_state.is_sleeping, ESP_ERR_INVALID_STATE, TAG, "Not in sleep state");
 
+    esp_err_t hw_ret = display_bridge_resume_hw_resource_after_sleep();
+    ESP_RETURN_ON_ERROR(hw_ret, TAG, "Failed to release bridge HW sleep guard");
+
     /* Rebind the display with new panel */
     esp_err_t ret = esp_lv_adapter_rebind_lcd_panel_internal(disp, panel, panel_io);
     if (ret != ESP_OK) {
@@ -468,12 +1048,7 @@ esp_err_t esp_lv_adapter_sleep_recover(lv_display_t *disp,
     }
 
     /* Check if all displays have been recovered */
-    int remaining = 0;
-    for (int i = 0; i < s_ctx.sleep_state.display_count; i++) {
-        if (s_ctx.sleep_state.all_displays[i] != NULL) {
-            remaining++;
-        }
-    }
+    uint8_t remaining = adapter_sleep_count_remaining_displays();
 
     if (remaining == 0) {
         /* All displays recovered - exit sleep mode */
@@ -658,15 +1233,38 @@ esp_err_t esp_lv_adapter_unregister_display(lv_display_t *disp)
     ESP_RETURN_ON_FALSE(s_ctx.inited, ESP_ERR_INVALID_STATE, TAG, "Adapter not initialized");
     ESP_RETURN_ON_FALSE(disp, ESP_ERR_INVALID_ARG, TAG, "Invalid display handle");
 
+    bool pause_requested = !s_ctx.paused;
+    if (pause_requested) {
+        esp_err_t ret = esp_lv_adapter_pause(-1);
+        ESP_RETURN_ON_ERROR(ret, TAG, "Failed to pause adapter");
+    }
+
+    esp_err_t ret = display_manager_wait_flush_done(disp, 5000);
+    if (ret != ESP_OK) {
+        if (pause_requested) {
+            esp_lv_adapter_resume();
+        }
+        ESP_RETURN_ON_ERROR(ret, TAG, "Failed to wait for flush completion");
+    }
+
     /* Acquire lock to ensure thread safety */
-    esp_err_t ret = esp_lv_adapter_lock((uint32_t) -1);
-    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to acquire adapter lock");
+    ret = esp_lv_adapter_lock((uint32_t) -1);
+    if (ret != ESP_OK) {
+        if (pause_requested) {
+            esp_lv_adapter_resume();
+        }
+        ESP_RETURN_ON_ERROR(ret, TAG, "Failed to acquire adapter lock");
+    }
 
     /* Delegate to display manager */
     ret = display_manager_unregister(disp);
 
     /* Release lock */
     esp_lv_adapter_unlock();
+
+    if (pause_requested) {
+        esp_lv_adapter_resume();
+    }
 
     return ret;
 }
@@ -680,6 +1278,40 @@ esp_err_t esp_lv_adapter_set_area_rounder_cb(lv_display_t *disp,
     return display_manager_set_area_rounder_cb(disp, rounder_cb, user_data);
 }
 
+esp_err_t esp_lv_adapter_set_draw_bitmap_callbacks(lv_display_t *disp,
+                                                   const esp_lv_adapter_draw_bitmap_callbacks_t *cbs,
+                                                   void *user_ctx)
+{
+    ESP_RETURN_ON_FALSE(s_ctx.inited, ESP_ERR_INVALID_STATE, TAG, "Adapter not initialized");
+    ESP_RETURN_ON_FALSE(disp, ESP_ERR_INVALID_ARG, TAG, "Invalid display handle");
+    return display_manager_set_draw_bitmap_callbacks(disp, cbs, user_ctx);
+}
+
+esp_err_t esp_lv_adapter_set_default_display_idf_callback_registration_enabled(bool enable)
+{
+    ESP_RETURN_ON_FALSE(s_ctx.inited, ESP_ERR_INVALID_STATE, TAG, "Adapter not initialized");
+    s_ctx.default_display_idf_callback_registration_enabled = enable;
+    return ESP_OK;
+}
+
+bool IRAM_ATTR esp_lv_adapter_display_notify_color_trans_done_from_isr(lv_display_t *disp)
+{
+    if (!s_ctx.inited || !disp) {
+        return false;
+    }
+
+    return display_manager_notify_color_trans_done_from_isr(disp);
+}
+
+bool IRAM_ATTR esp_lv_adapter_display_notify_frame_done_from_isr(lv_display_t *disp)
+{
+    if (!s_ctx.inited || !disp) {
+        return false;
+    }
+
+    return display_manager_notify_frame_done_from_isr(disp);
+}
+
 esp_err_t esp_lv_adapter_deinit(void)
 {
     /* Check if already deinitialized */
@@ -687,32 +1319,61 @@ esp_err_t esp_lv_adapter_deinit(void)
         return ESP_OK;
     }
 
+    bool pause_requested = !s_ctx.paused;
+    if (pause_requested) {
+        esp_err_t pause_ret = esp_lv_adapter_pause(-1);
+        ESP_RETURN_ON_ERROR(pause_ret, TAG, "Failed to pause adapter during deinit");
+    }
+
+    /* Use a sticky error: record the first failure but always continue deinit.
+     * Returning early after partial cleanup (e.g. some indevs already deleted)
+     * would resume the LVGL task against a partially torn-down state, which is
+     * more dangerous than pressing on and completing the teardown. */
+    esp_err_t first_err = ESP_OK;
+
+    esp_err_t ret = adapter_wait_for_all_flush_done(5000);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to confirm flush completion during deinit (%d), continuing", ret);
+        first_err = ret;
+    }
+
+    ret = adapter_unregister_all_inputs();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to fully unregister input devices during deinit (%d), continuing", ret);
+        if (first_err == ESP_OK) {
+            first_err = ret;
+        }
+    }
+
     /* Request LVGL task to exit gracefully */
     if (s_ctx.task) {
+        TaskHandle_t task = s_ctx.task;
         ESP_LOGI(TAG, "Requesting LVGL task to exit...");
         s_ctx.task_exit_requested = true;
         s_ctx.paused = false;
         s_ctx.pause_ack = false;
-        xTaskNotifyGive(s_ctx.task);
+        xTaskNotifyGive(task);
 
-        /* Wait for task to exit (max 1 second) */
+        /* Wait for task to suspend itself (max 1 second) */
         uint32_t wait_count = 0;
         const uint32_t max_wait_ms = 1000;
         const uint32_t poll_interval_ms = 10;
 
-        while (s_ctx.task != NULL && wait_count < (max_wait_ms / poll_interval_ms)) {
+        while (eTaskGetState(task) != eSuspended && wait_count < (max_wait_ms / poll_interval_ms)) {
             vTaskDelay(pdMS_TO_TICKS(poll_interval_ms));
             wait_count++;
         }
 
-        /* Force delete if task didn't exit */
-        if (s_ctx.task != NULL) {
-            ESP_LOGW(TAG, "LVGL task didn't exit gracefully, force deleting");
-            vTaskDelete(s_ctx.task);
-            s_ctx.task = NULL;
+        if (eTaskGetState(task) != eSuspended) {
+            ESP_LOGW(TAG, "LVGL task didn't suspend in time, force deleting");
         } else {
             ESP_LOGI(TAG, "LVGL task exited gracefully");
         }
+
+        /* Delete from outside so vTaskDeleteWithCaps properly frees the
+         * caps-allocated stack (vTaskDelete alone would leak it). */
+        vTaskDeleteWithCaps(task);
+        s_ctx.task = NULL;
     }
 
     /* Stop and delete tick timer */
@@ -724,60 +1385,8 @@ esp_err_t esp_lv_adapter_deinit(void)
         ESP_LOGI(TAG, "Tick timer stopped and deleted");
     }
 
-    /* Clear all registered displays */
+    /* Clear any remaining registered displays */
     display_manager_clear();
-
-    /* Clear all registered input devices */
-    esp_lv_adapter_input_node_t *input_node = s_ctx.input_list;
-    uint32_t input_count = 0;
-    while (input_node) {
-        esp_lv_adapter_input_node_t *next = input_node->next;
-
-        /* Delete LVGL input device */
-        if (input_node->indev) {
-#if LVGL_VERSION_MAJOR >= 9
-            lv_indev_delete(input_node->indev);
-#else
-            /* In LVGL v8, input devices are automatically cleaned up with displays */
-            /* Just free the user context if it exists */
-#endif
-        }
-
-        /* Free user context based on input device type */
-        if (input_node->user_ctx) {
-            switch (input_node->type) {
-            case ESP_LV_ADAPTER_INPUT_TYPE_TOUCH:
-                ESP_LOGD(TAG, "Cleaning up touch device context");
-                free(input_node->user_ctx);
-                break;
-#if CONFIG_ESP_LVGL_ADAPTER_ENABLE_BUTTON
-            case ESP_LV_ADAPTER_INPUT_TYPE_BUTTON:
-                ESP_LOGD(TAG, "Cleaning up button device context");
-                free(input_node->user_ctx);
-                break;
-#endif
-#if CONFIG_ESP_LVGL_ADAPTER_ENABLE_KNOB
-            case ESP_LV_ADAPTER_INPUT_TYPE_ENCODER:
-                ESP_LOGD(TAG, "Cleaning up encoder device context");
-                free(input_node->user_ctx);
-                break;
-#endif
-            default:
-                ESP_LOGW(TAG, "Unknown input device type %d, freeing context anyway", input_node->type);
-                free(input_node->user_ctx);
-                break;
-            }
-        }
-
-        free(input_node);
-        input_node = next;
-        input_count++;
-    }
-    s_ctx.input_list = NULL;
-
-    if (input_count > 0) {
-        ESP_LOGI(TAG, "%lu input device(s) cleaned up", input_count);
-    }
 
 #if CONFIG_ESP_LVGL_ADAPTER_ENABLE_FS
     /* Deinitialize all mounted file systems */
@@ -843,6 +1452,31 @@ esp_err_t esp_lv_adapter_deinit(void)
     }
 #endif
 
+    if (s_ctx.auto_sleep.pm_lock) {
+        if (s_ctx.auto_sleep.pm_lock_held) {
+            esp_err_t pm_ret = esp_pm_lock_release(s_ctx.auto_sleep.pm_lock);
+            if (pm_ret == ESP_OK) {
+                s_ctx.auto_sleep.pm_lock_held = false;
+            } else {
+                ESP_LOGW(TAG, "Failed to release auto sleep PM lock during deinit (%s)",
+                         esp_err_to_name(pm_ret));
+                if (first_err == ESP_OK) {
+                    first_err = pm_ret;
+                }
+            }
+        }
+
+        esp_err_t pm_ret = esp_pm_lock_delete(s_ctx.auto_sleep.pm_lock);
+        if (pm_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to delete auto sleep PM lock during deinit (%s)",
+                     esp_err_to_name(pm_ret));
+            if (first_err == ESP_OK) {
+                first_err = pm_ret;
+            }
+        }
+        s_ctx.auto_sleep.pm_lock = NULL;
+    }
+
     /* Cleanup mutexes */
     if (s_ctx.dummy_draw_mutex) {
         vSemaphoreDelete(s_ctx.dummy_draw_mutex);
@@ -857,13 +1491,22 @@ esp_err_t esp_lv_adapter_deinit(void)
         s_ctx.pause_done_sem = NULL;
     }
 
+    /* Deinitialize LVGL after adapter-managed resources are released. */
+#if LVGL_VERSION_MAJOR >= 9 || LV_ENABLE_GC || !LV_MEM_CUSTOM
+    lv_deinit();
+#endif
+
     /* Clear context */
     memset(&s_ctx, 0, sizeof(s_ctx));
-    ESP_LOGI(TAG, "LVGL adapter deinitialized successfully");
-    return ESP_OK;
+    if (first_err != ESP_OK) {
+        ESP_LOGW(TAG, "LVGL adapter deinitialized with errors (first: %d)", first_err);
+    } else {
+        ESP_LOGI(TAG, "LVGL adapter deinitialized successfully");
+    }
+    return first_err;
 }
 
-esp_lv_adapter_context_t *esp_lv_adapter_get_context(void)
+esp_lv_adapter_context_t *IRAM_ATTR esp_lv_adapter_get_context(void)
 {
     return &s_ctx;
 }
@@ -899,6 +1542,19 @@ esp_err_t esp_lv_adapter_unregister_input_device(lv_indev_t *indev)
 {
     ESP_RETURN_ON_FALSE(indev, ESP_ERR_INVALID_ARG, TAG, "Input device handle cannot be NULL");
 
+    for (esp_lv_adapter_display_node_t *display = s_ctx.display_list; display; display = display->next) {
+        for (uint8_t i = 0; i < display->sleep.input_count; i++) {
+            if (display->sleep.associated_inputs[i] == indev) {
+                for (uint8_t j = i + 1; j < display->sleep.input_count; j++) {
+                    display->sleep.associated_inputs[j - 1] = display->sleep.associated_inputs[j];
+                }
+                display->sleep.associated_inputs[display->sleep.input_count - 1] = NULL;
+                display->sleep.input_count--;
+                break;
+            }
+        }
+    }
+
     /* Find and remove from list */
     esp_lv_adapter_input_node_t **cursor = &s_ctx.input_list;
     while (*cursor) {
@@ -930,6 +1586,8 @@ static void lvgl_worker(void *arg)
     uint32_t task_delay_ms = s_ctx.config.task_max_delay_ms;
 
     while (!s_ctx.task_exit_requested) {
+        adapter_auto_sleep_consume_pending_activity();
+
         if (s_ctx.paused) {
             if (!s_ctx.pause_ack) {
                 s_ctx.pause_ack = true;
@@ -938,14 +1596,28 @@ static void lvgl_worker(void *arg)
                 }
             }
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            adapter_auto_sleep_consume_pending_activity();
+            if (adapter_auto_sleep_is_pause_mode() &&
+                    s_ctx.auto_sleep.state == ESP_LV_ADAPTER_AUTO_SLEEP_STATE_SLEEPING &&
+                    s_ctx.auto_sleep.wake_requested) {
+                (void)adapter_auto_sleep_exit();
+            }
             continue;
         }
 
         /* Process LVGL timers */
+        uint32_t next_delay_ms_raw = s_ctx.config.task_max_delay_ms;
         if (esp_lv_adapter_lock(-1) == ESP_OK) {
-            task_delay_ms = lv_timer_handler();
+            next_delay_ms_raw = lv_timer_handler();
             esp_lv_adapter_unlock();
         }
+
+        if (adapter_auto_sleep_should_enter(next_delay_ms_raw)) {
+            (void)adapter_auto_sleep_enter(next_delay_ms_raw);
+            continue;
+        }
+
+        task_delay_ms = next_delay_ms_raw;
 
         /* Clamp delay to configured range */
         if (task_delay_ms > s_ctx.config.task_max_delay_ms) {
@@ -954,14 +1626,14 @@ static void lvgl_worker(void *arg)
             task_delay_ms = s_ctx.config.task_min_delay_ms;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(task_delay_ms));
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(task_delay_ms));
     }
 
     s_ctx.paused = false;
     s_ctx.pause_ack = false;
-    /* Task deletes itself */
-    s_ctx.task = NULL;
-    vTaskDelete(NULL);
+    /* Suspend self; deinit will call vTaskDeleteWithCaps() from outside
+     * to properly free the caps-allocated stack. */
+    vTaskSuspend(NULL);
 }
 
 /**

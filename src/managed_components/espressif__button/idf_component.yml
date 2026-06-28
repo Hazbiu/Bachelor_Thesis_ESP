@@ -6,7 +6,7 @@ documentation: https://docs.espressif.com/projects/esp-iot-solution/en/latest/in
 issues: https://github.com/espressif/esp-iot-solution/issues
 repository: git://github.com/espressif/esp-iot-solution.git
 repository_info:
-  commit_sha: b9b4cc9fa85345b46af366a002785e7c6e8ef45d
+  commit_sha: 5f9cb98ae4d0e8153c4b4d1accf471214e5b6fe8
   path: components/button
 url: https://github.com/espressif/esp-iot-solution/tree/master/components/button
-version: 4.1.7
+version: 4.2.0
