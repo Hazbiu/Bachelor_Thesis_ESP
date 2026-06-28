@@ -5,5 +5,7 @@ idf_component_register(
         "platform/camera/video_capture.c"
         "services/vision/face_detection/face_detector.cpp"
         "services/vision/face_recognition/face_recognizer.cpp"
+        "diagnostics/cpu_stats.c"
+        "diagnostics/ai_pipeline_status.c"
     INCLUDE_DIRS "include"
 )

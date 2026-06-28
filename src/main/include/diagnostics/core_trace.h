@@ -10,7 +10,7 @@ static inline void core_trace(const char *tag, const char *stage)
     TaskHandle_t task = xTaskGetCurrentTaskHandle();
 
     ESP_LOGI(tag,
-             "[CORE-PROOF] stage=%s cpu=%d task=%s affinity=%d time_us=%lld",
+             " stage=%s cpu=%d task=%s affinity=%d time_us=%lld",
              stage,
              xPortGetCoreID(),                 // actual CPU executing this line
              pcTaskGetName(task),

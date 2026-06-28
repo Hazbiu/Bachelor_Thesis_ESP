@@ -2,7 +2,7 @@
 
 PORT="${1:-/dev/ttyACM0}"
 BAUD="${2:-115200}"
-PROJECT_DIR="$HOME/Programming/Bachelor_Thesis_ESP/src"
+PROJECT_DIR="$HOME/git-hub/Bachelor_Thesis_ESP/src"
 IDF_DIR="$HOME/.espressif/v5.5.4/esp-idf"
 
 LOG_DIR="$PROJECT_DIR/serial_logs"

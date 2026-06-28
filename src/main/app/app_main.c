@@ -14,6 +14,8 @@
 #include "services/vision/face_detector.h"
 #include "services/vision/face_recognizer.h"
 #include "diagnostics/core_trace.h"
+#include "diagnostics/cpu_stats.h"
+#include "diagnostics/ai_pipeline_status.h"
 #include "app/app_boot.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -119,6 +121,8 @@ static void calc_ppa_input_offset(uint32_t src_w, uint32_t src_h,
 void app_main(void)
 {
     core_trace(TAG, "APP_MAIN_START");
+    diagnostics_start_cpu_stats_monitor();
+    diagnostics_start_ai_pipeline_monitor();
     disp = bsp_display_start();
     bsp_display_backlight_on();
 
@@ -262,6 +266,7 @@ static void camera_video_frame_operation(
     }
     if ((frame_count % FACE_DETECT_INTERVAL) == 0) {
         face_box_t boxes[MAX_FACE_BOXES];
+        diagnostics_ai_frame_sent_to_detector();
 
     #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
         int face_count = face_detect_run_rgb565(
@@ -282,6 +287,7 @@ static void camera_video_frame_operation(
     #endif
 
         ESP_LOGI(TAG, "Detection ran, face_count=%d", face_count);
+        diagnostics_ai_detection_result(face_count);
 
         if (face_count > 0) {
             int update_count = face_count;
@@ -324,12 +330,9 @@ static void camera_video_frame_operation(
                         &recog_score
                     );
 
-                    if (recog_ret == ESP_OK) {
-                        ESP_LOGI(TAG,
-                                "Recognition result: name=%s score=%.3f",
-                                name,
-                                recog_score);
-                    }
+                    
+                    diagnostics_ai_recognition_result(recog_ret, name, recog_score);
+                    
                 }
             }
 
