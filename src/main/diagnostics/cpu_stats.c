@@ -83,7 +83,10 @@ static void print_cpu_thread_stats_once(void)
     uint32_t idle0_x100 = 0;
     uint32_t idle1_x100 = 0;
 
-    printf("\nThread Number | Thread Name | Thread State | CPU Usage\n");
+    printf("\n+---------------+------------------------+---------------+------------+\n");
+    printf("| %-13s | %-22s | %-13s | %-10s |\n",
+        "Thread Number", "Thread Name", "Thread State", "CPU Usage");
+    printf("+---------------+------------------------+---------------+------------+\n");
 
     for (UBaseType_t i = 0; i < end_count; i++) {
         int start_index = find_task_by_handle(start_array, start_count, end_array[i].xHandle);
@@ -99,12 +102,12 @@ static void print_cpu_thread_stats_once(void)
         const char *name = end_array[i].pcTaskName ? end_array[i].pcTaskName : "unknown";
         const char *state = task_state_to_string(end_array[i].eCurrentState);
 
-        printf("%u | %s | %s | %" PRIu32 ".%02" PRIu32 "%%\n",
-               (unsigned int)end_array[i].xTaskNumber,
-               name,
-               state,
-               task_pct_x100 / 100,
-               task_pct_x100 % 100);
+        printf("| %-13u | %-22.22s | %-13s | %6" PRIu32 ".%02" PRIu32 "%% |\n",
+            (unsigned int)end_array[i].xTaskNumber,
+            name,
+            state,
+            task_pct_x100 / 100,
+            task_pct_x100 % 100);
 
         if (strcmp(name, "IDLE0") == 0) {
             idle0_x100 = task_pct_x100;
@@ -113,22 +116,32 @@ static void print_cpu_thread_stats_once(void)
         }
     }
 
-#if CONFIG_FREERTOS_NUMBER_OF_CORES == 2
+    printf("+---------------+------------------------+---------------+------------+\n");
+
+    #if CONFIG_FREERTOS_NUMBER_OF_CORES == 2
     uint32_t cpu0_usage_x100 = 10000 - ((idle0_x100 * 2 > 10000) ? 10000 : idle0_x100 * 2);
     uint32_t cpu1_usage_x100 = 10000 - ((idle1_x100 * 2 > 10000) ? 10000 : idle1_x100 * 2);
 
-    printf("- | CPU0_TOTAL | Total | %" PRIu32 ".%02" PRIu32 "%%\n",
-           cpu0_usage_x100 / 100, cpu0_usage_x100 % 100);
+    printf("| %-13s | %-22s | %-13s | %6" PRIu32 ".%02" PRIu32 "%% |\n",
+        "-", "CPU0_TOTAL", "Total",
+        cpu0_usage_x100 / 100,
+        cpu0_usage_x100 % 100);
 
-    printf("- | CPU1_TOTAL | Total | %" PRIu32 ".%02" PRIu32 "%%\n",
-           cpu1_usage_x100 / 100, cpu1_usage_x100 % 100);
-#endif
+    printf("| %-13s | %-22s | %-13s | %6" PRIu32 ".%02" PRIu32 "%% |\n",
+        "-", "CPU1_TOTAL", "Total",
+        cpu1_usage_x100 / 100,
+        cpu1_usage_x100 % 100);
+    #endif
 
     uint32_t total_idle_x100 = idle0_x100 + idle1_x100;
     uint32_t total_cpu_x100 = total_idle_x100 >= 10000 ? 0 : 10000 - total_idle_x100;
 
-    printf("- | BOTH_CPUS_TOTAL | Total | %" PRIu32 ".%02" PRIu32 "%%\n",
-           total_cpu_x100 / 100, total_cpu_x100 % 100);
+    printf("| %-13s | %-22s | %-13s | %6" PRIu32 ".%02" PRIu32 "%% |\n",
+        "-", "BOTH_CPUS_TOTAL", "Total",
+        total_cpu_x100 / 100,
+        total_cpu_x100 % 100);
+
+    printf("+---------------+------------------------+---------------+------------+\n");
 
     free(start_array);
     free(end_array);
