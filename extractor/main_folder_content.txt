@@ -1,6 +1,6 @@
 Main folder export
-Generated on: Tue Jun 23 07:13:06 PM CEST 2026
-Source: /home/hazbiu/Programming/Bachelor_Thesis_ESP/extractor/../src/main
+Generated on: Mon Jul 20 11:19:40 AM CEST 2026
+Source: /mnt/c/Programming/Bachelor_Thesis_ESP/extractor/../src/main
 ==================================================
 
 ==================================================
@@ -95,6 +95,8 @@ FILE: src/main/app/app_main.c
 #include "services/vision/face_detector.h"
 #include "services/vision/face_recognizer.h"
 #include "diagnostics/core_trace.h"
+#include "diagnostics/cpu_stats.h"
+#include "diagnostics/ai_pipeline_status.h"
 #include "app/app_boot.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -200,6 +202,8 @@ static void calc_ppa_input_offset(uint32_t src_w, uint32_t src_h,
 void app_main(void)
 {
     core_trace(TAG, "APP_MAIN_START");
+    diagnostics_start_cpu_stats_monitor();
+    diagnostics_start_ai_pipeline_monitor();
     disp = bsp_display_start();
     bsp_display_backlight_on();
 
@@ -343,6 +347,7 @@ static void camera_video_frame_operation(
     }
     if ((frame_count % FACE_DETECT_INTERVAL) == 0) {
         face_box_t boxes[MAX_FACE_BOXES];
+        diagnostics_ai_frame_sent_to_detector();
 
     #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
         int face_count = face_detect_run_rgb565(
@@ -363,6 +368,7 @@ static void camera_video_frame_operation(
     #endif
 
         ESP_LOGI(TAG, "Detection ran, face_count=%d", face_count);
+        diagnostics_ai_detection_result(face_count);
 
         if (face_count > 0) {
             int update_count = face_count;
@@ -405,12 +411,9 @@ static void camera_video_frame_operation(
                         &recog_score
                     );
 
-                    if (recog_ret == ESP_OK) {
-                        ESP_LOGI(TAG,
-                                "Recognition result: name=%s score=%.3f",
-                                name,
-                                recog_score);
-                    }
+                    
+                    diagnostics_ai_recognition_result(recog_ret, name, recog_score);
+                    
                 }
             }
 
@@ -468,12 +471,272 @@ FILE: src/main/CMakeLists.txt
 ==================================================
 idf_component_register(
     SRCS
-        "main.c"
-        "app_video.c"
-        "face_detect_wrapper.cpp"
-        "face_recognition_wrapper.cpp"
-    INCLUDE_DIRS "."
+        "app/app_main.c"
+        "app/app_boot.c"
+        "platform/camera/video_capture.c"
+        "services/vision/face_detection/face_detector.cpp"
+        "services/vision/face_recognition/face_recognizer.cpp"
+        "diagnostics/cpu_stats.c"
+        "diagnostics/ai_pipeline_status.c"
+    INCLUDE_DIRS "include"
 )
+==================================================
+FILE: src/main/diagnostics/ai_pipeline_status.c
+==================================================
+#include "diagnostics/ai_pipeline_status.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+static uint32_t frames_to_detector = 0;
+static bool detection_success = false;
+static bool recognition_success = false;
+static bool user_found = false;
+static float live_similarity = 0.0f;
+
+void diagnostics_ai_frame_sent_to_detector(void)
+{
+    frames_to_detector++;
+}
+
+void diagnostics_ai_detection_result(int face_count)
+{
+    if (face_count > 0) {
+        detection_success = true;
+    }
+}
+
+void diagnostics_ai_recognition_result(esp_err_t ret, const char *name, float similarity)
+{
+    recognition_success = (ret == ESP_OK);
+    live_similarity = similarity;
+
+    if (ret == ESP_OK && name != NULL && strcmp(name, "unknown") != 0 && similarity > 0.0f) {
+        user_found = true;
+    }
+}
+
+static void ai_pipeline_monitor_task(void *arg)
+{
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        uint32_t fps = frames_to_detector;
+
+        printf("\nAI_Face_Rec_Pipeline:\n");
+        printf("\tStatus: %s\n", fps > 0 ? "Active" : "Paused");
+        printf("Flow:\n");
+
+        printf("Camera_Frames sent to AI_Face_Dec = %s\n",
+               fps > 0 ? "Successful" : "Not Successful");
+        printf("\tFrames Per Second = %" PRIu32 "\n", fps);
+
+        printf("AI_Face_Dec to AI_Face_Rec = %s\n",
+               recognition_success ? "Successful" : "Not Successful");
+
+        if (user_found) {
+            printf("AI_Face_Rec_Match = User Found = Keti\n");
+            printf("\tLive_Similarity = %.2f\n", live_similarity);
+        } else {
+            printf("AI_Face_Rec_Match = User Not Found\n");
+        }
+
+        frames_to_detector = 0;
+        detection_success = false;
+        recognition_success = false;
+        user_found = false;
+        live_similarity = 0.0f;
+    }
+}
+
+void diagnostics_start_ai_pipeline_monitor(void)
+{
+    xTaskCreatePinnedToCore(
+        ai_pipeline_monitor_task,
+        "ai_pipe_mon",
+        4096,
+        NULL,
+        tskIDLE_PRIORITY + 1,
+        NULL,
+        tskNO_AFFINITY
+    );
+}
+==================================================
+FILE: src/main/diagnostics/cpu_stats.c
+==================================================
+#include "diagnostics/cpu_stats.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "sdkconfig.h"
+
+#define CPU_STATS_INTERVAL_MS 3000
+#define TASK_ARRAY_EXTRA_SIZE 8
+
+static const char *task_state_to_string(eTaskState state)
+{
+    switch (state) {
+    case eRunning:   return "Running";
+    case eReady:     return "Ready";
+    case eBlocked:   return "Blocked";
+    case eSuspended: return "Suspended";
+    case eDeleted:   return "Deleted";
+    case eInvalid:   return "Invalid";
+    default:         return "Unknown";
+    }
+}
+
+static int find_task_by_handle(TaskStatus_t *array, UBaseType_t count, TaskHandle_t handle)
+{
+    for (UBaseType_t i = 0; i < count; i++) {
+        if (array[i].xHandle == handle) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static uint32_t percent_x100(uint64_t part, uint64_t total)
+{
+    if (total == 0) {
+        return 0;
+    }
+    return (uint32_t)((part * 10000ULL) / total);
+}
+
+static void print_cpu_thread_stats_once(void)
+{
+#if !CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+    printf("CPU stats not enabled\n");
+    return;
+#else
+    UBaseType_t start_size = uxTaskGetNumberOfTasks() + TASK_ARRAY_EXTRA_SIZE;
+    TaskStatus_t *start_array = calloc(start_size, sizeof(TaskStatus_t));
+    if (!start_array) return;
+
+    configRUN_TIME_COUNTER_TYPE start_total = 0;
+    UBaseType_t start_count = uxTaskGetSystemState(start_array, start_size, &start_total);
+    if (start_count == 0) {
+        free(start_array);
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(CPU_STATS_INTERVAL_MS));
+
+    UBaseType_t end_size = uxTaskGetNumberOfTasks() + TASK_ARRAY_EXTRA_SIZE;
+    TaskStatus_t *end_array = calloc(end_size, sizeof(TaskStatus_t));
+    if (!end_array) {
+        free(start_array);
+        return;
+    }
+
+    configRUN_TIME_COUNTER_TYPE end_total = 0;
+    UBaseType_t end_count = uxTaskGetSystemState(end_array, end_size, &end_total);
+    if (end_count == 0) {
+        free(start_array);
+        free(end_array);
+        return;
+    }
+
+    uint64_t total_delta = (uint64_t)(end_total - start_total);
+    uint64_t total_capacity = total_delta * CONFIG_FREERTOS_NUMBER_OF_CORES;
+
+    uint32_t idle0_x100 = 0;
+    uint32_t idle1_x100 = 0;
+
+    printf("\n+---------------+------------------------+---------------+------------+\n");
+    printf("| %-13s | %-22s | %-13s | %-10s |\n",
+        "Thread Number", "Thread Name", "Thread State", "CPU Usage");
+    printf("+---------------+------------------------+---------------+------------+\n");
+
+    for (UBaseType_t i = 0; i < end_count; i++) {
+        int start_index = find_task_by_handle(start_array, start_count, end_array[i].xHandle);
+
+        uint64_t task_delta = 0;
+        if (start_index >= 0) {
+            task_delta = (uint64_t)(end_array[i].ulRunTimeCounter -
+                                    start_array[start_index].ulRunTimeCounter);
+        }
+
+        uint32_t task_pct_x100 = percent_x100(task_delta, total_capacity);
+
+        const char *name = end_array[i].pcTaskName ? end_array[i].pcTaskName : "unknown";
+        const char *state = task_state_to_string(end_array[i].eCurrentState);
+
+        printf("| %-13u | %-22.22s | %-13s | %6" PRIu32 ".%02" PRIu32 "%% |\n",
+            (unsigned int)end_array[i].xTaskNumber,
+            name,
+            state,
+            task_pct_x100 / 100,
+            task_pct_x100 % 100);
+
+        if (strcmp(name, "IDLE0") == 0) {
+            idle0_x100 = task_pct_x100;
+        } else if (strcmp(name, "IDLE1") == 0) {
+            idle1_x100 = task_pct_x100;
+        }
+    }
+
+    printf("+---------------+------------------------+---------------+------------+\n");
+
+    #if CONFIG_FREERTOS_NUMBER_OF_CORES == 2
+    uint32_t cpu0_usage_x100 = 10000 - ((idle0_x100 * 2 > 10000) ? 10000 : idle0_x100 * 2);
+    uint32_t cpu1_usage_x100 = 10000 - ((idle1_x100 * 2 > 10000) ? 10000 : idle1_x100 * 2);
+
+    printf("| %-13s | %-22s | %-13s | %6" PRIu32 ".%02" PRIu32 "%% |\n",
+        "-", "CPU0_TOTAL", "Total",
+        cpu0_usage_x100 / 100,
+        cpu0_usage_x100 % 100);
+
+    printf("| %-13s | %-22s | %-13s | %6" PRIu32 ".%02" PRIu32 "%% |\n",
+        "-", "CPU1_TOTAL", "Total",
+        cpu1_usage_x100 / 100,
+        cpu1_usage_x100 % 100);
+    #endif
+
+    uint32_t total_idle_x100 = idle0_x100 + idle1_x100;
+    uint32_t total_cpu_x100 = total_idle_x100 >= 10000 ? 0 : 10000 - total_idle_x100;
+
+    printf("| %-13s | %-22s | %-13s | %6" PRIu32 ".%02" PRIu32 "%% |\n",
+        "-", "BOTH_CPUS_TOTAL", "Total",
+        total_cpu_x100 / 100,
+        total_cpu_x100 % 100);
+
+    printf("+---------------+------------------------+---------------+------------+\n");
+
+    free(start_array);
+    free(end_array);
+#endif
+}
+
+static void cpu_stats_task(void *arg)
+{
+    while (1) {
+        print_cpu_thread_stats_once();
+    }
+}
+
+void diagnostics_start_cpu_stats_monitor(void)
+{
+    xTaskCreatePinnedToCore(
+        cpu_stats_task,
+        "cpu_stats_dbg",
+        8192,
+        NULL,
+        tskIDLE_PRIORITY + 1,
+        NULL,
+        tskNO_AFFINITY
+    );
+}
 ==================================================
 FILE: src/main/features/camera_perview/camera_preview.c
 ==================================================
@@ -505,6 +768,18 @@ FILE: src/main/include/config/app_features.h
 [Skipped binary/non-text file]
 
 ==================================================
+FILE: src/main/include/diagnostics/ai_pipeline_status.h
+==================================================
+#pragma once
+
+#include "esp_err.h"
+
+void diagnostics_start_ai_pipeline_monitor(void);
+
+void diagnostics_ai_frame_sent_to_detector(void);
+void diagnostics_ai_detection_result(int face_count);
+void diagnostics_ai_recognition_result(esp_err_t ret, const char *name, float similarity);
+==================================================
 FILE: src/main/include/diagnostics/core_trace.h
 ==================================================
 #pragma once
@@ -519,7 +794,7 @@ static inline void core_trace(const char *tag, const char *stage)
     TaskHandle_t task = xTaskGetCurrentTaskHandle();
 
     ESP_LOGI(tag,
-             "[CORE-PROOF] stage=%s cpu=%d task=%s affinity=%d time_us=%lld",
+             " stage=%s cpu=%d task=%s affinity=%d time_us=%lld",
              stage,
              xPortGetCoreID(),                 // actual CPU executing this line
              pcTaskGetName(task),
@@ -527,6 +802,12 @@ static inline void core_trace(const char *tag, const char *stage)
              (long long)esp_timer_get_time());
 }
 
+==================================================
+FILE: src/main/include/diagnostics/cpu_stats.h
+==================================================
+#pragma once
+
+void diagnostics_start_cpu_stats_monitor(void);
 ==================================================
 FILE: src/main/include/platform/camera/video_capture.h
 ==================================================
@@ -731,7 +1012,7 @@ FILE: src/main/include/services/vision/face_recognizer.h
 
 #include <stdint.h>
 #include "esp_err.h"
-#include "face_detector.h"
+#include "services/vision/face_detector.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -759,394 +1040,6 @@ int face_recognition_get_count(void);
 }
 #endif
 ==================================================
-FILE: src/main/main.c
-==================================================
-#include <inttypes.h>
-#include <stdio.h>
-#include "esp_err.h"
-#include "esp_log.h"
-#include "esp_video_init.h"
-#include "esp_lcd_mipi_dsi.h"
-#include "esp_lcd_panel_ops.h"
-#include "esp_cache.h"
-#include "esp_heap_caps.h"
-#include "esp_private/esp_cache_private.h"
-#include "esp_timer.h"
-#include "driver/ppa.h"
-#include "app_video.h"
-#include "face_detect_wrapper.h"
-#include "face_recognition_wrapper.h"
-#include "esp_spiffs.h"
-#include "core_trace.h"
-#include "app/app_boot.h"
-#include "esp_lcd_panel_io.h"
-#include "esp_lcd_panel_vendor.h"
-#include "bsp/display.h"
-#include "bsp/esp-bsp.h"
-#include "lvgl.h"
-#include "lv_demos.h"
-
-#define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
-static bool enrolled_once = false;
-static bool enrollment_finished_this_boot = false;
-
-static int smooth_coord(int old_value, int new_value)
-{
-    return (old_value * 3 + new_value) / 4;
-}
-
-static void draw_rect_rgb565(
-    uint16_t *fb,
-    uint32_t fb_w,
-    uint32_t fb_h,
-    int x1,
-    int y1,
-    int x2,
-    int y2,
-    uint16_t color)
-{
-    if (!fb) {
-        return;
-    }
-
-    if (x1 < 0) x1 = 0;
-    if (y1 < 0) y1 = 0;
-    if (x2 < 0) x2 = 0;
-    if (y2 < 0) y2 = 0;
-
-    if (x1 >= (int)fb_w) x1 = fb_w - 1;
-    if (x2 >= (int)fb_w) x2 = fb_w - 1;
-    if (y1 >= (int)fb_h) y1 = fb_h - 1;
-    if (y2 >= (int)fb_h) y2 = fb_h - 1;
-
-    for (int x = x1; x <= x2; x++) {
-        fb[y1 * fb_w + x] = color;
-        fb[y2 * fb_w + x] = color;
-    }
-
-    for (int y = y1; y <= y2; y++) {
-        fb[y * fb_w + x1] = color;
-        fb[y * fb_w + x2] = color;
-    }
-}
-
-static void camera_video_frame_operation(
-    uint8_t *camera_buf,
-    uint8_t camera_buf_index,
-    uint32_t camera_buf_hes,
-    uint32_t camera_buf_ves,
-    size_t camera_buf_len,
-    void *user_data);
-
-static const char *TAG = "app_main";
-
-static esp_lcd_panel_handle_t display_panel;
-static ppa_client_handle_t ppa_srm_handle = NULL;
-static size_t data_cache_line_size = 0;
-static void *lcd_buffer[CONFIG_BSP_LCD_DPI_BUFFER_NUMS];
-static lv_display_t *disp;
-#define FACE_DETECT_INTERVAL 5
-#define MAX_FACE_BOXES 5
-#define FACE_RECOG_INTERVAL 20
-
-static uint32_t frame_count = 0;
-
-static face_box_t last_boxes[MAX_FACE_BOXES];
-static int last_face_count = 0;
-static int no_face_frames = 0;
-
-#define FACE_BOX_HOLD_MISSES 3
-
-i2c_master_bus_handle_t i2c_bus_;
-
-static bool dummy_draw_enabled = true;
-static bool dummy_mode_delay_flag = false;
-
-static void calc_ppa_input_offset(uint32_t src_w, uint32_t src_h,
-                                  uint32_t dst_w, uint32_t dst_h,
-                                  uint32_t *offset_x, uint32_t *offset_y)
-{
-    *offset_x = (src_w > dst_w) ? (src_w - dst_w) / 2 : 0;
-    *offset_y = (src_h > dst_h) ? (src_h - dst_h) / 2 : 0;
-
-    if ((*offset_x + dst_w) > src_w)
-    {
-        *offset_x = 0;
-    }
-    if ((*offset_y + dst_h) > src_h)
-    {
-        *offset_y = 0;
-    }
-}
-
-
-void app_main(void)
-{
-    core_trace(TAG, "APP_MAIN_START");
-    disp = bsp_display_start();
-    bsp_display_backlight_on();
-
-    ESP_ERROR_CHECK(esp_lv_adapter_set_dummy_draw(disp, dummy_draw_enabled));
-
-    display_panel = bsp_display_get_panel_handle();
-
-    ppa_client_config_t ppa_srm_config = {
-        .oper_type = PPA_OPERATION_SRM,
-    };
-    ESP_ERROR_CHECK(ppa_register_client(&ppa_srm_config, &ppa_srm_handle));
-
-    app_boot_initialize_services();
-    
-
-
-
-    ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size));
-
-    i2c_bus_ = bsp_i2c_get_handle();
-
-    esp_err_t ret = app_video_main(i2c_bus_);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "video main init failed with err=0x%x", ret);
-        return;
-    }
-
-    int video_cam_fd0 = app_video_open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, APP_VIDEO_FMT);
-    if (video_cam_fd0 < 0)
-    {
-        ESP_LOGE(TAG, "video cam open failed");
-        return;
-    }
-
-    ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(
-        display_panel, 3,
-        &lcd_buffer[0], &lcd_buffer[1], &lcd_buffer[2]));
-
-    ESP_LOGI(TAG, "Using user defined buffer");
-    void *camera_buf[2];
-    for (int i = 0; i < 2; i++)
-    {
-        camera_buf[i] = heap_caps_aligned_calloc(
-            data_cache_line_size,
-            1,
-            app_video_get_buf_size(),
-            MALLOC_CAP_SPIRAM);
-    }
-    ESP_ERROR_CHECK(app_video_set_bufs(video_cam_fd0, 2, (void *)camera_buf));
-
-    ESP_ERROR_CHECK(app_video_register_frame_operation_cb(camera_video_frame_operation));
-
-    ESP_LOGI(TAG, "[CORE-PROOF] Requesting video stream task on CPU0");
-
-    ESP_ERROR_CHECK(app_video_stream_task_start(video_cam_fd0, 0, NULL));
-
-}
-
-static void camera_video_frame_operation(
-    uint8_t *camera_buf,
-    uint8_t camera_buf_index,
-    uint32_t camera_buf_hes,
-    uint32_t camera_buf_ves,
-    size_t camera_buf_len,
-    void *user_data)
-{
-
-    if (!dummy_draw_enabled || dummy_mode_delay_flag)
-    {
-        return;
-    }
-
-    const uint32_t display_width = BSP_LCD_H_RES;
-    const uint32_t display_height = BSP_LCD_V_RES;
-
-    if (display_height == 0)
-    {
-        ESP_LOGE(TAG, "Display height is zero!");
-        return;
-    }
-
-    uint32_t in_offset_x = 0;
-    uint32_t in_offset_y = 0;
-
-    uint32_t in_block_w = camera_buf_hes;
-    uint32_t in_block_h = camera_buf_ves;
-
-    float scale_x = (float)display_width / (float)camera_buf_hes;
-    float scale_y = (float)display_height / (float)camera_buf_ves;
-
-
-
-    ppa_srm_oper_config_t srm_config = {
-        .in.buffer = camera_buf,
-        .in.pic_w = camera_buf_hes,
-        .in.pic_h = camera_buf_ves,
-        .in.block_w = in_block_w,
-        .in.block_h = in_block_h,
-        .in.block_offset_x = in_offset_x,
-        .in.block_offset_y = in_offset_y,
-        .in.srm_cm = APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? PPA_SRM_COLOR_MODE_RGB565 : PPA_SRM_COLOR_MODE_RGB888,
-
-        .out.buffer = lcd_buffer[camera_buf_index],
-        .out.buffer_size = ALIGN_UP(display_width * display_height *
-                                        (APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? 2 : 3),
-                                    data_cache_line_size),
-        .out.pic_w = display_width,
-        .out.pic_h = display_height,
-        .out.block_offset_x = 0,
-        .out.block_offset_y = 0,
-        .out.srm_cm = APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? PPA_SRM_COLOR_MODE_RGB565 : PPA_SRM_COLOR_MODE_RGB888,
-
-        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-        .scale_x = scale_x,
-        .scale_y = scale_y,
-        .mirror_x = 0,
-        .mirror_y = 0,
-        .rgb_swap = 0,
-        .byte_swap = 0,
-        .mode = PPA_TRANS_MODE_BLOCKING,
-    };
-
-    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "PPA SRM failed: %d", ret);
-        return;
-    }
-
-    frame_count++;
-
-    if ((frame_count % 100) == 0) {
-        ESP_LOGI(TAG,
-                "[CORE-PROOF] MAIN_SW frame=%" PRIu32
-                " cpu=%d task=%s affinity=%d",
-                frame_count,
-                xPortGetCoreID(),
-                pcTaskGetName(NULL),
-                xTaskGetCoreID(xTaskGetCurrentTaskHandle()));
-    }
-    if ((frame_count % FACE_DETECT_INTERVAL) == 0) {
-        face_box_t boxes[MAX_FACE_BOXES];
-
-    #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
-        int face_count = face_detect_run_rgb565(
-            camera_buf,
-            camera_buf_hes,
-            camera_buf_ves,
-            boxes,
-            MAX_FACE_BOXES
-        );
-    #else
-        int face_count = face_detect_run_rgb888(
-            camera_buf,
-            camera_buf_hes,
-            camera_buf_ves,
-            boxes,
-            MAX_FACE_BOXES
-        );
-    #endif
-
-        ESP_LOGI(TAG, "Detection ran, face_count=%d", face_count);
-
-        if (face_count > 0) {
-            int update_count = face_count;
-            if (update_count > MAX_FACE_BOXES) {
-                update_count = MAX_FACE_BOXES;
-            }
-
-            for (int i = 0; i < update_count; i++) {
-                if (i < last_face_count) {
-                    last_boxes[i].x1 = smooth_coord(last_boxes[i].x1, boxes[i].x1);
-                    last_boxes[i].y1 = smooth_coord(last_boxes[i].y1, boxes[i].y1);
-                    last_boxes[i].x2 = smooth_coord(last_boxes[i].x2, boxes[i].x2);
-                    last_boxes[i].y2 = smooth_coord(last_boxes[i].y2, boxes[i].y2);
-                    last_boxes[i].score = boxes[i].score;
-                } else {
-                    last_boxes[i] = boxes[i];
-                }
-
-                ESP_LOGI(TAG,
-                        "Face %d score=%.2f box=[%d,%d,%d,%d]",
-                        i,
-                        boxes[i].score,
-                        boxes[i].x1,
-                        boxes[i].y1,
-                        boxes[i].x2,
-                        boxes[i].y2);
-                
-
-                if (i == 0 && boxes[i].score > 0.85f) {
-                    char name[FACE_RECOG_MAX_NAME_LEN];
-                    float recog_score = 0.0f;
-
-                    esp_err_t recog_ret = face_recognition_recognize(
-                        camera_buf,
-                        camera_buf_hes,
-                        camera_buf_ves,
-                        &boxes[i],
-                        name,
-                        sizeof(name),
-                        &recog_score
-                    );
-
-                    if (recog_ret == ESP_OK) {
-                        ESP_LOGI(TAG,
-                                "Recognition result: name=%s score=%.3f",
-                                name,
-                                recog_score);
-                    }
-                }
-            }
-
-            last_face_count = update_count;
-            no_face_frames = 0;
-        } else {
-            no_face_frames++;
-
-            if (no_face_frames >= FACE_BOX_HOLD_MISSES) {
-                last_face_count = 0;
-            }
-        }
-    }
-
-    #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
-    for (int i = 0; i < last_face_count; i++) {
-        int lcd_x1 = last_boxes[i].x1 * display_width / camera_buf_hes;
-        int lcd_y1 = last_boxes[i].y1 * display_height / camera_buf_ves;
-        int lcd_x2 = last_boxes[i].x2 * display_width / camera_buf_hes;
-        int lcd_y2 = last_boxes[i].y2 * display_height / camera_buf_ves;
-
-        draw_rect_rgb565(
-            (uint16_t *)lcd_buffer[camera_buf_index],
-            display_width,
-            display_height,
-            lcd_x1,
-            lcd_y1,
-            lcd_x2,
-            lcd_y2,
-            0xF800
-        );
-    }
-    #endif
-    uint32_t draw_w = display_width;
-    uint32_t draw_h = display_height;
-
-    if (dummy_draw_enabled && !dummy_mode_delay_flag)
-    {
-        ret = esp_lv_adapter_dummy_draw_blit(
-            disp,
-            0, 0,
-            draw_w,
-            draw_h,
-            lcd_buffer[camera_buf_index],
-            true);
-
-        if (ret != ESP_OK)
-        {
-            ESP_LOGE(TAG, "Dummy draw blit failed: %d", ret);
-        }
-    }
-}
-==================================================
 FILE: src/main/platform/camera/camera_runtime.c
 ==================================================
 [Skipped binary/non-text file]
@@ -1172,7 +1065,7 @@ FILE: src/main/platform/camera/video_capture.c
 #include "esp_log.h"
 #include "linux/videodev2.h"
 #include "esp_video_init.h"
-#include "video_capture.h"
+#include "platform/camera/video_capture.h"
 
 static const char *TAG = "app_video";
 
@@ -1581,14 +1474,14 @@ FILE: src/main/platform/storage/spiffs_storage.c
 [Skipped binary/non-text file]
 
 ==================================================
-FILE: src/main/services/vision/face_detaction/face_detector.cpp
+FILE: src/main/services/vision/face_detection/face_detector.cpp
 ==================================================
-#include "face_detector.h"
+#include "services/vision/face_detector.h"
 
 #include "esp_log.h"
 #include "human_face_detect.hpp"
+#include "diagnostics/core_trace.h"
 #include "dl_image_define.hpp"
-#include "core_trace.h"
 
 static const char *TAG_FACE = "face_detect_wrapper";
 
@@ -1695,7 +1588,7 @@ extern "C" int face_detect_run_rgb888(
 ==================================================
 FILE: src/main/services/vision/face_recognition/face_recognizer.cpp
 ==================================================
-#include "face_recognition_wrapper.h"
+#include "services/vision/face_recognizer.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1711,9 +1604,10 @@ FILE: src/main/services/vision/face_recognition/face_recognizer.cpp
 #include "dl_image_define.hpp"
 #include "dl_detect_define.hpp"
 
-#include "video_capture.h"
-#include "face_detector.h"
-#include "core_trace.h"
+#include "services/vision/face_recognizer.h"
+#include "platform/camera/video_capture.h"
+#include "services/vision/face_detector.h"
+#include "diagnostics/core_trace.h"
 
 static const char *TAG_RECOG = "face_recognition_wrapper";
 

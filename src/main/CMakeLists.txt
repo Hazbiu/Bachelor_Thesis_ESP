@@ -7,5 +7,7 @@ idf_component_register(
         "services/vision/face_recognition/face_recognizer.cpp"
         "diagnostics/cpu_stats.c"
         "diagnostics/ai_pipeline_status.c"
+        "power_save/deep_sleep.c"
+        "power_save/wake_up.c"
     INCLUDE_DIRS "include"
 )

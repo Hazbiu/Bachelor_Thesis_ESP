@@ -23,7 +23,13 @@
 #include "bsp/esp-bsp.h"
 #include "lvgl.h"
 #include "lv_demos.h"
+#include "power_save/deep_sleep.h"
+#include "power_save/wake_up.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
+
+#define DEEP_SLEEP_TIMEOUT_MS 30000
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 static bool enrolled_once = false;
 static bool enrollment_finished_this_boot = false;
@@ -117,9 +123,19 @@ static void calc_ppa_input_offset(uint32_t src_w, uint32_t src_h,
     }
 }
 
+static void deep_sleep_timeout_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(DEEP_SLEEP_TIMEOUT_MS));
+
+    ESP_LOGI(TAG, "No activity for %d ms; entering deep sleep",
+             DEEP_SLEEP_TIMEOUT_MS);
+
+    enter_deep_sleep();
+}
 
 void app_main(void)
 {
+    report_wake_reason();
     core_trace(TAG, "APP_MAIN_START");
     diagnostics_start_cpu_stats_monitor();
     diagnostics_start_ai_pipeline_monitor();
@@ -179,6 +195,14 @@ void app_main(void)
     ESP_LOGI(TAG, "[CORE-PROOF] Requesting video stream task on CPU0");
 
     ESP_ERROR_CHECK(app_video_stream_task_start(video_cam_fd0, 0, NULL));
+
+    xTaskCreate(
+        deep_sleep_timeout_task,
+        "deep_sleep_timeout",
+        2048,
+        NULL,
+        5,
+        NULL);
 
 }
 
