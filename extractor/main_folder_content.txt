@@ -1,6 +1,6 @@
 Main folder export
-Generated on: Mon Jul 20 11:19:40 AM CEST 2026
-Source: /mnt/c/Programming/Bachelor_Thesis_ESP/extractor/../src/main
+Generated on: Tue Jul 21 02:30:53 PM CEST 2026
+Source: /home/keti-hazbiu/git-hub/Bachelor_Thesis_ESP/extractor/../src/main
 ==================================================
 
 ==================================================
@@ -104,7 +104,13 @@ FILE: src/main/app/app_main.c
 #include "bsp/esp-bsp.h"
 #include "lvgl.h"
 #include "lv_demos.h"
+#include "power_save/deep_sleep.h"
+#include "power_save/wake_up.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
+
+#define DEEP_SLEEP_TIMEOUT_MS 30000
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 static bool enrolled_once = false;
 static bool enrollment_finished_this_boot = false;
@@ -198,9 +204,19 @@ static void calc_ppa_input_offset(uint32_t src_w, uint32_t src_h,
     }
 }
 
+static void deep_sleep_timeout_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(DEEP_SLEEP_TIMEOUT_MS));
+
+    ESP_LOGI(TAG, "No activity for %d ms; entering deep sleep",
+             DEEP_SLEEP_TIMEOUT_MS);
+
+    enter_deep_sleep();
+}
 
 void app_main(void)
 {
+    report_wake_reason();
     core_trace(TAG, "APP_MAIN_START");
     diagnostics_start_cpu_stats_monitor();
     diagnostics_start_ai_pipeline_monitor();
@@ -260,6 +276,14 @@ void app_main(void)
     ESP_LOGI(TAG, "[CORE-PROOF] Requesting video stream task on CPU0");
 
     ESP_ERROR_CHECK(app_video_stream_task_start(video_cam_fd0, 0, NULL));
+
+    xTaskCreate(
+        deep_sleep_timeout_task,
+        "deep_sleep_timeout",
+        2048,
+        NULL,
+        5,
+        NULL);
 
 }
 
@@ -478,6 +502,8 @@ idf_component_register(
         "services/vision/face_recognition/face_recognizer.cpp"
         "diagnostics/cpu_stats.c"
         "diagnostics/ai_pipeline_status.c"
+        "power_save/deep_sleep.c"
+        "power_save/wake_up.c"
     INCLUDE_DIRS "include"
 )
 ==================================================
@@ -964,6 +990,18 @@ esp_err_t app_video_register_frame_operation_cb(app_video_frame_operation_cb_t o
 #endif
 #endif
 
+==================================================
+FILE: src/main/include/power_save/deep_sleep.h
+==================================================
+#pragma once
+
+void enter_deep_sleep(void);
+==================================================
+FILE: src/main/include/power_save/wake_up.h
+==================================================
+#pragma once
+
+void report_wake_reason(void);
 ==================================================
 FILE: src/main/include/services/vision/face_detector.h
 ==================================================
@@ -1473,6 +1511,66 @@ FILE: src/main/platform/storage/spiffs_storage.c
 ==================================================
 [Skipped binary/non-text file]
 
+==================================================
+FILE: src/main/power_save/deep_sleep.c
+==================================================
+#include "esp_log.h"
+#include "esp_sleep.h"
+
+static const char *TAG = "deep_sleep";
+
+#define DEEP_SLEEP_WAKEUP_SECONDS 10ULL
+
+void enter_deep_sleep(void)
+{
+    ESP_LOGI(
+        TAG,
+        "Touch interrupt is unavailable. "
+        "Using a 10-second timer wakeup."
+    );
+
+    ESP_ERROR_CHECK(
+        esp_sleep_enable_timer_wakeup(
+            DEEP_SLEEP_WAKEUP_SECONDS * 1000000ULL
+        )
+    );
+
+    ESP_LOGI(TAG, "Entering deep sleep");
+
+    esp_deep_sleep_start();
+}
+==================================================
+FILE: src/main/power_save/wake_up.c
+==================================================
+#include "power_save/wake_up.h"
+
+#include "esp_log.h"
+#include "esp_sleep.h"
+
+static const char *TAG = "wake_up";
+
+void report_wake_reason(void)
+{
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+
+    switch (cause) {
+    case ESP_SLEEP_WAKEUP_GPIO:
+        ESP_LOGI(TAG, "Woken from deep sleep by GT9271 touch interrupt");
+        break;
+
+    case ESP_SLEEP_WAKEUP_TIMER:
+        ESP_LOGI(TAG, "Woken from deep sleep by timer");
+        break;
+
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+        ESP_LOGI(TAG, "Normal power-on or reset (not deep-sleep wake)");
+        break;
+
+    default:
+        ESP_LOGI(TAG, "Wake cause: %d", cause);
+        break;
+    }
+}
 ==================================================
 FILE: src/main/services/vision/face_detection/face_detector.cpp
 ==================================================
