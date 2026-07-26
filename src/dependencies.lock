@@ -24,7 +24,7 @@ dependencies:
       type: service
     version: 0.5.3
   espressif/dl_fft:
-    component_hash: ced3cf28cc70452b7859c06f4e5059215167254a2047e34c893d6f501ccd6ea2
+    component_hash: a955ca29581de2177ddf25759273bd83f082b3c805e735fe6ee105858643989b
     dependencies:
     - name: idf
       require: private
@@ -32,14 +32,14 @@ dependencies:
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 0.4.0
+    version: 0.6.0
   espressif/esp-dl:
-    component_hash: f85a2b0b7597af79ce55a4fe33366c59006fc889423ee8b12fbd3ba0d4bf22dc
+    component_hash: c6ff0a5eafdabee9c7d9bb3fdb224ff4d5e18db5f4981629311694174555405c
     dependencies:
     - name: espressif/dl_fft
       registry_url: https://components.espressif.com
       require: private
-      version: '>=0.4.0'
+      version: '>=0.6.0'
     - name: espressif/esp_new_jpeg
       registry_url: https://components.espressif.com
       require: private
@@ -60,11 +60,11 @@ dependencies:
     - esp32s2
     - esp32s3
     - esp32s31
-    version: 3.3.6
+    version: 3.3.8
   espressif/esp_cam_sensor:
     dependencies: []
     source:
-      path: /home/keti-hazbiu/git-hub/Bachelor_Thesis_ESP/src/components/espressif__esp_cam_sensor
+      path: /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/components/espressif__esp_cam_sensor
       type: local
     version: 0.9.0
   espressif/esp_codec_dev:
@@ -152,7 +152,7 @@ dependencies:
       type: service
     version: 1.2.1
   espressif/esp_lcd_touch_gt911:
-    component_hash: 6029febef66eefd0910d527d7f30292779ccbf22a8dedd2bd69466acf0068a7b
+    component_hash: 07f678e4202d79bbad917805dcec4134ff08344177720f32ec4898267ad9e394
     dependencies:
     - name: espressif/esp_lcd_touch
       registry_url: https://components.espressif.com
@@ -164,9 +164,9 @@ dependencies:
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 1.2.0~2
+    version: 1.2.0~3
   espressif/esp_lv_decoder:
-    component_hash: 8e74961d7471fbdf6fc17c5517c0ecc15148b8d04e792a92fefc2b7bacd98cbb
+    component_hash: 331d23c304cea5d1aed0ad3cea7774874dbaeebb2217e8db6bf3cc8485ac9f9f
     dependencies:
     - name: espressif/esp_new_jpeg
       registry_url: https://components.espressif.com
@@ -196,7 +196,9 @@ dependencies:
     - esp32c3
     - esp32c5
     - esp32c6
-    version: 0.4.2
+    - esp32c61
+    - esp32h4
+    version: 0.4.3
   espressif/esp_lv_fs:
     component_hash: 66896007884b817df34c964f9a114fff538ee2674e99fee7159162498b93f94b
     dependencies:
@@ -220,7 +222,7 @@ dependencies:
       type: service
     version: 1.0.1
   espressif/esp_lvgl_adapter:
-    component_hash: 1ff54e30214aab9fe34afb6253f70d204106564014fadb193d1b8e9c46a13a08
+    component_hash: eb3e4e753119b66b60aff2df65c4c3cdad4d33e0a8a7fdfa7cdef83915289bfb
     dependencies:
     - name: espressif/button
       registry_url: https://components.espressif.com
@@ -256,7 +258,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 0.5.3
+    version: 0.6.2
   espressif/esp_mmap_assets:
     component_hash: b7c559238d9f4c11048b1d7302f5474e4f4f590902433efd792bd0cbf5324f2a
     dependencies:
@@ -417,14 +419,14 @@ dependencies:
       type: idf
     version: 5.5.4
   lvgl/lvgl:
-    component_hash: 184e532558c1c45fefed631f3e235423d22582aafb4630f3e8885c35281a49ae
+    component_hash: 17e68bfd21f0edf4c3ee838e2273da840bf3930e5dbc3bfa6c1190c3aed41f9f
     dependencies: []
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 9.5.0
+    version: 9.4.0
   waveshare/esp32_p4_platform:
-    component_hash: 0bbadcb5663a921779cf656eacc5673d9343ffcceeec21c43ba628b60f914292
+    component_hash: b1be590dd7170ea417a3b950b81c7892ff266d6514070ecdd568faeb654b0149
     dependencies:
     - name: espressif/esp_codec_dev
       registry_url: https://components.espressif.com
@@ -445,7 +447,7 @@ dependencies:
     - name: espressif/esp_lvgl_adapter
       registry_url: https://components.espressif.com
       require: public
-      version: ^0.5.1
+      version: ~0.6
     - name: idf
       require: private
       version: '>=5.5'
@@ -484,7 +486,7 @@ dependencies:
       type: service
     targets:
     - esp32p4
-    version: 2.0.0
+    version: 2.0.1
   waveshare/esp_lcd_dsi:
     component_hash: 004e3455a2e331eadef75da0df28eb090d03681e0300d75abccb1722fbca66c4
     dependencies:

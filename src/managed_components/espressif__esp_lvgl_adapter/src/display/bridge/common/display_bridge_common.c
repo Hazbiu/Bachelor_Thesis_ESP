@@ -16,7 +16,7 @@
 
 #include "esp_cache.h"
 #include "esp_private/esp_cache_private.h"
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 1)
 #include "esp_efuse.h"
 #else
 #include "esp_flash_encrypt.h"
@@ -49,7 +49,7 @@ bool display_bridge_flash_encryption_active(void)
 {
     static int s_state = -1;
     if (s_state < 0) {
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 1)
         s_state = esp_efuse_is_flash_encryption_enabled() ? 1 : 0;
 #else
         s_state = esp_flash_encryption_enabled() ? 1 : 0;
@@ -491,6 +491,26 @@ void display_cache_msync_framebuffer(void *buffer,
                     ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
 }
 
+void display_cache_msync_invalidate_framebuffer(void *buffer,
+                                                size_t size)
+{
+    if (!buffer || size == 0) {
+        return;
+    }
+
+    size_t line_size = display_bridge_get_cache_line_size_by_addr(buffer);
+    if (line_size == 0) {
+        return;
+    }
+
+    uintptr_t start_addr = (uintptr_t)buffer;
+    uintptr_t aligned_start = start_addr & ~((uintptr_t)line_size - 1);
+    size_t align_padding = start_addr - aligned_start;
+    size_t aligned_size = ((size + align_padding + line_size - 1) / line_size) * line_size;
+
+    esp_cache_msync((void *)aligned_start, aligned_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+}
+
 /**********************
  *   LCD OPERATIONS
  **********************/
@@ -613,8 +633,7 @@ size_t display_bridge_get_cache_line_size(void)
 #endif
 
 #if SOC_DMA2D_SUPPORTED
-#include "esp_idf_version.h"
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+#ifdef ESP_ASYNC_COLOR_CONVERT_AVAILABLE
 #include "esp_async_color_convert.h"
 #else
 #include "esp_async_fbcpy.h"
@@ -628,7 +647,7 @@ size_t display_bridge_get_cache_line_size(void)
 #if CONFIG_SOC_DMA2D_SUPPORTED
 static inline esp_err_t s_dma2d_install(void **out_handle)
 {
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+#ifdef ESP_ASYNC_COLOR_CONVERT_AVAILABLE
     async_color_convert_config_t cfg = {
         .dma_burst_size = 128,
     };
@@ -641,7 +660,7 @@ static inline esp_err_t s_dma2d_install(void **out_handle)
 
 static inline void s_dma2d_uninstall(void *handle)
 {
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+#ifdef ESP_ASYNC_COLOR_CONVERT_AVAILABLE
     esp_async_color_convert_uninstall((async_color_convert_handle_t)handle);
 #else
     esp_async_fbcpy_uninstall((esp_async_fbcpy_handle_t)handle);
@@ -655,11 +674,11 @@ static inline void s_dma2d_uninstall(void *handle)
  *
  * This function is 100% identical in both v8 and v9 implementations
  */
-void display_bridge_init_runtime_info(esp_lv_adapter_display_runtime_info_t *runtime,
-                                      const esp_lv_adapter_display_runtime_config_t *cfg)
+esp_err_t display_bridge_init_runtime_info(esp_lv_adapter_display_runtime_info_t *runtime,
+                                           const esp_lv_adapter_display_runtime_config_t *cfg)
 {
     if (!runtime || !cfg) {
-        return;
+        return ESP_ERR_INVALID_ARG;
     }
 
     runtime->hor_res = cfg->base.profile.hor_res;
@@ -672,15 +691,38 @@ void display_bridge_init_runtime_info(esp_lv_adapter_display_runtime_info_t *run
         runtime->frame_buffers[i] = cfg->frame_buffers[i];
     }
 
-    /* Calculate color bytes from buffer size */
+    /* Derive panel framebuffer pixel size from the configured framebuffer geometry. */
     size_t total_pixels = (size_t)runtime->hor_res * runtime->ver_res;
     uint8_t color_bytes = 0;
+    uint8_t lvgl_color_bytes = 0;
 
     if (runtime->frame_buffer_size && total_pixels) {
+        if ((runtime->frame_buffer_size % total_pixels) != 0 &&
+                cfg->base.profile.mono_layout == ESP_LV_ADAPTER_MONO_LAYOUT_NONE) {
+            ESP_LOGE(TAG, "frame_buffer_size=%zu is not pixel-aligned for %ux%u panel",
+                     runtime->frame_buffer_size, runtime->hor_res, runtime->ver_res);
+            return ESP_ERR_INVALID_ARG;
+        }
         color_bytes = runtime->frame_buffer_size / total_pixels;
     }
-    if (color_bytes == 0 && LV_COLOR_DEPTH % 8 == 0) {
-        color_bytes = LV_COLOR_DEPTH / 8;
+
+    if (LV_COLOR_DEPTH % 8 == 0) {
+        lvgl_color_bytes = LV_COLOR_DEPTH / 8;
+    } else if (cfg->base.profile.mono_layout == ESP_LV_ADAPTER_MONO_LAYOUT_NONE) {
+        ESP_LOGE(TAG, "LV_COLOR_DEPTH=%d is not supported for non-monochrome display", LV_COLOR_DEPTH);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (cfg->base.profile.mono_layout == ESP_LV_ADAPTER_MONO_LAYOUT_NONE &&
+            color_bytes && lvgl_color_bytes && color_bytes != lvgl_color_bytes) {
+        ESP_LOGE(TAG, "LVGL/LCD color depth mismatch: LV_COLOR_DEPTH=%d (%u bytes), framebuffer_size=%zu, panel=%ux%u, panel_color_bytes=%u",
+                 LV_COLOR_DEPTH, lvgl_color_bytes, runtime->frame_buffer_size,
+                 runtime->hor_res, runtime->ver_res, color_bytes);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (color_bytes == 0) {
+        color_bytes = lvgl_color_bytes;
     }
     if (color_bytes == 0) {
         color_bytes = sizeof(lv_color_t);
@@ -706,6 +748,8 @@ void display_bridge_init_runtime_info(esp_lv_adapter_display_runtime_info_t *run
         ESP_LOGW(TAG, "color depth %u bytes not HW-accelerated; using CPU fallback",
                  runtime->color_bytes);
     }
+
+    return ESP_OK;
 }
 
 #if SOC_DMA2D_SUPPORTED
@@ -868,7 +912,7 @@ esp_err_t display_bridge_release_hw_resource(void)
  *
  * IRAM: Executed in ISR context for fast response
  */
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+#ifdef ESP_ASYNC_COLOR_CONVERT_AVAILABLE
 bool IRAM_ATTR display_bridge_dma2d_done_callback(async_color_convert_handle_t mcp,
                                                   async_color_convert_event_data_t *event_data,
                                                   void *cb_args)
@@ -908,7 +952,7 @@ esp_err_t display_bridge_dma2d_copy_sync(void *trans_desc, uint32_t timeout_ms)
     /* Clear completion semaphore */
     xSemaphoreTake((SemaphoreHandle_t)hw->dma2d_done_sem, 0);
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+#ifdef ESP_ASYNC_COLOR_CONVERT_AVAILABLE
     ret = esp_async_color_convert(hw->fbcpy_handle,
                                   (const async_color_convert_request_t *)trans_desc,
                                   display_bridge_dma2d_done_callback,
@@ -1029,9 +1073,9 @@ int display_bridge_pipeline_init_from_cfg(esp_lv_adapter_display_pipeline_t *pip
     const bool rotated = (cfg->base.profile.rotation != ESP_LV_ADAPTER_ROTATE_0);
     const bool use_pipeline = (mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_PARTIAL ||
                                mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL ||
+                               mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_DIRECT ||
                                mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_FULL ||
-                               mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_FULL ||
-                               (rotated && mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_DIRECT));
+                               mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_FULL);
     if (!use_pipeline || cfg->frame_buffer_count == 0) {
         return 0;
     }
@@ -1082,9 +1126,9 @@ int display_bridge_pipeline_init_from_cfg(esp_lv_adapter_display_pipeline_t *pip
         }
         *out_disp_fb = fb[1];
         *out_draw_fb = fb[2];
-    } else if (mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_FULL ||
+    } else if (mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_DIRECT ||
+               mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_FULL ||
                mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_FULL) {
-        /* non-rotated full: fb[0]=disp, fb[1]=draw, fb[2..]=free */
         uint8_t required = (mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_FULL) ? 3 : 2;
         if (fb_count < required) {
             ESP_LOGE(TAG, "FULL mode %d requires %d frame buffers, got %d", mode, required, fb_count);
@@ -1094,7 +1138,8 @@ int display_bridge_pipeline_init_from_cfg(esp_lv_adapter_display_pipeline_t *pip
 
         *out_disp_fb = fb[0];
         *out_draw_fb = fb[1];
-        for (int i = 1; i < fb_count; i++) {
+        int free_start = (mode == ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_FULL) ? 2 : 1;
+        for (int i = free_start; i < fb_count; i++) {
             STAILQ_INSERT_TAIL(&pipeline->empty_list, &pipeline->elems[i], entry);
         }
     }

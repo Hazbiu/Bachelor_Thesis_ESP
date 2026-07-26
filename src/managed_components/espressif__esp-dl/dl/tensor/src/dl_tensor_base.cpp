@@ -2,8 +2,18 @@
 #include "dl_base_pad.hpp"
 #include "dl_base_requantize_linear.hpp"
 #include "esp_random.h"
+#include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <type_traits>
 namespace dl {
+
+static bool is_nan(float value)
+{
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return (bits & UINT32_C(0x7fffffff)) > UINT32_C(0x7f800000);
+}
 
 template <typename RT, typename T>
 RT quantize(T input, float inv_scale)
@@ -886,6 +896,25 @@ bool TensorBase::compare_elements(const T *gt_elements, float epsilon, bool verb
     }
 
     for (int i = 0; i < this->get_size(); i++) {
+        if constexpr (std::is_same_v<T, float>) {
+            const bool gt_is_nan = is_nan(gt_elements[i]);
+            const bool infer_is_nan = is_nan(elements[i]);
+            if (gt_is_nan || infer_is_nan) {
+                if (gt_is_nan && infer_is_nan) {
+                    continue;
+                }
+                if (verbose) {
+                    ESP_LOGE(__FUNCTION__,
+                             "Inconsistent values, ground truth: %.10f, infer: %.10f, epsilon:%.10f",
+                             gt_elements[i] * 1.0,
+                             elements[i] * 1.0,
+                             epsilon);
+                    std::vector<int> position = this->get_element_coordinates(i);
+                    ESP_LOGE(__FUNCTION__, "The position is: %s", vector_to_string(position).c_str());
+                }
+                return false;
+            }
+        }
         if (elements[i] - gt_elements[i] > epsilon || elements[i] - gt_elements[i] < -epsilon) {
             if (verbose) {
                 ESP_LOGE(__FUNCTION__,
@@ -1070,12 +1099,16 @@ void _slice(TensorBase *input,
         loop_step[axis] = step_i;
         assert(loop_start[axis] < loop_end[axis]);
     }
-    int min_offset = loop_end[last_axis] - loop_start[last_axis];
+    // contiguous_block_size: tail after last_axis (step always 1, safe for copy_memory).
+    // min_offset: includes last_axis range — only valid for copy_memory when step==1.
+    int contiguous_block_size = 1;
     for (int i = last_axis + 1; i < dims; i++) {
-        min_offset *= input_shape[i];
+        contiguous_block_size *= input_shape[i];
     }
+    int min_offset = (loop_end[last_axis] - loop_start[last_axis]) * contiguous_block_size;
     T *slice_ptr = nullptr;
     int min_offset_bytes = min_offset * sizeof(T);
+    int block_bytes = contiguous_block_size * sizeof(T);
 
     if (step.empty()) {
         if (dims == 1 || last_axis == 0) {
@@ -1099,7 +1132,7 @@ void _slice(TensorBase *input,
             }
         }
     } else {
-        if (dims == 1 || last_axis == 0) {
+        if (dims == 1) {
             slice_ptr = input_element + input->get_element_index(loop_start);
             if (loop_step[0] == 1) {
                 tool::copy_memory(output_element, slice_ptr, min_offset_bytes);
@@ -1110,18 +1143,35 @@ void _slice(TensorBase *input,
                     output_element += 1;
                 }
             }
+        } else if (last_axis == 0) {
+            // Multi-dimensional tensor slicing the outermost axis (axis 0).
+            // loop_step[0] is a coordinate-space step, NOT a flat-memory stride:
+            // each selected coordinate yields a contiguous_block_size memory block.
+            if (loop_step[0] == 1) {
+                slice_ptr = input_element + input->get_element_index(loop_start);
+                tool::copy_memory(output_element, slice_ptr, min_offset_bytes);
+            } else {
+                std::vector<int> loop_index = loop_start;
+                for (int idx = loop_start[0]; idx < loop_end[0]; idx += loop_step[0]) {
+                    loop_index[0] = idx;
+                    slice_ptr = input_element + input->get_element_index(loop_index);
+                    tool::copy_memory(output_element, slice_ptr, block_bytes);
+                    output_element += contiguous_block_size;
+                }
+            }
         } else {
             std::vector<int> loop_index = loop_start;
             while (loop_index[0] < loop_end[0]) {
-                slice_ptr = input_element + input->get_element_index(loop_index);
                 if (loop_step[last_axis] == 1) {
+                    slice_ptr = input_element + input->get_element_index(loop_index);
                     tool::copy_memory(output_element, slice_ptr, min_offset_bytes);
                     output_element += min_offset;
                 } else {
-                    for (int i = 0; i < min_offset; i += loop_step[last_axis]) {
-                        *output_element = *slice_ptr;
-                        slice_ptr += loop_step[last_axis];
-                        output_element += 1;
+                    for (int idx = loop_start[last_axis]; idx < loop_end[last_axis]; idx += loop_step[last_axis]) {
+                        loop_index[last_axis] = idx;
+                        slice_ptr = input_element + input->get_element_index(loop_index);
+                        tool::copy_memory(output_element, slice_ptr, block_bytes);
+                        output_element += contiguous_block_size;
                     }
                 }
 

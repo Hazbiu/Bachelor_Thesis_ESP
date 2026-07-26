@@ -12,7 +12,7 @@ documentation: https://docs.espressif.com/projects/esp-iot-solution/en/latest/di
 issues: https://github.com/espressif/esp-iot-solution/issues
 repository: git://github.com/espressif/esp-iot-solution.git
 repository_info:
-  commit_sha: 5f9cb98ae4d0e8153c4b4d1accf471214e5b6fe8
+  commit_sha: 56f3c5620464c061e968d3358bc897c528e097ee
   path: components/display/tools/esp_lv_decoder
 targets:
 - esp32
@@ -24,5 +24,7 @@ targets:
 - esp32c3
 - esp32c5
 - esp32c6
+- esp32c61
+- esp32h4
 url: https://github.com/espressif/esp-iot-solution/tree/master/components/display/tools/esp_lv_decoder
-version: 0.4.2
+version: 0.4.3

@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include "lvgl.h"
+#include "esp_err.h"
 #include "esp_lcd_panel_ops.h"
 #if LVGL_VERSION_MAJOR >= 9
 #include "lvgl_private.h"
@@ -32,8 +33,7 @@
 #define ESP_LV_ADAPTER_BRIDGE_BLOCK_SIZE_LARGE_DEFAULT  (256)
 
 #if SOC_DMA2D_SUPPORTED
-#include "esp_idf_version.h"
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+#ifdef ESP_ASYNC_COLOR_CONVERT_AVAILABLE
 #include "esp_async_color_convert.h"
 #else
 #include "esp_async_fbcpy.h"
@@ -264,6 +264,18 @@ void display_cache_msync_range(const void *addr,
 void display_cache_msync_framebuffer(void *buffer,
                                      size_t size);
 
+/**
+ * @brief Invalidate CPU cache for a framebuffer (Memory to Cache)
+ *
+ * Use after hardware accelerators (DMA2D/PPA) write directly to PSRAM,
+ * so subsequent CPU reads fetch fresh data from memory instead of stale cache.
+ *
+ * @param buffer Framebuffer pointer
+ * @param size Framebuffer size in bytes
+ */
+void display_cache_msync_invalidate_framebuffer(void *buffer,
+                                                size_t size);
+
 /* LCD operations */
 
 /**
@@ -367,8 +379,8 @@ struct display_pipeline_buf *display_bridge_pipeline_wait_free_buf(esp_lv_adapte
  * @param runtime Runtime info structure to initialize
  * @param cfg Display runtime configuration
  */
-void display_bridge_init_runtime_info(esp_lv_adapter_display_runtime_info_t *runtime,
-                                      const esp_lv_adapter_display_runtime_config_t *cfg);
+esp_err_t display_bridge_init_runtime_info(esp_lv_adapter_display_runtime_info_t *runtime,
+                                           const esp_lv_adapter_display_runtime_config_t *cfg);
 
 /**
  * @brief Record timestamp after a successful flush/blit operation
@@ -452,7 +464,7 @@ esp_err_t display_bridge_release_hw_resource(void);
  *
  * @note This function is 100% identical in v8 and v9
  */
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+#ifdef ESP_ASYNC_COLOR_CONVERT_AVAILABLE
 bool display_bridge_dma2d_done_callback(async_color_convert_handle_t mcp,
                                         async_color_convert_event_data_t *event_data,
                                         void *cb_args);

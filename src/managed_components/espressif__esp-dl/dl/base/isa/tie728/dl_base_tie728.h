@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 extern "C" {
 
 void dl_tie728_s16_conv2d_11cn_bias(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
@@ -458,7 +460,21 @@ void dl_tie728_vsmul_s8f32(int8_t *input, float *scale, int n);
 
 int32_t dl_tie728_reduce_l2_s8_aligned(int8_t *input, int32_t size);
 int64_t dl_tie728_reduce_l2_s16_aligned(int16_t *input, int32_t size);
+int8_t dl_tie728_reduce_max_s8_aligned(int8_t *input, int32_t size);
+int16_t dl_tie728_reduce_max_s16_aligned(int16_t *input, int32_t size);
+int8_t dl_tie728_reduce_min_s8_aligned(int8_t *input, int32_t size);
+int16_t dl_tie728_reduce_min_s16_aligned(int16_t *input, int32_t size);
+int8_t dl_tie728_reduce_abs_max_s8_aligned(int8_t *input, int32_t size);
+int16_t dl_tie728_reduce_abs_max_s16_aligned(int16_t *input, int32_t size);
+int32_t dl_tie728_reduce_sum_s8_aligned(int8_t *input, int32_t size);
+int64_t dl_tie728_reduce_sum_s16_aligned(int16_t *input, int32_t size);
+int32_t dl_tie728_reduce_l1_s8_aligned(int8_t *input, int32_t size);
+int64_t dl_tie728_reduce_l1_s16_aligned(int16_t *input, int32_t size);
 
 void dl_tie728_rmsnorm_s8(int8_t *output, int8_t *input, float *scale, float *rms, int n);
 void dl_tie728_rmsnorm_s16(int16_t *output, int16_t *input, float *scale, float *rms, int n);
+
+/* LUT API */
+void dl_tie728_s8_lut(int8_t *output, int8_t *input, int32_t n_16, int8_t *table);
+void dl_tie728_s16_lut_nearest_neighbor(int16_t *output, int16_t *input, int32_t n_8, int16_t *table, int32_t shift);
 }
