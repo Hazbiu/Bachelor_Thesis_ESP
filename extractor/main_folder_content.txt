@@ -1,5 +1,5 @@
 Main folder export
-Generated on: Sun Jul 26 08:09:28 PM CEST 2026
+Generated on: Sun Jul 26 08:58:04 PM CEST 2026
 Source: /home/hazbiu/Programming/Bachelor_Thesis_ESP/extractor/../src/main
 ==================================================
 
@@ -99,6 +99,7 @@ FILE: src/main/app/app_main.c
 #include "diagnostics/cpu_stats.h"
 #include "diagnostics/ai_pipeline_status.h"
 #include "app/app_boot.h"
+#include "app_ui.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "bsp/display.h"
@@ -109,9 +110,14 @@ FILE: src/main/app/app_main.c
 #include "power_save/wake_up.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/gpio.h"
 
 
 #define DEEP_SLEEP_TIMEOUT_MS 30000
+#define DEEP_SLEEP_BUTTON_GPIO GPIO_NUM_3
+#define DEEP_SLEEP_BUTTON_POLL_MS 5
+#define DEEP_SLEEP_BUTTON_DEBOUNCE_MS 25
+#define DEEP_SLEEP_BUTTON_TASK_PRIORITY 8
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 
 /*
@@ -132,9 +138,6 @@ FILE: src/main/app/app_main.c
  * then write it back before the LCD reads it.
  */
 #define SYNC_CACHE_AROUND_OVERLAY 1
-
-static bool enrolled_once = false;
-static bool enrollment_finished_this_boot = false;
 
 static int smooth_coord(int old_value, int new_value)
 {
@@ -192,6 +195,8 @@ static void *display_buffer[DISPLAY_BUF_NUM];
 static size_t lcd_fb_size = 0;
 static uint8_t display_buffer_index = 0;
 static bool display_backlight_enabled = false;
+static portMUX_TYPE deep_sleep_request_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool deep_sleep_requested = false;
 static lv_display_t *disp;
 #define FACE_DETECT_INTERVAL 5
 #define MAX_FACE_BOXES 5
@@ -207,25 +212,9 @@ static int no_face_frames = 0;
 
 i2c_master_bus_handle_t i2c_bus_;
 
-static bool dummy_draw_enabled = true;
+static bool dummy_draw_enabled = false;
+static bool application_start_requested = false;
 static bool dummy_mode_delay_flag = false;
-
-static void calc_ppa_input_offset(uint32_t src_w, uint32_t src_h,
-                                  uint32_t dst_w, uint32_t dst_h,
-                                  uint32_t *offset_x, uint32_t *offset_y)
-{
-    *offset_x = (src_w > dst_w) ? (src_w - dst_w) / 2 : 0;
-    *offset_y = (src_h > dst_h) ? (src_h - dst_h) / 2 : 0;
-
-    if ((*offset_x + dst_w) > src_w)
-    {
-        *offset_x = 0;
-    }
-    if ((*offset_y + dst_h) > src_h)
-    {
-        *offset_y = 0;
-    }
-}
 
 /*
  * Remove LVGL's performance and memory labels before the camera preview is
@@ -252,70 +241,182 @@ static void display_disable_lvgl_overlays(void)
 #endif
 }
 
+static bool claim_deep_sleep_request(void)
+{
+    bool claimed = false;
+
+    portENTER_CRITICAL(&deep_sleep_request_lock);
+    if (!deep_sleep_requested) {
+        deep_sleep_requested = true;
+        claimed = true;
+    }
+    portEXIT_CRITICAL(&deep_sleep_request_lock);
+
+    return claimed;
+}
+
+static void request_deep_sleep(const char *reason)
+{
+    if (!claim_deep_sleep_request()) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Deep sleep requested by %s", reason);
+
+    /* Give immediate visual feedback while enter_deep_sleep waits for release. */
+    bsp_display_backlight_off();
+    display_backlight_enabled = false;
+
+    enter_deep_sleep();
+
+    /* Normally unreachable. Re-arm requests if deep sleep could not be entered. */
+    portENTER_CRITICAL(&deep_sleep_request_lock);
+    deep_sleep_requested = false;
+    portEXIT_CRITICAL(&deep_sleep_request_lock);
+
+    ESP_LOGE(TAG, "Deep sleep request returned without entering sleep");
+}
+
+static void deep_sleep_button_task(void *arg)
+{
+    (void)arg;
+
+    gpio_config_t button_config = {
+        .pin_bit_mask = 1ULL << DEEP_SLEEP_BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    esp_err_t ret = gpio_config(&button_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure deep-sleep button: %s",
+                 esp_err_to_name(ret));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /*
+     * A wake-up press may still be held while the application boots. Wait for
+     * its release so the same press cannot immediately put the device to sleep.
+     */
+    while (gpio_get_level(DEEP_SLEEP_BUTTON_GPIO) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(DEEP_SLEEP_BUTTON_POLL_MS));
+    }
+    vTaskDelay(pdMS_TO_TICKS(DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
+
+    ESP_LOGI(TAG, "Deep-sleep button armed on GPIO%d",
+             DEEP_SLEEP_BUTTON_GPIO);
+
+    while (1) {
+        if (gpio_get_level(DEEP_SLEEP_BUTTON_GPIO) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
+
+            if (gpio_get_level(DEEP_SLEEP_BUTTON_GPIO) == 0) {
+                request_deep_sleep("GPIO3 button");
+
+                /* Only reached if entering deep sleep failed. */
+                while (gpio_get_level(DEEP_SLEEP_BUTTON_GPIO) == 0) {
+                    vTaskDelay(pdMS_TO_TICKS(DEEP_SLEEP_BUTTON_POLL_MS));
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(DEEP_SLEEP_BUTTON_POLL_MS));
+    }
+}
+
 static void deep_sleep_timeout_task(void *arg)
 {
+    (void)arg;
+
     vTaskDelay(pdMS_TO_TICKS(DEEP_SLEEP_TIMEOUT_MS));
 
     ESP_LOGI(TAG, "No activity for %d ms; entering deep sleep",
              DEEP_SLEEP_TIMEOUT_MS);
 
-    enter_deep_sleep();
+    request_deep_sleep("30-second timeout");
+    vTaskDelete(NULL);
 }
 
-void app_main(void)
+static void camera_application_start_task(void *arg)
 {
-    report_wake_reason();
-    core_trace(TAG, "APP_MAIN_START");
-    diagnostics_start_cpu_stats_monitor();
-    diagnostics_start_ai_pipeline_monitor();
-    disp = bsp_display_start();
+    (void)arg;
 
-    /* Enter camera-owned display mode before the backlight is enabled. */
-    ESP_ERROR_CHECK(esp_lv_adapter_set_dummy_draw(disp, dummy_draw_enabled));
+    esp_err_t ret;
+    int video_cam_fd0 = -1;
 
-    display_disable_lvgl_overlays();
+    app_ui_set_status("Initializing display accelerator...");
 
     ppa_client_config_t ppa_srm_config = {
         .oper_type = PPA_OPERATION_SRM,
     };
-    ESP_ERROR_CHECK(ppa_register_client(&ppa_srm_config, &ppa_srm_handle));
 
+    ret = ppa_register_client(&ppa_srm_config, &ppa_srm_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "PPA client registration failed: %s", esp_err_to_name(ret));
+        app_ui_show_error("PPA initialization failed. Restart the device.");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    app_ui_set_status("Initializing face detection and recognition...");
+
+    /*
+     * Keep the existing service initialization unchanged, but defer it until
+     * the user presses Start so the launcher GUI appears immediately at boot.
+     */
     app_boot_initialize_services();
 
-    ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size));
+    diagnostics_start_ai_pipeline_monitor();
+
+    ret = esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Cache alignment query failed: %s", esp_err_to_name(ret));
+        app_ui_show_error("Memory initialization failed. Restart the device.");
+        vTaskDelete(NULL);
+        return;
+    }
 
     lcd_fb_size = ALIGN_UP(
         (size_t)BSP_LCD_H_RES * BSP_LCD_V_RES *
             (APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? 2 : 3),
         data_cache_line_size);
 
+    app_ui_set_status("Opening camera...");
+
     i2c_bus_ = bsp_i2c_get_handle();
 
-    esp_err_t ret = app_video_main(i2c_bus_);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "video main init failed with err=0x%x", ret);
+    ret = app_video_main(i2c_bus_);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Video initialization failed: %s", esp_err_to_name(ret));
+        app_ui_show_error("Camera initialization failed. Restart the device.");
+        vTaskDelete(NULL);
         return;
     }
 
-    int video_cam_fd0 = app_video_open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, APP_VIDEO_FMT);
-    if (video_cam_fd0 < 0)
-    {
-        ESP_LOGE(TAG, "video cam open failed");
+    video_cam_fd0 = app_video_open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, APP_VIDEO_FMT);
+    if (video_cam_fd0 < 0) {
+        ESP_LOGE(TAG, "Video camera open failed");
+        app_ui_show_error("Camera could not be opened. Restart the device.");
+        vTaskDelete(NULL);
         return;
     }
 
-    for (int i = 0; i < DISPLAY_BUF_NUM; i++)
-    {
+    app_ui_set_status("Allocating camera buffers...");
+
+    for (int i = 0; i < DISPLAY_BUF_NUM; i++) {
         display_buffer[i] = heap_caps_aligned_calloc(
             data_cache_line_size,
             1,
             lcd_fb_size,
             MALLOC_CAP_SPIRAM);
 
-        if (!display_buffer[i])
-        {
-            ESP_LOGE(TAG, "failed to allocate display buffer %d", i);
+        if (!display_buffer[i]) {
+            ESP_LOGE(TAG, "Failed to allocate display buffer %d", i);
+            app_ui_show_error("Display-buffer allocation failed. Restart the device.");
+            vTaskDelete(NULL);
             return;
         }
     }
@@ -324,28 +425,71 @@ void app_main(void)
              DISPLAY_BUF_NUM, CAMERA_BUF_NUM);
 
     void *camera_buf[CAMERA_BUF_NUM];
-    for (int i = 0; i < CAMERA_BUF_NUM; i++)
-    {
+    for (int i = 0; i < CAMERA_BUF_NUM; i++) {
         camera_buf[i] = heap_caps_aligned_calloc(
             data_cache_line_size,
             1,
             app_video_get_buf_size(),
             MALLOC_CAP_SPIRAM);
 
-        if (!camera_buf[i])
-        {
-            ESP_LOGE(TAG, "failed to allocate camera buffer %d", i);
+        if (!camera_buf[i]) {
+            ESP_LOGE(TAG, "Failed to allocate camera buffer %d", i);
+            app_ui_show_error("Camera-buffer allocation failed. Restart the device.");
+            vTaskDelete(NULL);
             return;
         }
     }
-    ESP_ERROR_CHECK(app_video_set_bufs(video_cam_fd0, CAMERA_BUF_NUM, (const void **)camera_buf));
 
-    ESP_ERROR_CHECK(app_video_register_frame_operation_cb(camera_video_frame_operation));
+    ret = app_video_set_bufs(
+        video_cam_fd0,
+        CAMERA_BUF_NUM,
+        (const void **)camera_buf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Camera buffer setup failed: %s", esp_err_to_name(ret));
+        app_ui_show_error("Camera-buffer setup failed. Restart the device.");
+        vTaskDelete(NULL);
+        return;
+    }
 
+    ret = app_video_register_frame_operation_cb(camera_video_frame_operation);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Frame callback registration failed: %s", esp_err_to_name(ret));
+        app_ui_show_error("Camera callback setup failed. Restart the device.");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    app_ui_set_status("Starting live application...");
+
+    /*
+     * Start capture while dummy draw is still disabled. Any frame arriving in
+     * this tiny transition window is safely ignored by the callback.
+     */
     ESP_LOGI(TAG, "[CORE-PROOF] Requesting video stream task on CPU0");
+    ret = app_video_stream_task_start(video_cam_fd0, 0, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Video stream task failed: %s", esp_err_to_name(ret));
+        app_ui_show_error("Camera stream failed to start. Restart the device.");
+        vTaskDelete(NULL);
+        return;
+    }
 
-    ESP_ERROR_CHECK(app_video_stream_task_start(video_cam_fd0, 0, NULL));
+    /* Hide the launcher before granting direct display ownership to camera. */
+    bsp_display_backlight_off();
+    display_backlight_enabled = false;
+    app_ui_destroy();
 
+    ret = esp_lv_adapter_set_dummy_draw(disp, true);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not enable camera display mode: %s", esp_err_to_name(ret));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    dummy_draw_enabled = true;
+    display_disable_lvgl_overlays();
+
+    /* The first complete camera frame turns the backlight on again. */
     xTaskCreate(
         deep_sleep_timeout_task,
         "deep_sleep_timeout",
@@ -354,6 +498,68 @@ void app_main(void)
         5,
         NULL);
 
+    ESP_LOGI(TAG, "Launcher completed; camera application is running");
+    vTaskDelete(NULL);
+}
+
+static void launcher_start_requested(void *user_data)
+{
+    (void)user_data;
+
+    if (application_start_requested) {
+        return;
+    }
+
+    application_start_requested = true;
+
+    BaseType_t created = xTaskCreatePinnedToCore(
+        camera_application_start_task,
+        "camera_app_start",
+        8192,
+        NULL,
+        6,
+        NULL,
+        1);
+
+    if (created != pdPASS) {
+        application_start_requested = false;
+        ESP_LOGE(TAG, "Failed to create camera startup task");
+        app_ui_show_error("Could not start application task. Restart the device.");
+    }
+}
+
+void app_main(void)
+{
+    report_wake_reason();
+    core_trace(TAG, "APP_MAIN_START");
+    diagnostics_start_cpu_stats_monitor();
+
+    /*
+     * Phase 1: normal LVGL rendering. The user sees a proper launcher and the
+     * camera/AI pipeline is not initialized until Start Camera is pressed.
+     */
+    disp = bsp_display_start();
+    ESP_ERROR_CHECK(esp_lv_adapter_set_dummy_draw(disp, false));
+    display_disable_lvgl_overlays();
+
+    app_ui_create(launcher_start_requested, NULL);
+    bsp_display_backlight_on();
+    display_backlight_enabled = true;
+
+    /* The physical button works both on the launcher and in camera mode. */
+    BaseType_t button_task_created = xTaskCreatePinnedToCore(
+        deep_sleep_button_task,
+        "deep_sleep_button",
+        2048,
+        NULL,
+        DEEP_SLEEP_BUTTON_TASK_PRIORITY,
+        NULL,
+        1);
+
+    if (button_task_created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create deep-sleep button task");
+        app_ui_show_error("Deep-sleep button task failed. Restart the device.");
+    }
 }
 
 static void camera_video_frame_operation(
@@ -610,6 +816,7 @@ idf_component_register(
     SRCS
         "app/app_main.c"
         "app/app_boot.c"
+        "features/gui_screens/app_ui.c"
         "platform/camera/video_capture.c"
         "services/vision/face_detection/face_detector.cpp"
         "services/vision/face_recognition/face_recognizer.cpp"
@@ -617,8 +824,11 @@ idf_component_register(
         "diagnostics/ai_pipeline_status.c"
         "power_save/deep_sleep.c"
         "power_save/wake_up.c"
-    INCLUDE_DIRS "include"
+    INCLUDE_DIRS
+        "include"
+        "features/gui_screens"
 )
+
 ==================================================
 FILE: src/main/diagnostics/ai_pipeline_status.c
 ==================================================
@@ -880,6 +1090,398 @@ void diagnostics_start_cpu_stats_monitor(void)
 FILE: src/main/features/camera_perview/camera_preview.c
 ==================================================
 [Skipped binary/non-text file]
+
+==================================================
+FILE: src/main/features/deep_sleep/app_ui.c
+==================================================
+#include "app_ui.h"
+
+#include "bsp/display.h"
+#include "bsp/esp-bsp.h"
+#include "lvgl.h"
+
+static app_ui_start_callback_t s_start_callback;
+static void *s_start_user_data;
+
+static lv_obj_t *s_status_label;
+static lv_obj_t *s_start_button;
+static lv_obj_t *s_start_button_label;
+
+static void start_button_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    /* Prevent double-starts while camera and AI services are initializing. */
+    lv_obj_add_state(s_start_button, LV_STATE_DISABLED);
+    lv_label_set_text(s_start_button_label, "Starting...");
+    lv_label_set_text(s_status_label, "Preparing camera and face recognition...");
+    lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xB8C2CC), 0);
+
+    if (s_start_callback) {
+        s_start_callback(s_start_user_data);
+    }
+}
+
+void app_ui_create(app_ui_start_callback_t start_callback, void *user_data)
+{
+    s_start_callback = start_callback;
+    s_start_user_data = user_data;
+
+    bsp_display_lock(0);
+
+    lv_obj_t *screen = lv_screen_active();
+    lv_obj_clean(screen);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(0x08111F), 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+
+    lv_obj_t *panel = lv_obj_create(screen);
+    lv_obj_set_size(panel, LV_PCT(72), LV_PCT(68));
+    lv_obj_center(panel);
+    lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(panel, 28, 0);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(0x111C2E), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(panel, lv_color_hex(0x29415F), 0);
+    lv_obj_set_style_border_width(panel, 2, 0);
+    lv_obj_set_style_pad_all(panel, 36, 0);
+    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(
+        panel,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *title = lv_label_create(panel);
+    lv_label_set_text(title, "Face Recognition System");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xF5F8FC), 0);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *subtitle = lv_label_create(panel);
+    lv_label_set_text(
+        subtitle,
+        "Press Start to initialize the camera and open the live recognition application.");
+    lv_label_set_long_mode(subtitle, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(subtitle, LV_PCT(82));
+    lv_obj_set_style_text_color(subtitle, lv_color_hex(0xA9B6C7), 0);
+    lv_obj_set_style_text_align(subtitle, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_top(subtitle, 12, 0);
+    lv_obj_set_style_pad_bottom(subtitle, 24, 0);
+
+    lv_obj_t *status_box = lv_obj_create(panel);
+    lv_obj_set_size(status_box, LV_PCT(72), 52);
+    lv_obj_remove_flag(status_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(status_box, 18, 0);
+    lv_obj_set_style_bg_color(status_box, lv_color_hex(0x0B1525), 0);
+    lv_obj_set_style_bg_opa(status_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(status_box, 0, 0);
+    lv_obj_set_style_pad_all(status_box, 0, 0);
+
+    s_status_label = lv_label_create(status_box);
+    lv_label_set_text(s_status_label, "Ready");
+    lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x75D59A), 0);
+    lv_obj_center(s_status_label);
+
+    s_start_button = lv_button_create(panel);
+    lv_obj_set_size(s_start_button, 260, 72);
+    lv_obj_set_style_radius(s_start_button, 20, 0);
+    lv_obj_set_style_bg_color(s_start_button, lv_color_hex(0x2F80ED), 0);
+    lv_obj_set_style_bg_color(
+        s_start_button,
+        lv_color_hex(0x1D5FAF),
+        LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(
+        s_start_button,
+        lv_color_hex(0x435268),
+        LV_STATE_DISABLED);
+    lv_obj_set_style_pad_top(s_start_button, 20, 0);
+    lv_obj_set_style_pad_bottom(s_start_button, 20, 0);
+    lv_obj_add_event_cb(s_start_button, start_button_event_cb, LV_EVENT_CLICKED, NULL);
+
+    s_start_button_label = lv_label_create(s_start_button);
+    lv_label_set_text(s_start_button_label, "Start Camera");
+    lv_obj_set_style_text_color(s_start_button_label, lv_color_white(), 0);
+    lv_obj_center(s_start_button_label);
+
+    lv_obj_t *hint = lv_label_create(panel);
+    lv_label_set_text(hint, "The physical GPIO3 button remains available for deep sleep.");
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, LV_PCT(80));
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x75849A), 0);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_top(hint, 14, 0);
+
+    bsp_display_unlock();
+}
+
+void app_ui_set_status(const char *text)
+{
+    if (!text || !s_status_label) {
+        return;
+    }
+
+    bsp_display_lock(0);
+    if (s_status_label) {
+        lv_label_set_text(s_status_label, text);
+        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xB8C2CC), 0);
+    }
+    bsp_display_unlock();
+}
+
+void app_ui_show_error(const char *text)
+{
+    if (!text || !s_status_label) {
+        return;
+    }
+
+    bsp_display_lock(0);
+    if (s_status_label) {
+        lv_label_set_text(s_status_label, text);
+        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xFF7A7A), 0);
+    }
+    if (s_start_button_label) {
+        lv_label_set_text(s_start_button_label, "Restart device");
+    }
+    bsp_display_unlock();
+}
+
+void app_ui_destroy(void)
+{
+    bsp_display_lock(0);
+
+    lv_obj_clean(lv_screen_active());
+    s_status_label = NULL;
+    s_start_button = NULL;
+    s_start_button_label = NULL;
+    s_start_callback = NULL;
+    s_start_user_data = NULL;
+
+    bsp_display_unlock();
+}
+
+==================================================
+FILE: src/main/features/deep_sleep/app_ui.h
+==================================================
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef void (*app_ui_start_callback_t)(void *user_data);
+
+/** Create the launcher screen shown before the camera application starts. */
+void app_ui_create(app_ui_start_callback_t start_callback, void *user_data);
+
+/** Update the launcher status text from any FreeRTOS task. */
+void app_ui_set_status(const char *text);
+
+/** Show a startup failure on the launcher screen. */
+void app_ui_show_error(const char *text);
+
+/** Remove launcher objects before switching the display to camera dummy-draw mode. */
+void app_ui_destroy(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+==================================================
+FILE: src/main/features/gui_screens/app_ui.c
+==================================================
+#include "app_ui.h"
+
+#include "bsp/display.h"
+#include "bsp/esp-bsp.h"
+#include "lvgl.h"
+
+static app_ui_start_callback_t s_start_callback;
+static void *s_start_user_data;
+
+static lv_obj_t *s_status_label;
+static lv_obj_t *s_start_button;
+static lv_obj_t *s_start_button_label;
+
+static void start_button_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    /* Prevent double-starts while camera and AI services are initializing. */
+    lv_obj_add_state(s_start_button, LV_STATE_DISABLED);
+    lv_label_set_text(s_start_button_label, "Starting...");
+    lv_label_set_text(s_status_label, "Preparing camera and face recognition...");
+    lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xB8C2CC), 0);
+
+    if (s_start_callback) {
+        s_start_callback(s_start_user_data);
+    }
+}
+
+void app_ui_create(app_ui_start_callback_t start_callback, void *user_data)
+{
+    s_start_callback = start_callback;
+    s_start_user_data = user_data;
+
+    bsp_display_lock(0);
+
+    lv_obj_t *screen = lv_screen_active();
+    lv_obj_clean(screen);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(0x08111F), 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+
+    lv_obj_t *panel = lv_obj_create(screen);
+    lv_obj_set_size(panel, LV_PCT(72), LV_PCT(68));
+    lv_obj_center(panel);
+    lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(panel, 28, 0);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(0x111C2E), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(panel, lv_color_hex(0x29415F), 0);
+    lv_obj_set_style_border_width(panel, 2, 0);
+    lv_obj_set_style_pad_all(panel, 36, 0);
+    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(
+        panel,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *title = lv_label_create(panel);
+    lv_label_set_text(title, "Face Recognition System");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xF5F8FC), 0);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *subtitle = lv_label_create(panel);
+    lv_label_set_text(
+        subtitle,
+        "Press Start to initialize the camera and open the live recognition application.");
+    lv_label_set_long_mode(subtitle, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(subtitle, LV_PCT(82));
+    lv_obj_set_style_text_color(subtitle, lv_color_hex(0xA9B6C7), 0);
+    lv_obj_set_style_text_align(subtitle, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_top(subtitle, 12, 0);
+    lv_obj_set_style_pad_bottom(subtitle, 24, 0);
+
+    lv_obj_t *status_box = lv_obj_create(panel);
+    lv_obj_set_size(status_box, LV_PCT(72), 52);
+    lv_obj_remove_flag(status_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(status_box, 18, 0);
+    lv_obj_set_style_bg_color(status_box, lv_color_hex(0x0B1525), 0);
+    lv_obj_set_style_bg_opa(status_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(status_box, 0, 0);
+    lv_obj_set_style_pad_all(status_box, 0, 0);
+
+    s_status_label = lv_label_create(status_box);
+    lv_label_set_text(s_status_label, "Ready");
+    lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x75D59A), 0);
+    lv_obj_center(s_status_label);
+
+    s_start_button = lv_button_create(panel);
+    lv_obj_set_size(s_start_button, 260, 72);
+    lv_obj_set_style_radius(s_start_button, 20, 0);
+    lv_obj_set_style_bg_color(s_start_button, lv_color_hex(0x2F80ED), 0);
+    lv_obj_set_style_bg_color(
+        s_start_button,
+        lv_color_hex(0x1D5FAF),
+        LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(
+        s_start_button,
+        lv_color_hex(0x435268),
+        LV_STATE_DISABLED);
+    lv_obj_set_style_pad_top(s_start_button, 20, 0);
+    lv_obj_set_style_pad_bottom(s_start_button, 20, 0);
+    lv_obj_add_event_cb(s_start_button, start_button_event_cb, LV_EVENT_CLICKED, NULL);
+
+    s_start_button_label = lv_label_create(s_start_button);
+    lv_label_set_text(s_start_button_label, "Start Camera");
+    lv_obj_set_style_text_color(s_start_button_label, lv_color_white(), 0);
+    lv_obj_center(s_start_button_label);
+
+    lv_obj_t *hint = lv_label_create(panel);
+    lv_label_set_text(hint, "The physical GPIO3 button remains available for deep sleep.");
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, LV_PCT(80));
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x75849A), 0);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_top(hint, 14, 0);
+
+    bsp_display_unlock();
+}
+
+void app_ui_set_status(const char *text)
+{
+    if (!text || !s_status_label) {
+        return;
+    }
+
+    bsp_display_lock(0);
+    if (s_status_label) {
+        lv_label_set_text(s_status_label, text);
+        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xB8C2CC), 0);
+    }
+    bsp_display_unlock();
+}
+
+void app_ui_show_error(const char *text)
+{
+    if (!text || !s_status_label) {
+        return;
+    }
+
+    bsp_display_lock(0);
+    if (s_status_label) {
+        lv_label_set_text(s_status_label, text);
+        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xFF7A7A), 0);
+    }
+    if (s_start_button_label) {
+        lv_label_set_text(s_start_button_label, "Restart device");
+    }
+    bsp_display_unlock();
+}
+
+void app_ui_destroy(void)
+{
+    bsp_display_lock(0);
+
+    lv_obj_clean(lv_screen_active());
+    s_status_label = NULL;
+    s_start_button = NULL;
+    s_start_button_label = NULL;
+    s_start_callback = NULL;
+    s_start_user_data = NULL;
+
+    bsp_display_unlock();
+}
+
+==================================================
+FILE: src/main/features/gui_screens/app_ui.h
+==================================================
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef void (*app_ui_start_callback_t)(void *user_data);
+
+/** Create the launcher screen shown before the camera application starts. */
+void app_ui_create(app_ui_start_callback_t start_callback, void *user_data);
+
+/** Update the launcher status text from any FreeRTOS task. */
+void app_ui_set_status(const char *text);
+
+/** Show a startup failure on the launcher screen. */
+void app_ui_show_error(const char *text);
+
+/** Remove launcher objects before switching the display to camera dummy-draw mode. */
+void app_ui_destroy(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 ==================================================
 FILE: src/main/idf_component.yml
