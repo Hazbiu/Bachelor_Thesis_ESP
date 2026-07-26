@@ -1,5 +1,5 @@
 #include "power_save/wake_up.h"
-
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 
@@ -10,9 +10,21 @@ void report_wake_reason(void)
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
 
     switch (cause) {
-    case ESP_SLEEP_WAKEUP_GPIO:
-        ESP_LOGI(TAG, "Woken from deep sleep by GT9271 touch interrupt");
+    case ESP_SLEEP_WAKEUP_GPIO: {
+        uint64_t wake_gpio_mask = esp_sleep_get_gpio_wakeup_status();
+
+        ESP_LOGI(
+            TAG,
+            "Woken from deep sleep by GPIO, mask=0x%llx",
+            (unsigned long long)wake_gpio_mask
+        );
+
+        if (wake_gpio_mask & (1ULL << GPIO_NUM_3)) {
+            ESP_LOGI(TAG, "Wake-up button on GPIO3 was pressed");
+        }
+
         break;
+    }
 
     case ESP_SLEEP_WAKEUP_TIMER:
         ESP_LOGI(TAG, "Woken from deep sleep by timer");
