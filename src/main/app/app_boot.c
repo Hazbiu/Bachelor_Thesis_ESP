@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "app/app_boot.h"
+#include "config/app_config.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
@@ -8,7 +9,6 @@
 #include "services/vision/face_recognizer.h"
 
 
-#define BUILD_FACE_DB_FROM_SD 0
 static const char *TAG = "app_main";
 
 static esp_err_t mount_spiffs(void)
@@ -62,7 +62,7 @@ void app_boot_initialize_services(void)
 
     ESP_ERROR_CHECK(face_detect_init());
 
-#if BUILD_FACE_DB_FROM_SD
+#if APP_BUILD_FACE_DB_FROM_SD
     ESP_ERROR_CHECK(face_recognition_build_db_from_sd());
 #else
     ESP_ERROR_CHECK(face_recognition_init());
