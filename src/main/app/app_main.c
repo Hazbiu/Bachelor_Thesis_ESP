@@ -25,13 +25,12 @@
 #include "bsp/esp-bsp.h"
 #include "lvgl.h"
 #include "lv_demos.h"
-#include "power_save/deep_sleep.h"
 #include "power_save/wake_up.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/gpio.h"
 #include "power_save/cpu_power.h"
 #include "config/app_config.h"
+#include "app/app_sleep.h"
 
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 
@@ -107,8 +106,6 @@ static void *display_buffer[APP_DISPLAY_BUFFER_COUNT];
 static size_t lcd_fb_size = 0;
 static uint8_t display_buffer_index = 0;
 static bool display_backlight_enabled = false;
-static portMUX_TYPE deep_sleep_request_lock = portMUX_INITIALIZER_UNLOCKED;
-static bool deep_sleep_requested = false;
 static lv_display_t *disp;
 static lv_indev_t *launcher_touch_indev = NULL;
 
@@ -153,135 +150,21 @@ static void display_disable_lvgl_overlays(void)
 #endif
 }
 
-static bool claim_deep_sleep_request(void)
+static void prepare_application_for_sleep(void *user_data)
 {
-    bool claimed = false;
-
-    portENTER_CRITICAL(&deep_sleep_request_lock);
-    if (!deep_sleep_requested) {
-        deep_sleep_requested = true;
-        claimed = true;
-    }
-    portEXIT_CRITICAL(&deep_sleep_request_lock);
-
-    return claimed;
-}
-
-static void request_deep_sleep(const char *reason)
-{
-    if (!claim_deep_sleep_request()) {
-        return;
-    }
-
-    ESP_LOGI(TAG, "Deep sleep requested by %s", reason);
+    (void)user_data;
 
     /*
-     * Stop the camera callback from doing more PPA, face detection,
-     * recognition or LCD operations while the camera is shutting down.
+     * Stop the frame callback from starting more PPA, detection,
+     * recognition or LCD operations during shutdown.
      */
     dummy_mode_delay_flag = true;
 
     /*
-     * Turn off the display backlight immediately.
+     * app_sleep.c switches the physical backlight off. Keep this
+     * module's software state synchronized with the hardware state.
      */
-    bsp_display_backlight_off();
     display_backlight_enabled = false;
-
-    /*
-     * Stop the V4L2 stream task, execute VIDIOC_STREAMOFF,
-     * and close the camera file descriptor.
-     *
-     * This is also safe when the camera has not been started yet.
-     */
-    esp_err_t camera_ret = app_video_shutdown();
-
-    if (camera_ret == ESP_OK) {
-        ESP_LOGI(TAG, "Camera shut down successfully");
-    } else {
-        ESP_LOGW(
-            TAG,
-            "Camera shutdown failed: %s",
-            esp_err_to_name(camera_ret));
-    }
-
-    /*
-     * Configure the GPIO3 wake source and enter deep sleep.
-     */
-    enter_deep_sleep();
-
-    /*
-     * Normally unreachable. This executes only if deep sleep failed.
-     */
-    dummy_mode_delay_flag = false;
-
-    portENTER_CRITICAL(&deep_sleep_request_lock);
-    deep_sleep_requested = false;
-    portEXIT_CRITICAL(&deep_sleep_request_lock);
-
-    ESP_LOGE(TAG, "Deep sleep request returned without entering sleep");
-}
-
-static void deep_sleep_button_task(void *arg)
-{
-    (void)arg;
-
-    gpio_config_t button_config = {
-        .pin_bit_mask = 1ULL << APP_DEEP_SLEEP_BUTTON_GPIO,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-
-    esp_err_t ret = gpio_config(&button_config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure deep-sleep button: %s",
-                 esp_err_to_name(ret));
-        vTaskDelete(NULL);
-        return;
-    }
-
-    /*
-     * A wake-up press may still be held while the application boots. Wait for
-     * its release so the same press cannot immediately put the device to sleep.
-     */
-    while (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
-        vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
-    }
-    vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
-
-    ESP_LOGI(TAG, "Deep-sleep button armed on GPIO%d",
-             APP_DEEP_SLEEP_BUTTON_GPIO);
-
-    while (1) {
-        if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
-            vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
-
-            if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
-                request_deep_sleep("GPIO3 button");
-
-                /* Only reached if entering deep sleep failed. */
-                while (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
-                    vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
-                }
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
-    }
-}
-
-static void deep_sleep_timeout_task(void *arg)
-{
-    (void)arg;
-
-    vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_TIMEOUT_MS));
-
-    ESP_LOGI(TAG, "No activity for %d ms; entering deep sleep",
-             APP_DEEP_SLEEP_TIMEOUT_MS);
-
-    request_deep_sleep("30-second timeout");
-    vTaskDelete(NULL);
 }
 
 static void camera_application_start_task(void *arg)
@@ -440,13 +323,13 @@ static void camera_application_start_task(void *arg)
     display_disable_lvgl_overlays();
 
     /* The first complete camera frame turns the backlight on again. */
-    xTaskCreate(
-        deep_sleep_timeout_task,
-        "deep_sleep_timeout",
-        2048,
-        NULL,
-        5,
-        NULL);
+    ret = app_sleep_start_timeout();
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Failed to start deep-sleep timeout: %s",
+            esp_err_to_name(ret));
+    }
 
     ESP_LOGI(TAG, "Launcher completed; camera application is running");
     vTaskDelete(NULL);
@@ -541,18 +424,18 @@ void app_main(void)
     display_backlight_enabled = true;
 
     /* The physical button works both on the launcher and in camera mode. */
-    BaseType_t button_task_created = xTaskCreatePinnedToCore(
-        deep_sleep_button_task,
-        "deep_sleep_button",
-        2048,
-        NULL,
-        APP_DEEP_SLEEP_BUTTON_PRIORITY,
-        NULL,
-        1);
+    esp_err_t sleep_button_ret = app_sleep_start_button_monitor(
+        prepare_application_for_sleep,
+        NULL);
 
-    if (button_task_created != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create deep-sleep button task");
-        app_ui_show_error("Deep-sleep button task failed. Restart the device.");
+    if (sleep_button_ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Failed to start deep-sleep button monitor: %s",
+            esp_err_to_name(sleep_button_ret));
+
+        app_ui_show_error(
+            "Deep-sleep button task failed. Restart the device.");
     }
 }
 

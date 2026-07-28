@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "app/app_main.c"
         "app/app_boot.c"
+        "app/app_sleep.c"
         "features/gui_screens/app_ui.c"
         "platform/camera/video_capture.c"
         "services/vision/face_detection/face_detector.cpp"

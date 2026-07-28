@@ -1,5 +1,5 @@
 Main folder export
-Generated on: Tue Jul 28 10:44:11 PM CEST 2026
+Generated on: Tue Jul 28 11:09:15 PM CEST 2026
 Source: /home/hazbiu/Programming/Bachelor_Thesis_ESP/extractor/../src/main
 ==================================================
 
@@ -8,6 +8,7 @@ FILE: src/main/app/app_boot.c
 ==================================================
 #include <stdio.h>
 #include "app/app_boot.h"
+#include "config/app_config.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
@@ -16,7 +17,6 @@ FILE: src/main/app/app_boot.c
 #include "services/vision/face_recognizer.h"
 
 
-#define BUILD_FACE_DB_FROM_SD 0
 static const char *TAG = "app_main";
 
 static esp_err_t mount_spiffs(void)
@@ -70,12 +70,13 @@ void app_boot_initialize_services(void)
 
     ESP_ERROR_CHECK(face_detect_init());
 
-#if BUILD_FACE_DB_FROM_SD
+#if APP_BUILD_FACE_DB_FROM_SD
     ESP_ERROR_CHECK(face_recognition_build_db_from_sd());
 #else
     ESP_ERROR_CHECK(face_recognition_init());
 #endif
 }
+
 
 ==================================================
 FILE: src/main/app/app_main.c
@@ -113,12 +114,8 @@ FILE: src/main/app/app_main.c
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "power_save/cpu_power.h"
+#include "config/app_config.h"
 
-#define DEEP_SLEEP_TIMEOUT_MS 30000
-#define DEEP_SLEEP_BUTTON_GPIO GPIO_NUM_3
-#define DEEP_SLEEP_BUTTON_POLL_MS 5
-#define DEEP_SLEEP_BUTTON_DEBOUNCE_MS 25
-#define DEEP_SLEEP_BUTTON_TASK_PRIORITY 8
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 
 /*
@@ -130,15 +127,12 @@ FILE: src/main/app/app_main.c
  * for tear-free ping-pong rendering. The display buffer is handed to the LVGL
  * adapter with wait=true before that buffer is reused.
  */
-#define CAMERA_BUF_NUM 2
-#define DISPLAY_BUF_NUM 2
 
 /*
  * The PPA writes the display buffer through hardware, while the face rectangle
  * is written by the CPU. Invalidate before the CPU touches a PPA-written buffer,
  * then write it back before the LCD reads it.
  */
-#define SYNC_CACHE_AROUND_OVERLAY 1
 
 static int smooth_coord(int old_value, int new_value)
 {
@@ -192,7 +186,7 @@ static const char *TAG = "app_main";
 
 static ppa_client_handle_t ppa_srm_handle = NULL;
 static size_t data_cache_line_size = 0;
-static void *display_buffer[DISPLAY_BUF_NUM];
+static void *display_buffer[APP_DISPLAY_BUFFER_COUNT];
 static size_t lcd_fb_size = 0;
 static uint8_t display_buffer_index = 0;
 static bool display_backlight_enabled = false;
@@ -200,17 +194,13 @@ static portMUX_TYPE deep_sleep_request_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool deep_sleep_requested = false;
 static lv_display_t *disp;
 static lv_indev_t *launcher_touch_indev = NULL;
-#define FACE_DETECT_INTERVAL 5
-#define MAX_FACE_BOXES 5
-#define FACE_RECOG_INTERVAL 20
 
 static uint32_t frame_count = 0;
 
-static face_box_t last_boxes[MAX_FACE_BOXES];
+static face_box_t last_boxes[APP_MAX_FACE_BOXES];
 static int last_face_count = 0;
 static int no_face_frames = 0;
 
-#define FACE_BOX_HOLD_MISSES 3
 
 i2c_master_bus_handle_t i2c_bus_;
 
@@ -319,7 +309,7 @@ static void deep_sleep_button_task(void *arg)
     (void)arg;
 
     gpio_config_t button_config = {
-        .pin_bit_mask = 1ULL << DEEP_SLEEP_BUTTON_GPIO,
+        .pin_bit_mask = 1ULL << APP_DEEP_SLEEP_BUTTON_GPIO,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -338,29 +328,29 @@ static void deep_sleep_button_task(void *arg)
      * A wake-up press may still be held while the application boots. Wait for
      * its release so the same press cannot immediately put the device to sleep.
      */
-    while (gpio_get_level(DEEP_SLEEP_BUTTON_GPIO) == 0) {
-        vTaskDelay(pdMS_TO_TICKS(DEEP_SLEEP_BUTTON_POLL_MS));
+    while (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
     }
-    vTaskDelay(pdMS_TO_TICKS(DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
+    vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
 
     ESP_LOGI(TAG, "Deep-sleep button armed on GPIO%d",
-             DEEP_SLEEP_BUTTON_GPIO);
+             APP_DEEP_SLEEP_BUTTON_GPIO);
 
     while (1) {
-        if (gpio_get_level(DEEP_SLEEP_BUTTON_GPIO) == 0) {
-            vTaskDelay(pdMS_TO_TICKS(DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
+        if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
 
-            if (gpio_get_level(DEEP_SLEEP_BUTTON_GPIO) == 0) {
+            if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
                 request_deep_sleep("GPIO3 button");
 
                 /* Only reached if entering deep sleep failed. */
-                while (gpio_get_level(DEEP_SLEEP_BUTTON_GPIO) == 0) {
-                    vTaskDelay(pdMS_TO_TICKS(DEEP_SLEEP_BUTTON_POLL_MS));
+                while (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
+                    vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
                 }
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(DEEP_SLEEP_BUTTON_POLL_MS));
+        vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
     }
 }
 
@@ -368,10 +358,10 @@ static void deep_sleep_timeout_task(void *arg)
 {
     (void)arg;
 
-    vTaskDelay(pdMS_TO_TICKS(DEEP_SLEEP_TIMEOUT_MS));
+    vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_TIMEOUT_MS));
 
     ESP_LOGI(TAG, "No activity for %d ms; entering deep sleep",
-             DEEP_SLEEP_TIMEOUT_MS);
+             APP_DEEP_SLEEP_TIMEOUT_MS);
 
     request_deep_sleep("30-second timeout");
     vTaskDelete(NULL);
@@ -443,7 +433,7 @@ static void camera_application_start_task(void *arg)
 
     app_ui_set_status("Allocating camera buffers...");
 
-    for (int i = 0; i < DISPLAY_BUF_NUM; i++) {
+    for (int i = 0; i < APP_DISPLAY_BUFFER_COUNT; i++) {
         display_buffer[i] = heap_caps_aligned_calloc(
             data_cache_line_size,
             1,
@@ -459,10 +449,10 @@ static void camera_application_start_task(void *arg)
     }
 
     ESP_LOGI(TAG, "Using independent buffers, display_buf=%d camera_buf=%d",
-             DISPLAY_BUF_NUM, CAMERA_BUF_NUM);
+             APP_DISPLAY_BUFFER_COUNT, APP_CAMERA_BUFFER_COUNT);
 
-    void *camera_buf[CAMERA_BUF_NUM];
-    for (int i = 0; i < CAMERA_BUF_NUM; i++) {
+    void *camera_buf[APP_CAMERA_BUFFER_COUNT];
+    for (int i = 0; i < APP_CAMERA_BUFFER_COUNT; i++) {
         camera_buf[i] = heap_caps_aligned_calloc(
             data_cache_line_size,
             1,
@@ -479,7 +469,7 @@ static void camera_application_start_task(void *arg)
 
     ret = app_video_set_bufs(
         video_cam_fd0,
-        CAMERA_BUF_NUM,
+        APP_CAMERA_BUFFER_COUNT,
         (const void **)camera_buf);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Camera buffer setup failed: %s", esp_err_to_name(ret));
@@ -639,7 +629,7 @@ void app_main(void)
         "deep_sleep_button",
         2048,
         NULL,
-        DEEP_SLEEP_BUTTON_TASK_PRIORITY,
+        APP_DEEP_SLEEP_BUTTON_PRIORITY,
         NULL,
         1);
 
@@ -742,16 +732,16 @@ static void camera_video_frame_operation(
                 pcTaskGetName(NULL),
                 xTaskGetCoreID(xTaskGetCurrentTaskHandle()));
     }
-    if ((frame_count % FACE_DETECT_INTERVAL) == 0) {
-        face_box_t boxes[MAX_FACE_BOXES];
+    if ((frame_count % APP_FACE_DETECT_INTERVAL_FRAMES) == 0) {
+        face_box_t boxes[APP_MAX_FACE_BOXES];
         diagnostics_ai_frame_sent_to_detector();
 
         /*
          * Recognition is far more expensive than detection and it runs inside
          * this video task, so every run stalls the display pipeline. Honour
-         * FACE_RECOG_INTERVAL instead of recognising on every detection pass.
+         * APP_FACE_RECOG_INTERVAL_FRAMES instead of recognising on every detection pass.
          */
-        const bool run_recognition = ((frame_count % FACE_RECOG_INTERVAL) == 0);
+        const bool run_recognition = ((frame_count % APP_FACE_RECOG_INTERVAL_FRAMES) == 0);
 
     esp_err_t detect_power_ret = cpu_power_ai_begin();
 
@@ -768,7 +758,7 @@ static void camera_video_frame_operation(
             camera_buf_hes,
             camera_buf_ves,
             boxes,
-            MAX_FACE_BOXES
+            APP_MAX_FACE_BOXES
         );
     #else
         int face_count = face_detect_run_rgb888(
@@ -776,7 +766,7 @@ static void camera_video_frame_operation(
             camera_buf_hes,
             camera_buf_ves,
             boxes,
-            MAX_FACE_BOXES
+            APP_MAX_FACE_BOXES
         );
     #endif
 
@@ -796,8 +786,8 @@ static void camera_video_frame_operation(
 
         if (face_count > 0) {
             int update_count = face_count;
-            if (update_count > MAX_FACE_BOXES) {
-                update_count = MAX_FACE_BOXES;
+            if (update_count > APP_MAX_FACE_BOXES) {
+                update_count = APP_MAX_FACE_BOXES;
             }
 
             for (int i = 0; i < update_count; i++) {
@@ -820,7 +810,7 @@ static void camera_video_frame_operation(
                         boxes[i].x2,
                         boxes[i].y2);
 
-                if (i == 0 && run_recognition && boxes[i].score > 0.85f) {
+                if (i == 0 && run_recognition && boxes[i].score > APP_FACE_RECOG_MIN_SCORE) {
                     char name[FACE_RECOG_MAX_NAME_LEN];
                     float recog_score = 0.0f;
 
@@ -863,7 +853,7 @@ static void camera_video_frame_operation(
         } else {
             no_face_frames++;
 
-            if (no_face_frames >= FACE_BOX_HOLD_MISSES) {
+            if (no_face_frames >= APP_FACE_BOX_HOLD_MISSES) {
                 last_face_count = 0;
             }
         }
@@ -871,7 +861,7 @@ static void camera_video_frame_operation(
 
     #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
     if (last_face_count > 0) {
-    #if SYNC_CACHE_AROUND_OVERLAY
+    #if APP_SYNC_CACHE_AROUND_OVERLAY
         /* PPA updated PSRAM; invalidate stale CPU cache lines before drawing. */
         esp_cache_msync(target_fb, lcd_fb_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
     #endif
@@ -894,7 +884,7 @@ static void camera_video_frame_operation(
             );
         }
 
-    #if SYNC_CACHE_AROUND_OVERLAY
+    #if APP_SYNC_CACHE_AROUND_OVERLAY
         /* CPU updated the rectangle; write it back before LCD DMA reads it. */
         esp_cache_msync(target_fb, lcd_fb_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
     #endif
@@ -921,7 +911,7 @@ static void camera_video_frame_operation(
         }
 
         /* The submitted buffer is now owned by scanout; render into the other. */
-        display_buffer_index = (display_buffer_index + 1) % DISPLAY_BUF_NUM;
+        display_buffer_index = (display_buffer_index + 1) % APP_DISPLAY_BUFFER_COUNT;
 
         /* Never expose LVGL's startup/sysmon frame. Show only a complete camera frame. */
         if (!display_backlight_enabled)
@@ -1528,6 +1518,38 @@ FILE: src/main/include/app/app_boot.h
 #pragma once
 
 void app_boot_initialize_services(void);
+
+==================================================
+FILE: src/main/include/config/app_config.h
+==================================================
+#pragma once
+
+#include "driver/gpio.h"
+
+/* Camera and display buffers */
+#define APP_CAMERA_BUFFER_COUNT             2
+#define APP_DISPLAY_BUFFER_COUNT            2
+
+/* Face-processing configuration */
+#define APP_FACE_DETECT_INTERVAL_FRAMES     5
+#define APP_FACE_RECOG_INTERVAL_FRAMES      20
+#define APP_MAX_FACE_BOXES                  5
+#define APP_FACE_BOX_HOLD_MISSES            3
+#define APP_FACE_RECOG_MIN_SCORE            0.85f
+
+/* Cache synchronization */
+#define APP_SYNC_CACHE_AROUND_OVERLAY       1
+
+/* Deep-sleep configuration */
+#define APP_DEEP_SLEEP_TIMEOUT_MS           30000
+#define APP_DEEP_SLEEP_BUTTON_GPIO          GPIO_NUM_3
+#define APP_DEEP_SLEEP_BUTTON_POLL_MS       5
+#define APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS   25
+#define APP_DEEP_SLEEP_BUTTON_PRIORITY      8
+
+/* Face-database configuration */
+#define APP_BUILD_FACE_DB_FROM_SD           0
+
 
 ==================================================
 FILE: src/main/include/config/app_features.h
