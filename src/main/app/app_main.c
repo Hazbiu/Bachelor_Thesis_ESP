@@ -30,7 +30,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
-
+#include "power_save/cpu_power.h"
 
 #define DEEP_SLEEP_TIMEOUT_MS 30000
 #define DEEP_SLEEP_BUTTON_GPIO GPIO_NUM_3
@@ -186,13 +186,45 @@ static void request_deep_sleep(const char *reason)
 
     ESP_LOGI(TAG, "Deep sleep requested by %s", reason);
 
-    /* Give immediate visual feedback while enter_deep_sleep waits for release. */
+    /*
+     * Stop the camera callback from doing more PPA, face detection,
+     * recognition or LCD operations while the camera is shutting down.
+     */
+    dummy_mode_delay_flag = true;
+
+    /*
+     * Turn off the display backlight immediately.
+     */
     bsp_display_backlight_off();
     display_backlight_enabled = false;
 
+    /*
+     * Stop the V4L2 stream task, execute VIDIOC_STREAMOFF,
+     * and close the camera file descriptor.
+     *
+     * This is also safe when the camera has not been started yet.
+     */
+    esp_err_t camera_ret = app_video_shutdown();
+
+    if (camera_ret == ESP_OK) {
+        ESP_LOGI(TAG, "Camera shut down successfully");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "Camera shutdown failed: %s",
+            esp_err_to_name(camera_ret));
+    }
+
+    /*
+     * Configure the GPIO3 wake source and enter deep sleep.
+     */
     enter_deep_sleep();
 
-    /* Normally unreachable. Re-arm requests if deep sleep could not be entered. */
+    /*
+     * Normally unreachable. This executes only if deep sleep failed.
+     */
+    dummy_mode_delay_flag = false;
+
     portENTER_CRITICAL(&deep_sleep_request_lock);
     deep_sleep_requested = false;
     portEXIT_CRITICAL(&deep_sleep_request_lock);
@@ -464,6 +496,15 @@ void app_main(void)
 {
     report_wake_reason();
     core_trace(TAG, "APP_MAIN_START");
+
+    esp_err_t cpu_power_ret = cpu_power_init();
+    if (cpu_power_ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "CPU power management initialization failed: %s",
+            esp_err_to_name(cpu_power_ret));
+    }
+
     diagnostics_start_cpu_stats_monitor();
 
     /*
@@ -630,6 +671,15 @@ static void camera_video_frame_operation(
          */
         const bool run_recognition = ((frame_count % FACE_RECOG_INTERVAL) == 0);
 
+    esp_err_t detect_power_ret = cpu_power_ai_begin();
+
+    if (detect_power_ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Could not request maximum CPU frequency for detection: %s",
+            esp_err_to_name(detect_power_ret));
+    }
+
     #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
         int face_count = face_detect_run_rgb565(
             camera_buf,
@@ -647,6 +697,17 @@ static void camera_video_frame_operation(
             MAX_FACE_BOXES
         );
     #endif
+
+    if (detect_power_ret == ESP_OK) {
+        esp_err_t release_ret = cpu_power_ai_end();
+
+        if (release_ret != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "Could not release detection CPU lock: %s",
+                esp_err_to_name(release_ret));
+        }
+    }
 
         ESP_LOGI(TAG, "Detection ran, face_count=%d", face_count);
         diagnostics_ai_detection_result(face_count);
@@ -681,6 +742,15 @@ static void camera_video_frame_operation(
                     char name[FACE_RECOG_MAX_NAME_LEN];
                     float recog_score = 0.0f;
 
+                    esp_err_t recognition_power_ret = cpu_power_ai_begin();
+
+                    if (recognition_power_ret != ESP_OK) {
+                        ESP_LOGW(
+                            TAG,
+                            "Could not request maximum CPU frequency for recognition: %s",
+                            esp_err_to_name(recognition_power_ret));
+                    }
+
                     esp_err_t recog_ret = face_recognition_recognize(
                         camera_buf,
                         camera_buf_hes,
@@ -690,6 +760,17 @@ static void camera_video_frame_operation(
                         sizeof(name),
                         &recog_score
                     );
+
+                    if (recognition_power_ret == ESP_OK) {
+                        esp_err_t release_ret = cpu_power_ai_end();
+
+                        if (release_ret != ESP_OK) {
+                            ESP_LOGW(
+                                TAG,
+                                "Could not release recognition CPU lock: %s",
+                                esp_err_to_name(release_ret));
+                        }
+                    }
 
                     diagnostics_ai_recognition_result(recog_ret, name, recog_score);
                 }

@@ -10,6 +10,7 @@ idf_component_register(
         "diagnostics/ai_pipeline_status.c"
         "power_save/deep_sleep.c"
         "power_save/wake_up.c"
+        "power_save/cpu_power.c"
     INCLUDE_DIRS
         "include"
         "features/gui_screens"

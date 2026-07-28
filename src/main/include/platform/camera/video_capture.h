@@ -146,6 +146,13 @@ esp_err_t app_video_stream_task_stop(int video_fd);
  */
 esp_err_t app_video_register_frame_operation_cb(app_video_frame_operation_cb_t operation_cb);
 
+/**
+ * Stop the camera stream, wait for the video task to exit,
+ * and close the V4L2 camera device.
+ */
+esp_err_t app_video_shutdown(void);
+
+
 #ifdef __cplusplus
 }
 #endif
