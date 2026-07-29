@@ -1,5 +1,5 @@
 CMake files export
-Generated on: Tue Jul 28 11:09:16 PM CEST 2026
+Generated on: Wed Jul 29 08:16:39 PM CEST 2026
 Source: /home/hazbiu/Programming/Bachelor_Thesis_ESP/extractor/../src
 Included: CMakeLists.txt and *.cmake
 Excluded: src/managed_components
@@ -241,6 +241,7 @@ idf_component_register(
     SRCS
         "app/app_main.c"
         "app/app_boot.c"
+        "app/app_sleep.c"
         "features/gui_screens/app_ui.c"
         "platform/camera/video_capture.c"
         "services/vision/face_detection/face_detector.cpp"
@@ -250,6 +251,8 @@ idf_component_register(
         "power_save/deep_sleep.c"
         "power_save/wake_up.c"
         "power_save/cpu_power.c"
+        "power_save/component_wifi.c"
+        "power_save/component_sdcard.c"
     INCLUDE_DIRS
         "include"
         "features/gui_screens"

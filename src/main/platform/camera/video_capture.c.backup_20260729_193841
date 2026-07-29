@@ -27,14 +27,12 @@
 
 static const char *TAG = "app_video";
 
-#define MAX_BUFFER_COUNT                  3
-#define MIN_BUFFER_COUNT                  2
-#define VIDEO_TASK_STACK_SIZE             (4 * 1024)
-#define VIDEO_TASK_PRIORITY               4
-#define VIDEO_STOP_TIMEOUT_MS             1500
-#define VIDEO_CLOSE_GRACE_TIMEOUT_MS      250
-#define VIDEO_NO_FRAME_RETRY_DELAY_MS     2
-#define VIDEO_ERROR_RETRY_DELAY_MS        10
+#define MAX_BUFFER_COUNT              3
+#define MIN_BUFFER_COUNT              2
+#define VIDEO_TASK_STACK_SIZE         (4 * 1024)
+#define VIDEO_TASK_PRIORITY           4
+#define VIDEO_STOP_TIMEOUT_MS         1500
+#define VIDEO_ERROR_RETRY_DELAY_MS    10
 
 typedef struct {
     uint8_t *camera_buffer[MAX_BUFFER_COUNT];
@@ -70,28 +68,6 @@ static void clear_binary_semaphore(SemaphoreHandle_t semaphore)
 
     while (xSemaphoreTake(semaphore, 0) == pdTRUE) {
         /* Remove a signal left from an earlier stop operation. */
-    }
-}
-
-static void reset_camera_runtime_state(void)
-{
-    app_camera_video.video_fd = -1;
-    app_camera_video.video_streaming = false;
-    app_camera_video.video_task_delete = false;
-    app_camera_video.video_stream_task_handle = NULL;
-    app_camera_video.camera_buf_count = 0;
-    app_camera_video.camera_buf_size = 0;
-    app_camera_video.camera_buf_hes = 0;
-    app_camera_video.camera_buf_ves = 0;
-    app_camera_video.video_task_user_data = NULL;
-
-    for (int i = 0; i < MAX_BUFFER_COUNT; i++) {
-        /*
-         * Camera buffers are allocated and owned by app_main.
-         * The driver association is removed here; this module does not free
-         * application-owned PSRAM.
-         */
-        app_camera_video.camera_buffer[i] = NULL;
     }
 }
 
@@ -134,12 +110,7 @@ int app_video_open(char *dev, video_fmt_t init_fmt)
     struct v4l2_ext_controls controls;
     struct v4l2_ext_control control[1];
 
-    /*
-     * Use non-blocking capture so the stream task periodically regains
-     * execution and can observe video_task_delete. This prevents shutdown
-     * from depending on VIDIOC_STREAMOFF waking a blocking VIDIOC_DQBUF.
-     */
-    int fd = open(dev, O_RDONLY | O_NONBLOCK);
+    int fd = open(dev, O_RDONLY);
     if (fd < 0) {
         ESP_LOGE(TAG, "Open video failed, errno=%d", errno);
         return -1;
@@ -350,37 +321,15 @@ uint32_t app_video_get_buf_size(void)
 
 static esp_err_t video_receive_video_frame(int video_fd)
 {
-    memset(
-        &app_camera_video.v4l2_buf,
-        0,
-        sizeof(app_camera_video.v4l2_buf));
+    memset(&app_camera_video.v4l2_buf, 0, sizeof(app_camera_video.v4l2_buf));
 
-    app_camera_video.v4l2_buf.type =
-        V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    app_camera_video.v4l2_buf.memory =
-        app_camera_video.camera_mem_mode;
+    app_camera_video.v4l2_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    app_camera_video.v4l2_buf.memory = app_camera_video.camera_mem_mode;
 
     if (ioctl(
             video_fd,
             VIDIOC_DQBUF,
             &app_camera_video.v4l2_buf) != 0) {
-        /*
-         * O_NONBLOCK makes EAGAIN/EWOULDBLOCK the normal "no completed frame
-         * yet" condition. It is not a camera failure.
-         */
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return ESP_ERR_NOT_FOUND;
-        }
-
-        /*
-         * A signal/interruption is transient. Let the task retry unless a
-         * shutdown request is already pending.
-         */
-        if (errno == EINTR) {
-            return ESP_ERR_INVALID_STATE;
-        }
-
-        ESP_LOGE(TAG, "VIDIOC_DQBUF failed, errno=%d", errno);
         return ESP_FAIL;
     }
 
@@ -400,21 +349,14 @@ static void video_operation_video_frame(void)
         return;
     }
 
-    uint8_t *buffer =
-        app_camera_video.camera_buffer[buffer_index];
-
+    uint8_t *buffer = app_camera_video.camera_buffer[buffer_index];
     if (buffer == NULL) {
-        ESP_LOGE(
-            TAG,
-            "Camera buffer %" PRIu32 " is NULL",
-            buffer_index);
+        ESP_LOGE(TAG, "Camera buffer %" PRIu32 " is NULL", buffer_index);
         return;
     }
 
-    app_camera_video.v4l2_buf.m.userptr =
-        (unsigned long)buffer;
-    app_camera_video.v4l2_buf.length =
-        app_camera_video.camera_buf_size;
+    app_camera_video.v4l2_buf.m.userptr = (unsigned long)buffer;
+    app_camera_video.v4l2_buf.length = app_camera_video.camera_buf_size;
 
     if (app_camera_video.user_camera_video_frame_operation_cb != NULL) {
         app_camera_video.user_camera_video_frame_operation_cb(
@@ -433,7 +375,6 @@ static esp_err_t video_free_video_frame(int video_fd)
             video_fd,
             VIDIOC_QBUF,
             &app_camera_video.v4l2_buf) != 0) {
-        ESP_LOGE(TAG, "VIDIOC_QBUF failed, errno=%d", errno);
         return ESP_FAIL;
     }
 
@@ -447,10 +388,7 @@ static esp_err_t video_stream_start(int video_fd)
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
     if (ioctl(video_fd, VIDIOC_STREAMON, &type) != 0) {
-        ESP_LOGE(
-            TAG,
-            "Failed to start video stream, errno=%d",
-            errno);
+        ESP_LOGE(TAG, "Failed to start video stream, errno=%d", errno);
         return ESP_FAIL;
     }
 
@@ -479,10 +417,7 @@ static esp_err_t video_stream_stop(int video_fd)
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
     if (ioctl(video_fd, VIDIOC_STREAMOFF, &type) != 0) {
-        ESP_LOGE(
-            TAG,
-            "Failed to stop video stream, errno=%d",
-            errno);
+        ESP_LOGE(TAG, "Failed to stop video stream, errno=%d", errno);
         return ESP_FAIL;
     }
 
@@ -501,43 +436,21 @@ static void video_stream_task(void *arg)
         pcTaskGetName(NULL));
 
     while (!app_camera_video.video_task_delete) {
-        esp_err_t ret =
-            video_receive_video_frame(video_fd);
-
-        if (ret == ESP_ERR_NOT_FOUND) {
-            /*
-             * No frame is ready yet. Yield briefly and then check the
-             * shutdown flag again.
-             */
-            vTaskDelay(
-                pdMS_TO_TICKS(
-                    VIDEO_NO_FRAME_RETRY_DELAY_MS));
-            continue;
-        }
-
-        if (ret == ESP_ERR_INVALID_STATE) {
-            if (app_camera_video.video_task_delete) {
-                break;
-            }
-
-            taskYIELD();
-            continue;
-        }
+        esp_err_t ret = video_receive_video_frame(video_fd);
 
         if (ret != ESP_OK) {
             if (app_camera_video.video_task_delete) {
                 break;
             }
 
-            vTaskDelay(
-                pdMS_TO_TICKS(
-                    VIDEO_ERROR_RETRY_DELAY_MS));
+            ESP_LOGE(TAG, "Failed to receive video frame");
+            vTaskDelay(pdMS_TO_TICKS(VIDEO_ERROR_RETRY_DELAY_MS));
             continue;
         }
 
         /*
-         * Once shutdown is requested, do not process or requeue another
-         * completed frame.
+         * VIDIOC_STREAMOFF from the stop function can race with this task.
+         * Once shutdown is requested, do not process or requeue another frame.
          */
         if (app_camera_video.video_task_delete) {
             break;
@@ -552,9 +465,7 @@ static void video_stream_task(void *arg)
         ret = video_free_video_frame(video_fd);
         if (ret != ESP_OK) {
             if (!app_camera_video.video_task_delete) {
-                ESP_LOGE(
-                    TAG,
-                    "Failed to return video frame to the driver");
+                ESP_LOGE(TAG, "Failed to return video frame to the driver");
             }
             break;
         }
@@ -586,26 +497,20 @@ esp_err_t app_video_stream_task_start(
     }
 
     if (app_camera_video.video_stream_task_handle != NULL) {
-        ESP_LOGW(
-            TAG,
-            "Video stream task is already running");
+        ESP_LOGW(TAG, "Video stream task is already running");
         return ESP_ERR_INVALID_STATE;
     }
 
     if (app_camera_video.video_stopped_sem == NULL) {
-        app_camera_video.video_stopped_sem =
-            xSemaphoreCreateBinary();
+        app_camera_video.video_stopped_sem = xSemaphoreCreateBinary();
 
         if (app_camera_video.video_stopped_sem == NULL) {
-            ESP_LOGE(
-                TAG,
-                "Failed to create video-stop semaphore");
+            ESP_LOGE(TAG, "Failed to create video-stop semaphore");
             return ESP_ERR_NO_MEM;
         }
     }
 
-    clear_binary_semaphore(
-        app_camera_video.video_stopped_sem);
+    clear_binary_semaphore(app_camera_video.video_stopped_sem);
 
     app_camera_video.video_task_delete = false;
     app_camera_video.video_task_core_id = core_id;
@@ -632,10 +537,7 @@ esp_err_t app_video_stream_task_start(
         core_id);
 
     if (result != pdPASS) {
-        ESP_LOGE(
-            TAG,
-            "Failed to create video stream task");
-
+        ESP_LOGE(TAG, "Failed to create video stream task");
         app_camera_video.video_stream_task_handle = NULL;
         (void)video_stream_stop(video_fd);
         return ESP_FAIL;
@@ -651,9 +553,7 @@ esp_err_t app_video_stream_task_restart(int video_fd)
     }
 
     if (app_camera_video.video_stream_task_handle != NULL) {
-        ESP_LOGE(
-            TAG,
-            "Cannot restart while video stream task is running");
+        ESP_LOGE(TAG, "Cannot restart while video stream task is running");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -673,9 +573,7 @@ esp_err_t app_video_stream_task_restart(int video_fd)
         app_camera_video.video_task_user_data);
 
     if (ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "Failed to restart video stream task");
+        ESP_LOGE(TAG, "Failed to restart video stream task");
         return ret;
     }
 
@@ -694,49 +592,31 @@ esp_err_t app_video_stream_task_stop(int video_fd)
 
     if (xTaskGetCurrentTaskHandle() ==
         app_camera_video.video_stream_task_handle) {
-        ESP_LOGE(
-            TAG,
-            "Video task cannot synchronously stop itself");
+        ESP_LOGE(TAG, "Video task cannot synchronously stop itself");
         return ESP_ERR_INVALID_STATE;
     }
 
     if (app_camera_video.video_stopped_sem == NULL) {
-        ESP_LOGE(
-            TAG,
-            "Video-stop semaphore is unavailable");
+        ESP_LOGE(TAG, "Video-stop semaphore is unavailable");
         return ESP_ERR_INVALID_STATE;
     }
 
-    clear_binary_semaphore(
-        app_camera_video.video_stopped_sem);
-
-    /*
-     * Set this before STREAMOFF. With non-blocking DQBUF, the task observes
-     * the flag within a few milliseconds even if STREAMOFF does not wake the
-     * driver immediately.
-     */
+    clear_binary_semaphore(app_camera_video.video_stopped_sem);
     app_camera_video.video_task_delete = true;
 
-    esp_err_t streamoff_ret =
-        video_stream_stop(video_fd);
-
+    /*
+     * STREAMOFF wakes a task blocked inside VIDIOC_DQBUF. The video task then
+     * exits and signals video_stopped_sem.
+     */
+    esp_err_t streamoff_ret = video_stream_stop(video_fd);
     if (streamoff_ret != ESP_OK) {
-        ESP_LOGW(
-            TAG,
-            "STREAMOFF failed while requesting task shutdown");
+        ESP_LOGW(TAG, "STREAMOFF failed while requesting task shutdown");
     }
 
     if (xSemaphoreTake(
             app_camera_video.video_stopped_sem,
             pdMS_TO_TICKS(VIDEO_STOP_TIMEOUT_MS)) != pdTRUE) {
-        ESP_LOGE(
-            TAG,
-            "Timed out while stopping video stream task");
-
-        /*
-         * Keep video_task_delete asserted. app_video_shutdown() will close
-         * the file descriptor and perform one final bounded wait.
-         */
+        ESP_LOGE(TAG, "Timed out while stopping video stream task");
         return ESP_ERR_TIMEOUT;
     }
 
@@ -752,83 +632,39 @@ esp_err_t app_video_shutdown(void)
         return ESP_OK;
     }
 
-    ESP_LOGI(
-        TAG,
-        "Shutting down camera before deep sleep");
+    ESP_LOGI(TAG, "Shutting down camera before deep sleep");
 
-    esp_err_t stop_ret =
-        app_video_stream_task_stop(video_fd);
-
-    if (stop_ret != ESP_OK) {
-        ESP_LOGW(
-            TAG,
-            "Graceful camera-task stop failed: %s; "
-            "closing the device to force release",
-            esp_err_to_name(stop_ret));
-    }
-
-    /*
-     * Always close the camera file descriptor, even when the normal task-stop
-     * handshake times out. The previous implementation returned early and
-     * therefore left the CSI device open during deep sleep.
-     */
-    esp_err_t close_ret = ESP_OK;
-
-    if (close(video_fd) != 0) {
+    esp_err_t ret = app_video_stream_task_stop(video_fd);
+    if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
-            "Closing camera device failed, errno=%d",
-            errno);
-        close_ret = ESP_FAIL;
+            "Could not stop camera stream: %s",
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    if (close(video_fd) != 0) {
+        ESP_LOGE(TAG, "Closing camera device failed, errno=%d", errno);
+        return ESP_FAIL;
     }
 
     app_camera_video.video_fd = -1;
     app_camera_video.video_streaming = false;
+    app_camera_video.camera_buf_count = 0;
+    app_camera_video.camera_buf_size = 0;
+    app_camera_video.camera_buf_hes = 0;
+    app_camera_video.camera_buf_ves = 0;
+    app_camera_video.video_task_user_data = NULL;
 
-    /*
-     * Closing the descriptor should release a task that was still inside a
-     * driver operation. Give it one final bounded interval to signal exit.
-     */
-    if (app_camera_video.video_stream_task_handle != NULL &&
-        app_camera_video.video_stopped_sem != NULL) {
-        if (xSemaphoreTake(
-                app_camera_video.video_stopped_sem,
-                pdMS_TO_TICKS(
-                    VIDEO_CLOSE_GRACE_TIMEOUT_MS)) == pdTRUE) {
-            ESP_LOGW(
-                TAG,
-                "Video task exited after forced device close");
-        } else {
-            /*
-             * Deep sleep follows immediately and resets the complete CSI
-             * subsystem. Delete the application task so no task can access
-             * the now-closed descriptor during the remaining shutdown steps.
-             */
-            TaskHandle_t stuck_task =
-                app_camera_video.video_stream_task_handle;
-
-            app_camera_video.video_stream_task_handle = NULL;
-            app_camera_video.video_task_delete = false;
-
-            if (stuck_task != NULL) {
-                ESP_LOGW(
-                    TAG,
-                    "Force deleting video task after shutdown timeout");
-                vTaskDelete(stuck_task);
-            }
-        }
+    for (int i = 0; i < MAX_BUFFER_COUNT; i++) {
+        /*
+         * These pointers are owned by app_main. Closing the camera releases
+         * the driver association; app_main owns any heap deallocation.
+         */
+        app_camera_video.camera_buffer[i] = NULL;
     }
 
-    reset_camera_runtime_state();
-
-    if (close_ret != ESP_OK) {
-        return close_ret;
-    }
-
-    ESP_LOGI(
-        TAG,
-        "Camera stream stopped and camera device closed");
-
+    ESP_LOGI(TAG, "Camera stream stopped and camera device closed");
     return ESP_OK;
 }
 
@@ -839,8 +675,6 @@ esp_err_t app_video_register_frame_operation_cb(
         return ESP_ERR_INVALID_ARG;
     }
 
-    app_camera_video.user_camera_video_frame_operation_cb =
-        operation_cb;
-
+    app_camera_video.user_camera_video_frame_operation_cb = operation_cb;
     return ESP_OK;
 }

@@ -296,14 +296,6 @@ esp_err_t bsp_display_lock(uint32_t timeout_ms);
  */
 void bsp_display_unlock(void);
 
-/**
- * Completely shut down LVGL, touch, LCD panel, MIPI-DSI bus and the
- * ESP32-P4 internal 2.5 V DPHY LDO before deep sleep.
- *
- * A deep-sleep wake reboots and initializes the display again.
- */
-esp_err_t bsp_display_shutdown_for_deep_sleep(void);
-
 esp_lcd_panel_handle_t bsp_display_get_panel_handle(void);
 #endif // BSP_CONFIG_NO_GRAPHIC_LIB == 0
 

@@ -73,36 +73,30 @@ void app_sleep_request(const char *reason)
         reason != NULL ? reason : "unknown source");
 
     /*
-     * Power-profile mode:
-     *
-     * Every stage is held for five seconds so that the Joulescope graph
-     * shows a stable current plateau after each subsystem is disabled.
-     *
-     * Total additional shutdown time: approximately 30 seconds.
-     */
-    ESP_LOGI(
-        "POWER_PROFILE",
-        "STEP 0: all systems active");
-
-    vTaskDelay(pdMS_TO_TICKS(5000));
-
-    /*
      * Stop new PPA, face-detection, face-recognition and LCD operations
-     * before shutting down the camera stream.
+     * before the video stream is shut down.
      */
     if (s_prepare_callback != NULL) {
         s_prepare_callback(s_prepare_user_data);
     }
 
     /*
-     * STEP 1:
-     * Stop the V4L2 stream task, issue VIDIOC_STREAMOFF and close the
-     * camera file descriptor.
+     * Hide the display immediately.
      */
-    ESP_LOGI(
-        "POWER_PROFILE",
-        "STEP 1: stopping camera");
+    esp_err_t backlight_ret = bsp_display_backlight_off();
 
+    if (backlight_ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Could not switch display backlight off: %s",
+            esp_err_to_name(backlight_ret));
+    }
+
+    /*
+     * Stop the V4L2 stream task, issue VIDIOC_STREAMOFF and close the
+     * camera file descriptor. app_video_shutdown() is also safe before
+     * the camera has been started.
+     */
     esp_err_t camera_ret = app_video_shutdown();
 
     if (camera_ret == ESP_OK) {
@@ -114,18 +108,10 @@ void app_sleep_request(const char *reason)
             esp_err_to_name(camera_ret));
     }
 
-    vTaskDelay(pdMS_TO_TICKS(5000));
-
     /*
-     * STEP 2:
-     * Switch the backlight off, stop LVGL and touch, switch LCD output
-     * off, delete the LCD panel and MIPI-DSI bus, and release the
-     * 2.5 V DPHY LDO.
+     * Stop LVGL and touch, switch the LCD output off, delete the LCD panel
+     * and MIPI-DSI bus, then release the 2.5 V DPHY LDO.
      */
-    ESP_LOGI(
-        "POWER_PROFILE",
-        "STEP 2: disabling display, touch and MIPI-DSI");
-
     esp_err_t display_ret =
         bsp_display_shutdown_for_deep_sleep();
 
@@ -140,20 +126,13 @@ void app_sleep_request(const char *reason)
             esp_err_to_name(display_ret));
     }
 
-    vTaskDelay(pdMS_TO_TICKS(5000));
-
     /*
-     * STEP 3:
      * Disable the board's external audio power amplifier.
      *
      * Waveshare ESP32-P4-NANO:
      * GPIO53 HIGH = amplifier enabled
      * GPIO53 LOW  = amplifier disabled
      */
-    ESP_LOGI(
-        "POWER_PROFILE",
-        "STEP 3: disabling audio amplifier");
-
     esp_err_t audio_ret =
         component_audio_disable_for_deep_sleep();
 
@@ -168,17 +147,10 @@ void app_sleep_request(const char *reason)
             esp_err_to_name(audio_ret));
     }
 
-    vTaskDelay(pdMS_TO_TICKS(5000));
-
     /*
-     * STEP 4:
-     * Unmount the FAT filesystem and disconnect the microSD card's
+     * Unmount the FAT filesystem before disconnecting the microSD card's
      * SD1_VDD power rail.
      */
-    ESP_LOGI(
-        "POWER_PROFILE",
-        "STEP 4: disabling microSD");
-
     esp_err_t sdcard_ret =
         component_sdcard_disable_for_deep_sleep();
 
@@ -193,16 +165,10 @@ void app_sleep_request(const char *reason)
             esp_err_to_name(sdcard_ret));
     }
 
-    vTaskDelay(pdMS_TO_TICKS(5000));
-
     /*
-     * STEP 5:
-     * Hold the external ESP32-C6 Wi-Fi coprocessor in reset.
+     * Disable the external ESP32-C6 Wi-Fi coprocessor before the
+     * ESP32-P4 enters deep sleep.
      */
-    ESP_LOGI(
-        "POWER_PROFILE",
-        "STEP 5: disabling ESP32-C6");
-
     esp_err_t wifi_ret =
         component_wifi_disable_for_deep_sleep();
 
@@ -218,31 +184,13 @@ void app_sleep_request(const char *reason)
     }
 
     /*
-     * Keep this final pre-sleep configuration active for five seconds.
-     * The Joulescope plateau now represents:
-     *
-     * camera off
-     * display/DSI off
-     * audio amplifier off
-     * microSD off
-     * ESP32-C6 held in reset
-     * ESP32-P4 still awake
+     * Configure the GPIO wake source and enter hardware deep sleep.
      */
-    vTaskDelay(pdMS_TO_TICKS(5000));
-
-    /*
-     * STEP 6:
-     * Configure the GPIO3 wake source and enter hardware deep sleep.
-     */
-    ESP_LOGI(
-        "POWER_PROFILE",
-        "STEP 6: entering ESP32-P4 deep sleep");
-
     enter_deep_sleep();
 
     /*
-     * Normally unreachable. Restore the audio amplifier only when
-     * entering deep sleep unexpectedly fails.
+     * Normally unreachable. Restore the audio amplifier only when entering
+     * deep sleep unexpectedly fails.
      */
     esp_err_t audio_restore_ret =
         component_audio_restore_after_failed_sleep();
