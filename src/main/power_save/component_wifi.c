@@ -18,10 +18,6 @@ static const char *TAG = "component_wifi";
 
 esp_err_t component_wifi_disable_for_deep_sleep(void)
 {
-    /*
-     * Do not name this variable gpio_config. That would hide the
-     * gpio_config() function and cause a compiler error.
-     */
     gpio_config_t io_config = {
         .pin_bit_mask = 1ULL << WIFI_C6_CHIP_PU_GPIO,
         .mode = GPIO_MODE_OUTPUT,
@@ -41,7 +37,7 @@ esp_err_t component_wifi_disable_for_deep_sleep(void)
     }
 
     /*
-     * Hold the ESP32-C6 in reset.
+     * LOW holds the external ESP32-C6 in reset.
      */
     ret = gpio_set_level(WIFI_C6_CHIP_PU_GPIO, 0);
     if (ret != ESP_OK) {
@@ -53,10 +49,23 @@ esp_err_t component_wifi_disable_for_deep_sleep(void)
     }
 
     /*
-     * ESP32-P4 supports holding an individual output GPIO while its
-     * GPIO/IOMUX power domain is switched off. ESP-IDF for ESP32-P4
-     * does not provide gpio_deep_sleep_hold_en().
+     * ESP-IDF normally switches GPIO54 to its sleep configuration.
+     * The board's external pull-up then raises CHIP_PU to 3.3 V and
+     * starts the ESP32-C6 again.
+     *
+     * Disable sleep-configuration switching for GPIO54 before holding
+     * the pin, so its active OUTPUT-LOW configuration is retained.
      */
+    ret = gpio_sleep_sel_dis(WIFI_C6_CHIP_PU_GPIO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not disable sleep switching for GPIO%d: %s",
+            WIFI_C6_CHIP_PU_GPIO,
+            esp_err_to_name(ret));
+        return ret;
+    }
+
     ret = gpio_hold_en(WIFI_C6_CHIP_PU_GPIO);
     if (ret != ESP_OK) {
         ESP_LOGE(
