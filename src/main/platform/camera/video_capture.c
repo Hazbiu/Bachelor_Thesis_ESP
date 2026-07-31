@@ -560,11 +560,23 @@ static void video_stream_task(void *arg)
         }
     }
 
-    esp_err_t stop_ret = video_stream_stop(video_fd);
-    if (stop_ret != ESP_OK) {
-        ESP_LOGW(TAG, "Video stream did not stop cleanly");
-    }
+    /*
+     * During a requested shutdown, app_video_stream_task_stop()
+     * already executes VIDIOC_STREAMOFF. Do not execute it again
+     * from this task, because two simultaneous STREAMOFF calls can
+     * race and produce EBUSY (errno 16).
+     *
+     * If the task exits independently because of a streaming error,
+     * it remains responsible for stopping the stream.
+     */
+    if (!app_camera_video.video_task_delete) {
+        esp_err_t stop_ret = video_stream_stop(video_fd);
 
+        if (stop_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Video stream did not stop cleanly");
+        }
+    }
+    
     app_camera_video.video_task_delete = false;
     app_camera_video.video_stream_task_handle = NULL;
 
