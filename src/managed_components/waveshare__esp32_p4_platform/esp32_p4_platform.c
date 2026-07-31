@@ -7,6 +7,10 @@
 #include "esp_idf_version.h"
 #include "esp_spiffs.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_commands.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_ldo_regulator.h"
 #include "esp_vfs_fat.h"
@@ -1207,24 +1211,74 @@ esp_err_t bsp_display_shutdown_for_deep_sleep(void)
             }
         }
 
-        ret = esp_lcd_panel_disp_sleep(panel_handle, true);
+        #if CONFIG_BSP_LCD_TYPE_800_1280_10_1_INCH_A
+                /*
+                * The selected 10.1-inch A panel uses the JD9365 controller.
+                * Its driver does not implement esp_lcd_panel_disp_sleep(), so
+                * send the standard Sleep In command directly through DBI.
+                *
+                * The preceding disp_on_off(false) sends Display Off (0x28).
+                */
+                if (io_handle == NULL)
+                {
+                    ret = ESP_ERR_INVALID_STATE;
+                    ESP_LOGE(TAG, "Cannot put JD9365 to sleep: DBI IO is NULL");
 
-        if (ret == ESP_OK)
-        {
-            ESP_LOGI(TAG, "LCD controller entered sleep mode");
-        }
-        else if (ret != ESP_ERR_NOT_SUPPORTED)
-        {
-            ESP_LOGW(
-                TAG,
-                "LCD sleep command failed: %s",
-                esp_err_to_name(ret));
+                    if (first_error == ESP_OK)
+                    {
+                        first_error = ret;
+                    }
+                }
+                else
+                {
+                    /* Wait longer than the required Display Off -> Sleep In delay. */
+                    vTaskDelay(pdMS_TO_TICKS(5) + 1);
 
-            if (first_error == ESP_OK)
-            {
-                first_error = ret;
-            }
-        }
+                    ret = esp_lcd_panel_io_tx_param(
+                        io_handle,
+                        LCD_CMD_SLPIN,
+                        NULL,
+                        0);
+
+                    if (ret != ESP_OK)
+                    {
+                        ESP_LOGE(
+                            TAG,
+                            "JD9365 Sleep In command failed: %s",
+                            esp_err_to_name(ret));
+
+                        if (first_error == ESP_OK)
+                        {
+                            first_error = ret;
+                        }
+                    }
+                    else
+                    {
+                        /* Keep DBI and DSI alive until Sleep In completes. */
+                        vTaskDelay(pdMS_TO_TICKS(120) + 1);
+                        ESP_LOGI(TAG, "JD9365 entered sleep mode");
+                    }
+                }
+        #else
+                ret = esp_lcd_panel_disp_sleep(panel_handle, true);
+
+                if (ret == ESP_OK)
+                {
+                    ESP_LOGI(TAG, "LCD controller entered sleep mode");
+                }
+                else if (ret != ESP_ERR_NOT_SUPPORTED)
+                {
+                    ESP_LOGW(
+                        TAG,
+                        "LCD sleep command failed: %s",
+                        esp_err_to_name(ret));
+
+                    if (first_error == ESP_OK)
+                    {
+                        first_error = ret;
+                    }
+                }
+        #endif
 
         ret = esp_lcd_panel_del(panel_handle);
 
