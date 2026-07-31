@@ -13,6 +13,7 @@ idf_component_register(
         "power_save/wake_up.c"
         "power_save/cpu_power.c"
         "power_save/component_wifi.c"
+	"power_save/component_ethernet.c"
         "power_save/component_sdcard.c"
         "power_save/component_audio.c"
     INCLUDE_DIRS

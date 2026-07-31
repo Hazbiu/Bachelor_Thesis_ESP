@@ -16,6 +16,7 @@
 #include "power_save/component_sdcard.h"
 #include "power_save/component_wifi.h"
 #include "power_save/deep_sleep.h"
+#include "power_save/component_ethernet.h"
 
 static const char *TAG = "app_sleep";
 
@@ -78,7 +79,7 @@ void app_sleep_request(const char *reason)
      * Every stage is held for five seconds so that the Joulescope graph
      * shows a stable current plateau after each subsystem is disabled.
      *
-     * Total additional shutdown time: approximately 30 seconds.
+     * Total additional shutdown time: approximately 35 seconds.
      */
     ESP_LOGI(
         "POWER_PROFILE",
@@ -218,27 +219,66 @@ void app_sleep_request(const char *reason)
     }
 
     /*
-     * Keep this final pre-sleep configuration active for five seconds.
-     * The Joulescope plateau now represents:
-     *
-     * camera off
-     * display/DSI off
-     * audio amplifier off
-     * microSD off
-     * ESP32-C6 held in reset
-     * ESP32-P4 still awake
+     * Keep the ESP32-C6 reset state active for five seconds so that
+     * its current contribution can be measured separately.
      */
     vTaskDelay(pdMS_TO_TICKS(5000));
 
     /*
      * STEP 6:
+     * Hold the onboard IP101GRI Ethernet PHY in hardware reset.
+     *
+     * Waveshare ESP32-P4-NANO:
+     * GPIO51 HIGH = Ethernet PHY released
+     * GPIO51 LOW  = Ethernet PHY held in reset
+     */
+    ESP_LOGI(
+        "POWER_PROFILE",
+        "STEP 6: disabling IP101GRI Ethernet PHY");
+
+    esp_err_t ethernet_ret =
+        component_ethernet_disable_for_deep_sleep();
+
+    if (ethernet_ret == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "Ethernet PHY held in reset successfully");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "Ethernet PHY shutdown failed: %s",
+            esp_err_to_name(ethernet_ret));
+    }
+
+    /*
+     * Keep the Ethernet-reset state active for five seconds so that
+     * its current contribution can be measured separately.
+     */
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    /*
+     * STEP 7:
      * Configure the GPIO3 wake source and enter hardware deep sleep.
      */
     ESP_LOGI(
         "POWER_PROFILE",
-        "STEP 6: entering ESP32-P4 deep sleep");
+        "STEP 7: entering ESP32-P4 deep sleep");
 
     enter_deep_sleep();
+
+    /*
+     * Normally unreachable. Release the Ethernet PHY only when
+     * entering deep sleep unexpectedly fails.
+     */
+    esp_err_t ethernet_restore_ret =
+        component_ethernet_restore_after_failed_sleep();
+
+    if (ethernet_restore_ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Could not restore Ethernet PHY: %s",
+            esp_err_to_name(ethernet_restore_ret));
+    }
 
     /*
      * Normally unreachable. Restore the audio amplifier only when
