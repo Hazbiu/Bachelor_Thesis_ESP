@@ -5,6 +5,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
+#include <stdio.h>
 
 static const char *TAG = "deep_sleep";
 
@@ -73,6 +74,11 @@ void enter_deep_sleep(void)
         "Entering deep sleep. Press the GPIO%d button to wake up.",
         WAKE_BUTTON_GPIO
     );
+
+    /*
+     * Flush buffered logging before entering deep sleep.
+     */
+    fflush(stdout);
 
     esp_deep_sleep_start();
 }
