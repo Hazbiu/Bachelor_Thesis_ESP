@@ -108,7 +108,7 @@ find /media/hazbiu/SDCARD/enroll/Keti \
   -maxdepth 1 -type f -iname '*.rgb' \
   -printf '%f %s bytes\n'
 ```
-
+ali
 Every file must report:
 
 ```text
