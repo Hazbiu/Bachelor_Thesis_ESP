@@ -26,10 +26,20 @@ esp_err_t app_sleep_start_button_monitor(
     void *user_data);
 
 /**
- * Start the one-shot inactivity timeout defined by
- * APP_DEEP_SLEEP_TIMEOUT_MS.
+ * Start the face-inactivity monitor.
+ *
+ * The initial timeout begins when this function is called. Every subsequent
+ * call to app_sleep_notify_face_detected() restarts the complete timeout.
  */
 esp_err_t app_sleep_start_timeout(void);
+
+/**
+ * Record a positive face-detection result and restart the inactivity window.
+ *
+ * Known and unknown faces are both activity. Calls made before the inactivity
+ * monitor starts, or after a sleep request is accepted, are ignored.
+ */
+void app_sleep_notify_face_detected(void);
 
 /**
  * Request an ordered transition into deep sleep.

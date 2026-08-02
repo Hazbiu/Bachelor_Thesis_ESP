@@ -20,6 +20,7 @@
 
 /* Deep-sleep configuration */
 #define APP_DEEP_SLEEP_TIMEOUT_MS           30000
+#define APP_DEEP_SLEEP_INACTIVITY_POLL_MS   100
 #define APP_DEEP_SLEEP_BUTTON_GPIO          GPIO_NUM_3
 #define APP_DEEP_SLEEP_BUTTON_POLL_MS       5
 #define APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS   25

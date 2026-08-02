@@ -568,12 +568,12 @@ static void camera_application_start_task(void *arg)
     dummy_draw_enabled = true;
     display_disable_lvgl_overlays();
 
-    /* The first complete camera frame turns the backlight on again. */
+    /* Start the 30-second face-inactivity window with the camera application. */
     ret = app_sleep_start_timeout();
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
-            "Failed to start deep-sleep timeout: %s",
+            "Failed to start face-inactivity monitor: %s",
             esp_err_to_name(ret));
     }
 
@@ -831,6 +831,13 @@ static void camera_video_frame_operation(
         diagnostics_ai_detection_result(face_count);
 
         if (face_count > 0) {
+            /*
+             * Every positive detection restarts the 30-second inactivity
+             * window. Recognition success is deliberately not required:
+             * known and unknown faces both keep the application awake.
+             */
+            app_sleep_notify_face_detected();
+
             int update_count = face_count;
             if (update_count > APP_MAX_FACE_BOXES) {
                 update_count = APP_MAX_FACE_BOXES;

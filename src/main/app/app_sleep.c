@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
@@ -9,6 +10,7 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "platform/camera/video_capture.h"
@@ -24,6 +26,8 @@ static portMUX_TYPE s_sleep_request_lock =
     portMUX_INITIALIZER_UNLOCKED;
 
 static bool s_sleep_requested;
+static bool s_inactivity_monitor_started;
+static int64_t s_last_face_detected_us;
 
 static app_sleep_prepare_callback_t s_prepare_callback;
 static void *s_prepare_user_data;
@@ -35,6 +39,32 @@ static bool claim_sleep_request(void)
     portENTER_CRITICAL(&s_sleep_request_lock);
 
     if (!s_sleep_requested) {
+        s_sleep_requested = true;
+        claimed = true;
+    }
+
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    return claimed;
+}
+
+static bool claim_inactivity_sleep_request(void)
+{
+    const int64_t now_us = esp_timer_get_time();
+    const int64_t timeout_us =
+        (int64_t)APP_DEEP_SLEEP_TIMEOUT_MS * 1000LL;
+    bool claimed = false;
+
+    /*
+     * The timeout check and the sleep claim share the same lock as the
+     * face-detection reset. A face therefore cannot reset the timer between
+     * the final timeout check and acceptance of the sleep request.
+     */
+    portENTER_CRITICAL(&s_sleep_request_lock);
+
+    if (s_inactivity_monitor_started &&
+        !s_sleep_requested &&
+        (now_us - s_last_face_detected_us) >= timeout_us) {
         s_sleep_requested = true;
         claimed = true;
     }
@@ -62,12 +92,21 @@ bool app_sleep_is_requested(void)
     return requested;
 }
 
-void app_sleep_request(const char *reason)
+void app_sleep_notify_face_detected(void)
 {
-    if (!claim_sleep_request()) {
-        return;
+    const int64_t now_us = esp_timer_get_time();
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+
+    if (s_inactivity_monitor_started && !s_sleep_requested) {
+        s_last_face_detected_us = now_us;
     }
 
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+}
+
+static void run_sleep_sequence(const char *reason)
+{
     ESP_LOGI(
         TAG,
         "Deep sleep requested by %s",
@@ -332,6 +371,15 @@ void app_sleep_request(const char *reason)
         "Deep sleep request returned without entering sleep");
 }
 
+void app_sleep_request(const char *reason)
+{
+    if (!claim_sleep_request()) {
+        return;
+    }
+
+    run_sleep_sequence(reason);
+}
+
 static void deep_sleep_button_task(void *arg)
 {
     (void)arg;
@@ -406,15 +454,30 @@ static void deep_sleep_timeout_task(void *arg)
 {
     (void)arg;
 
-    vTaskDelay(
-        pdMS_TO_TICKS(APP_DEEP_SLEEP_TIMEOUT_MS));
-
     ESP_LOGI(
         TAG,
-        "No activity for %d ms; entering deep sleep",
+        "Face-inactivity monitor armed: timeout=%d ms",
         APP_DEEP_SLEEP_TIMEOUT_MS);
 
-    app_sleep_request("inactivity timeout");
+    while (!app_sleep_is_requested()) {
+        vTaskDelay(
+            pdMS_TO_TICKS(
+                APP_DEEP_SLEEP_INACTIVITY_POLL_MS));
+
+        if (claim_inactivity_sleep_request()) {
+            ESP_LOGI(
+                TAG,
+                "No face detected for %d ms; entering deep sleep",
+                APP_DEEP_SLEEP_TIMEOUT_MS);
+
+            run_sleep_sequence("30-second face inactivity");
+            break;
+        }
+    }
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    s_inactivity_monitor_started = false;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
 
     vTaskDelete(NULL);
 }
@@ -448,18 +511,36 @@ esp_err_t app_sleep_start_button_monitor(
 
 esp_err_t app_sleep_start_timeout(void)
 {
+    const int64_t start_time_us = esp_timer_get_time();
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+
+    if (s_inactivity_monitor_started) {
+        portEXIT_CRITICAL(&s_sleep_request_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_last_face_detected_us = start_time_us;
+    s_inactivity_monitor_started = true;
+
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+
     BaseType_t created = xTaskCreate(
         deep_sleep_timeout_task,
-        "deep_sleep_timeout",
+        "face_inactivity",
         2048,
         NULL,
         5,
         NULL);
 
     if (created != pdPASS) {
+        portENTER_CRITICAL(&s_sleep_request_lock);
+        s_inactivity_monitor_started = false;
+        portEXIT_CRITICAL(&s_sleep_request_lock);
+
         ESP_LOGE(
             TAG,
-            "Failed to create deep-sleep timeout task");
+            "Failed to create face-inactivity task");
 
         return ESP_ERR_NO_MEM;
     }
