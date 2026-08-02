@@ -4,7 +4,6 @@
 #include "freertos/task.h"
 
 #include "driver/gpio.h"
-#include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
@@ -14,22 +13,6 @@
 static const char *TAG = "deep_sleep";
 
 #define WAKE_BUTTON_GPIO GPIO_NUM_3
-
-/*
- * Apply the global pad hold during final deep-sleep preparation.
- *
- * gpio_force_hold_all() also holds the flash and UART pads. Therefore:
- *
- * - This callback must execute from IRAM.
- * - It must not produce logs.
- * - It must not delay.
- * - It must not allocate memory.
- * - It must not call any function that could block.
- */
-static void IRAM_ATTR hold_all_pads_at_deep_sleep_entry(void)
-{
-    (void)gpio_force_hold_all();
-}
 
 void enter_deep_sleep(void)
 {
@@ -90,26 +73,6 @@ void enter_deep_sleep(void)
         )
     );
 
-    /*
-     * Register the final deep-sleep preparation callback.
-     *
-     * ESP_ERROR_CHECK will stop execution if registration fails.
-     */
-    ESP_ERROR_CHECK(
-        esp_deep_sleep_register_hook(
-            hold_all_pads_at_deep_sleep_entry
-        )
-    );
-
-    /*
-     * This message confirms that firmware containing the new hook
-     * was successfully flashed and is executing.
-     */
-    ESP_LOGI(
-        TAG,
-        "IRAM global pad-hold hook registered"
-    );
-
     ESP_LOGI(
         TAG,
         "Entering deep sleep. Press the GPIO%d button to wake up.",
@@ -117,8 +80,7 @@ void enter_deep_sleep(void)
     );
 
     /*
-     * Flush buffered output before the hook holds the UART and flash
-     * pads during deep-sleep preparation.
+     * Flush buffered output before entering deep sleep.
      */
     fflush(stdout);
 
