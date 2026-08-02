@@ -17,7 +17,30 @@ extern "C" esp_err_t face_detect_init(void)
         return ESP_OK;
     }
 
-    s_face_detect = new HumanFaceDetect();
+    s_face_detect = new HumanFaceDetect(
+        HumanFaceDetect::MSRMNP_S8_V1,
+        true
+    );
+
+    if (!s_face_detect) {
+        ESP_LOGE(TAG_FACE, "Failed to create HumanFaceDetect");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /*
+    * Stage 0: MSR generates face candidates.
+    * Stage 1: MNP validates candidates and produces five landmarks.
+    *
+    * Defaults are 0.50 for both stages. These initial tuning values increase
+    * recall while keeping the second stage stricter than the first.
+    */
+    s_face_detect->set_score_thr(0.40f, 0);
+    s_face_detect->set_score_thr(0.45f, 1);
+
+    ESP_LOGI(
+        TAG_FACE,
+        "HumanFaceDetect initialized: model=MSRMNP thresholds=[0.40, 0.45]"
+    );
     if (!s_face_detect) {
         ESP_LOGE(TAG_FACE, "Failed to create HumanFaceDetect");
         return ESP_FAIL;
