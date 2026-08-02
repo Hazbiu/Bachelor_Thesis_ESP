@@ -11,11 +11,6 @@ extern "C" {
 
 #define FACE_RECOG_MAX_NAME_LEN 32
 
-/*
- * Initializes recognition from one shared /sdcard/FACE.DB database.
- * The database is rebuilt automatically when the RGB enrollment dataset under
- * /sdcard/enroll/<person-name>/ changes.
- */
 esp_err_t face_recognition_init(void);
 
 esp_err_t face_recognition_recognize(

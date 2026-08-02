@@ -13,8 +13,6 @@ typedef struct {
     int x2;
     int y2;
     float score;
-    int keypoints[10];
-    int keypoint_count;
 } face_box_t;
 
 esp_err_t face_detect_init(void);

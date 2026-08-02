@@ -1,7 +1,5 @@
 #include "services/vision/face_detector.h"
 
-#include <algorithm>
-
 #include "esp_log.h"
 #include "human_face_detect.hpp"
 #include "diagnostics/core_trace.h"
@@ -68,15 +66,6 @@ static int face_detect_run_common(
         boxes[count].x2 = res.box[2];
         boxes[count].y2 = res.box[3];
         boxes[count].score = res.score;
-        boxes[count].keypoint_count = std::min((int)res.keypoint.size(), 10);
-
-        for (int i = 0; i < boxes[count].keypoint_count; i++) {
-            boxes[count].keypoints[i] = res.keypoint[i];
-        }
-
-        for (int i = boxes[count].keypoint_count; i < 10; i++) {
-            boxes[count].keypoints[i] = 0;
-        }
 
         count++;
     }

@@ -1,7 +1,6 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
-#include <string.h>
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_video_init.h"
@@ -91,249 +90,6 @@ static void draw_rect_rgb565(
     }
 }
 
-static void draw_filled_rect_rgb565(
-    uint16_t *fb,
-    uint32_t fb_w,
-    uint32_t fb_h,
-    int x1,
-    int y1,
-    int x2,
-    int y2,
-    uint16_t color)
-{
-    if (!fb || fb_w == 0 || fb_h == 0) {
-        return;
-    }
-
-    if (x1 > x2) {
-        int temp = x1;
-        x1 = x2;
-        x2 = temp;
-    }
-
-    if (y1 > y2) {
-        int temp = y1;
-        y1 = y2;
-        y2 = temp;
-    }
-
-    if (x2 < 0 || y2 < 0 || x1 >= (int)fb_w || y1 >= (int)fb_h) {
-        return;
-    }
-
-    if (x1 < 0) x1 = 0;
-    if (y1 < 0) y1 = 0;
-    if (x2 >= (int)fb_w) x2 = (int)fb_w - 1;
-    if (y2 >= (int)fb_h) y2 = (int)fb_h - 1;
-
-    for (int y = y1; y <= y2; y++) {
-        uint16_t *row = fb + y * fb_w;
-        for (int x = x1; x <= x2; x++) {
-            row[x] = color;
-        }
-    }
-}
-
-static void draw_thick_rect_rgb565(
-    uint16_t *fb,
-    uint32_t fb_w,
-    uint32_t fb_h,
-    int x1,
-    int y1,
-    int x2,
-    int y2,
-    int thickness,
-    uint16_t color)
-{
-    for (int inset = 0; inset < thickness; inset++) {
-        draw_rect_rgb565(
-            fb,
-            fb_w,
-            fb_h,
-            x1 + inset,
-            y1 + inset,
-            x2 - inset,
-            y2 - inset,
-            color
-        );
-    }
-}
-
-/* Five-pixel-wide uppercase font. Lowercase folder names are shown uppercase. */
-static const uint8_t s_font_5x7[36][7] = {
-    {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}, /* 0 */
-    {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}, /* 1 */
-    {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}, /* 2 */
-    {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E}, /* 3 */
-    {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}, /* 4 */
-    {0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E}, /* 5 */
-    {0x0E, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x0E}, /* 6 */
-    {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}, /* 7 */
-    {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}, /* 8 */
-    {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E}, /* 9 */
-    {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}, /* A */
-    {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}, /* B */
-    {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}, /* C */
-    {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E}, /* D */
-    {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}, /* E */
-    {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}, /* F */
-    {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}, /* G */
-    {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}, /* H */
-    {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}, /* I */
-    {0x01, 0x01, 0x01, 0x01, 0x11, 0x11, 0x0E}, /* J */
-    {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}, /* K */
-    {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}, /* L */
-    {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}, /* M */
-    {0x11, 0x19, 0x19, 0x15, 0x13, 0x13, 0x11}, /* N */
-    {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}, /* O */
-    {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}, /* P */
-    {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D}, /* Q */
-    {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}, /* R */
-    {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}, /* S */
-    {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}, /* T */
-    {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}, /* U */
-    {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04}, /* V */
-    {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A}, /* W */
-    {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11}, /* X */
-    {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}, /* Y */
-    {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}, /* Z */
-};
-
-static const uint8_t *font_5x7_glyph(char character)
-{
-    if (character >= 'a' && character <= 'z') {
-        character = (char)(character - 'a' + 'A');
-    }
-
-    if (character >= '0' && character <= '9') {
-        return s_font_5x7[character - '0'];
-    }
-
-    if (character >= 'A' && character <= 'Z') {
-        return s_font_5x7[10 + character - 'A'];
-    }
-
-    return NULL;
-}
-
-static void draw_large_text_rgb565(
-    uint16_t *fb,
-    uint32_t fb_w,
-    uint32_t fb_h,
-    int start_x,
-    int start_y,
-    const char *text,
-    int scale,
-    uint16_t color)
-{
-    if (!fb || !text || scale <= 0) {
-        return;
-    }
-
-    int cursor_x = start_x;
-
-    for (const char *cursor = text; *cursor != '\0'; cursor++) {
-        const uint8_t *glyph = font_5x7_glyph(*cursor);
-
-        if (glyph) {
-            for (int row = 0; row < 7; row++) {
-                for (int column = 0; column < 5; column++) {
-                    if ((glyph[row] & (1U << (4 - column))) == 0) {
-                        continue;
-                    }
-
-                    draw_filled_rect_rgb565(
-                        fb,
-                        fb_w,
-                        fb_h,
-                        cursor_x + column * scale,
-                        start_y + row * scale,
-                        cursor_x + (column + 1) * scale - 1,
-                        start_y + (row + 1) * scale - 1,
-                        color
-                    );
-                }
-            }
-        }
-
-        cursor_x += 6 * scale;
-    }
-}
-
-static void draw_face_label_rgb565(
-    uint16_t *fb,
-    uint32_t fb_w,
-    uint32_t fb_h,
-    int box_x2,
-    int box_y1,
-    const char *name,
-    uint16_t background_color)
-{
-    if (!name || name[0] == '\0') {
-        return;
-    }
-
-    const int scale = APP_FACE_LABEL_FONT_SCALE;
-    const int padding = 2 * scale;
-    const int text_width = (int)strlen(name) * 6 * scale - scale;
-    const int text_height = 7 * scale;
-    const int label_width = text_width + 2 * padding;
-    const int label_height = text_height + 2 * padding;
-
-    int label_x2 = box_x2;
-    if (label_x2 >= (int)fb_w) label_x2 = (int)fb_w - 1;
-    if (label_x2 < label_width - 1) label_x2 = label_width - 1;
-
-    int label_x1 = label_x2 - label_width + 1;
-    int label_y2 = box_y1 - 1;
-    int label_y1 = label_y2 - label_height + 1;
-
-    if (label_y1 < 0) {
-        label_y1 = box_y1;
-        label_y2 = label_y1 + label_height - 1;
-    }
-
-    draw_filled_rect_rgb565(
-        fb,
-        fb_w,
-        fb_h,
-        label_x1,
-        label_y1,
-        label_x2,
-        label_y2,
-        background_color
-    );
-
-    draw_large_text_rgb565(
-        fb,
-        fb_w,
-        fb_h,
-        label_x1 + padding,
-        label_y1 + padding,
-        name,
-        scale,
-        0xFFFF
-    );
-}
-
-static float face_box_iou(const face_box_t *a, const face_box_t *b)
-{
-    const int intersection_x1 = a->x1 > b->x1 ? a->x1 : b->x1;
-    const int intersection_y1 = a->y1 > b->y1 ? a->y1 : b->y1;
-    const int intersection_x2 = a->x2 < b->x2 ? a->x2 : b->x2;
-    const int intersection_y2 = a->y2 < b->y2 ? a->y2 : b->y2;
-    const int intersection_w = intersection_x2 > intersection_x1
-        ? intersection_x2 - intersection_x1 : 0;
-    const int intersection_h = intersection_y2 > intersection_y1
-        ? intersection_y2 - intersection_y1 : 0;
-    const int intersection_area = intersection_w * intersection_h;
-    const int area_a = (a->x2 - a->x1) * (a->y2 - a->y1);
-    const int area_b = (b->x2 - b->x1) * (b->y2 - b->y1);
-    const int union_area = area_a + area_b - intersection_area;
-
-    return union_area > 0 ? (float)intersection_area / (float)union_area : 0.0f;
-}
-
 static void camera_video_frame_operation(
     uint8_t *camera_buf,
     uint8_t camera_buf_index,
@@ -356,8 +112,6 @@ static lv_indev_t *launcher_touch_indev = NULL;
 static uint32_t frame_count = 0;
 
 static face_box_t last_boxes[APP_MAX_FACE_BOXES];
-static char last_face_names[APP_MAX_FACE_BOXES][FACE_RECOG_MAX_NAME_LEN];
-static float last_recognition_scores[APP_MAX_FACE_BOXES];
 static int last_face_count = 0;
 static int no_face_frames = 0;
 
@@ -836,43 +590,15 @@ static void camera_video_frame_operation(
                 update_count = APP_MAX_FACE_BOXES;
             }
 
-            face_box_t updated_boxes[APP_MAX_FACE_BOXES] = {0};
-            char updated_names[APP_MAX_FACE_BOXES][FACE_RECOG_MAX_NAME_LEN] = {{0}};
-            float updated_recognition_scores[APP_MAX_FACE_BOXES] = {0};
-            bool previous_box_used[APP_MAX_FACE_BOXES] = {false};
-
             for (int i = 0; i < update_count; i++) {
-                int matched_previous = -1;
-                float best_iou = 0.20f;
-
-                for (int previous = 0; previous < last_face_count; previous++) {
-                    if (previous_box_used[previous]) {
-                        continue;
-                    }
-
-                    const float iou = face_box_iou(&boxes[i], &last_boxes[previous]);
-                    if (iou > best_iou) {
-                        best_iou = iou;
-                        matched_previous = previous;
-                    }
-                }
-
-                updated_boxes[i] = boxes[i];
-
-                if (matched_previous >= 0) {
-                    previous_box_used[matched_previous] = true;
-                    updated_boxes[i].x1 = smooth_coord(last_boxes[matched_previous].x1, boxes[i].x1);
-                    updated_boxes[i].y1 = smooth_coord(last_boxes[matched_previous].y1, boxes[i].y1);
-                    updated_boxes[i].x2 = smooth_coord(last_boxes[matched_previous].x2, boxes[i].x2);
-                    updated_boxes[i].y2 = smooth_coord(last_boxes[matched_previous].y2, boxes[i].y2);
-                    snprintf(
-                        updated_names[i],
-                        sizeof(updated_names[i]),
-                        "%s",
-                        last_face_names[matched_previous]
-                    );
-                    updated_recognition_scores[i] =
-                        last_recognition_scores[matched_previous];
+                if (i < last_face_count) {
+                    last_boxes[i].x1 = smooth_coord(last_boxes[i].x1, boxes[i].x1);
+                    last_boxes[i].y1 = smooth_coord(last_boxes[i].y1, boxes[i].y1);
+                    last_boxes[i].x2 = smooth_coord(last_boxes[i].x2, boxes[i].x2);
+                    last_boxes[i].y2 = smooth_coord(last_boxes[i].y2, boxes[i].y2);
+                    last_boxes[i].score = boxes[i].score;
+                } else {
+                    last_boxes[i] = boxes[i];
                 }
 
                 ESP_LOGI(TAG,
@@ -884,7 +610,7 @@ static void camera_video_frame_operation(
                         boxes[i].x2,
                         boxes[i].y2);
 
-                if (run_recognition && boxes[i].score > APP_FACE_RECOG_MIN_SCORE) {
+                if (i == 0 && run_recognition && boxes[i].score > APP_FACE_RECOG_MIN_SCORE) {
                     char name[FACE_RECOG_MAX_NAME_LEN];
                     float recog_score = 0.0f;
 
@@ -919,43 +645,8 @@ static void camera_video_frame_operation(
                     }
 
                     diagnostics_ai_recognition_result(recog_ret, name, recog_score);
-
-                    if (recog_ret == ESP_OK) {
-                        snprintf(
-                            updated_names[i],
-                            sizeof(updated_names[i]),
-                            "%s",
-                            name
-                        );
-                        updated_recognition_scores[i] = recog_score;
-                    } else {
-                        snprintf(
-                            updated_names[i],
-                            sizeof(updated_names[i]),
-                            "%s",
-                            "unknown"
-                        );
-                        updated_recognition_scores[i] = 0.0f;
-                    }
-
-                    ESP_LOGI(
-                        TAG,
-                        "Face %d recognition: name=%s similarity=%.3f result=%s",
-                        i,
-                        updated_names[i],
-                        updated_recognition_scores[i],
-                        esp_err_to_name(recog_ret)
-                    );
                 }
             }
-
-            memcpy(last_boxes, updated_boxes, sizeof(updated_boxes));
-            memcpy(last_face_names, updated_names, sizeof(updated_names));
-            memcpy(
-                last_recognition_scores,
-                updated_recognition_scores,
-                sizeof(updated_recognition_scores)
-            );
 
             last_face_count = update_count;
             no_face_frames = 0;
@@ -964,8 +655,6 @@ static void camera_video_frame_operation(
 
             if (no_face_frames >= APP_FACE_BOX_HOLD_MISSES) {
                 last_face_count = 0;
-                memset(last_face_names, 0, sizeof(last_face_names));
-                memset(last_recognition_scores, 0, sizeof(last_recognition_scores));
             }
         }
     }
@@ -983,12 +672,7 @@ static void camera_video_frame_operation(
             int lcd_x2 = last_boxes[i].x2 * display_width / camera_buf_hes;
             int lcd_y2 = last_boxes[i].y2 * display_height / camera_buf_ves;
 
-            const bool recognized =
-                last_face_names[i][0] != '\0' &&
-                strcmp(last_face_names[i], "unknown") != 0;
-            const uint16_t overlay_color = recognized ? 0x07E0 : 0xF800;
-
-            draw_thick_rect_rgb565(
+            draw_rect_rgb565(
                 (uint16_t *)target_fb,
                 display_width,
                 display_height,
@@ -996,18 +680,7 @@ static void camera_video_frame_operation(
                 lcd_y1,
                 lcd_x2,
                 lcd_y2,
-                APP_FACE_BOX_THICKNESS,
-                overlay_color
-            );
-
-            draw_face_label_rgb565(
-                (uint16_t *)target_fb,
-                display_width,
-                display_height,
-                lcd_x2,
-                lcd_y1,
-                last_face_names[i],
-                overlay_color
+                0xF800
             );
         }
 
