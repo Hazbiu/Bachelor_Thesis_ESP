@@ -20,7 +20,6 @@
 #include "diagnostics/ai_pipeline_status.h"
 #include "app/app_boot.h"
 #include "app_ui.h"
-#include "pin_screen.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "bsp/display.h"
@@ -29,7 +28,6 @@
 #include "lv_demos.h"
 #include "power_save/wake_up.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "power_save/cpu_power.h"
 #include "config/app_config.h"
@@ -344,14 +342,6 @@ static void camera_video_frame_operation(
     size_t camera_buf_len,
     void *user_data);
 
-static void camera_video_frame_process(
-    uint8_t *camera_buf,
-    uint8_t camera_buf_index,
-    uint32_t camera_buf_hes,
-    uint32_t camera_buf_ves,
-    size_t camera_buf_len,
-    void *user_data);
-
 static const char *TAG = "app_main";
 
 static ppa_client_handle_t ppa_srm_handle = NULL;
@@ -377,249 +367,6 @@ i2c_master_bus_handle_t i2c_bus_;
 static bool dummy_draw_enabled = false;
 static bool application_start_requested = false;
 static bool dummy_mode_delay_flag = false;
-
-/*
- * Direct camera scanout and normal LVGL rendering must never own the display
- * at the same time. The frame callback and both authentication transitions
- * use this mutex to serialize the ownership hand-off.
- */
-static SemaphoreHandle_t display_mode_mutex;
-
-static portMUX_TYPE authentication_state_lock = portMUX_INITIALIZER_UNLOCKED;
-static bool pin_transition_pending;
-static bool pin_screen_active;
-static bool pin_rearm_required;
-static int pin_rearm_no_face_passes;
-static char pending_identity[FACE_RECOG_MAX_NAME_LEN];
-
-static bool authentication_blocks_camera(void)
-{
-    bool blocked;
-
-    portENTER_CRITICAL(&authentication_state_lock);
-    blocked = pin_transition_pending || pin_screen_active;
-    portEXIT_CRITICAL(&authentication_state_lock);
-
-    return blocked;
-}
-
-static void authentication_note_detection_result(int face_count)
-{
-    bool rearmed = false;
-
-    portENTER_CRITICAL(&authentication_state_lock);
-
-    if (face_count > 0) {
-        pin_rearm_no_face_passes = 0;
-    } else if (pin_rearm_required &&
-               !pin_transition_pending &&
-               !pin_screen_active) {
-        pin_rearm_no_face_passes++;
-
-        if (pin_rearm_no_face_passes >= APP_FACE_BOX_HOLD_MISSES) {
-            pin_rearm_required = false;
-            pin_rearm_no_face_passes = 0;
-            rearmed = true;
-        }
-    }
-
-    portEXIT_CRITICAL(&authentication_state_lock);
-
-    if (rearmed) {
-        ESP_LOGI(TAG, "Authentication rearmed after the face left the camera");
-    }
-}
-
-static void authentication_mark_transition_failed(void)
-{
-    portENTER_CRITICAL(&authentication_state_lock);
-    pin_transition_pending = false;
-    pin_screen_active = false;
-    portEXIT_CRITICAL(&authentication_state_lock);
-}
-
-static void camera_resume_task(void *arg)
-{
-    (void)arg;
-
-    /* Leave the success state visible briefly before restoring live video. */
-    vTaskDelay(pdMS_TO_TICKS(350));
-
-    if (app_sleep_is_requested()) {
-        vTaskDelete(NULL);
-        return;
-    }
-
-    if (!display_mode_mutex ||
-        xSemaphoreTake(display_mode_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        ESP_LOGE(TAG, "Timed out while waiting to restore camera display mode");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    pin_screen_hide();
-    vTaskDelay(pdMS_TO_TICKS(30));
-
-    esp_err_t ret = esp_lv_adapter_set_dummy_draw(disp, true);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "Could not restore camera display mode: %s",
-                 esp_err_to_name(ret));
-        xSemaphoreGive(display_mode_mutex);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    last_face_count = 0;
-    no_face_frames = 0;
-    memset(last_face_names, 0, sizeof(last_face_names));
-    memset(last_recognition_scores, 0, sizeof(last_recognition_scores));
-
-    dummy_draw_enabled = true;
-
-    portENTER_CRITICAL(&authentication_state_lock);
-    pin_transition_pending = false;
-    pin_screen_active = false;
-    portEXIT_CRITICAL(&authentication_state_lock);
-
-    app_sleep_notify_face_detected();
-    xSemaphoreGive(display_mode_mutex);
-
-    ESP_LOGI(TAG, "PIN accepted; camera display mode restored");
-    vTaskDelete(NULL);
-}
-
-static void pin_accepted_callback(void *user_data)
-{
-    (void)user_data;
-
-    if (app_sleep_is_requested()) {
-        return;
-    }
-
-    BaseType_t created = xTaskCreatePinnedToCore(
-        camera_resume_task,
-        "camera_resume",
-        4096,
-        NULL,
-        7,
-        NULL,
-        1);
-
-    if (created != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create camera-resume task");
-    }
-}
-
-static void pin_screen_transition_task(void *arg)
-{
-    (void)arg;
-
-    if (!display_mode_mutex ||
-        xSemaphoreTake(display_mode_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        ESP_LOGE(TAG, "Timed out while waiting to show PIN screen");
-        authentication_mark_transition_failed();
-        vTaskDelete(NULL);
-        return;
-    }
-
-    if (app_sleep_is_requested()) {
-        authentication_mark_transition_failed();
-        xSemaphoreGive(display_mode_mutex);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    esp_err_t ret = esp_lv_adapter_set_dummy_draw(disp, false);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "Could not enable LVGL PIN-screen mode: %s",
-                 esp_err_to_name(ret));
-        authentication_mark_transition_failed();
-        xSemaphoreGive(display_mode_mutex);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    dummy_draw_enabled = false;
-    vTaskDelay(pdMS_TO_TICKS(30));
-
-    ret = pin_screen_show(pending_identity, pin_accepted_callback, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Could not create PIN screen: %s", esp_err_to_name(ret));
-
-        esp_err_t restore_ret = esp_lv_adapter_set_dummy_draw(disp, true);
-        if (restore_ret == ESP_OK) {
-            dummy_draw_enabled = true;
-        } else {
-            ESP_LOGE(TAG,
-                     "Could not recover camera display mode: %s",
-                     esp_err_to_name(restore_ret));
-        }
-
-        authentication_mark_transition_failed();
-        xSemaphoreGive(display_mode_mutex);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    portENTER_CRITICAL(&authentication_state_lock);
-    pin_transition_pending = false;
-    pin_screen_active = true;
-    portEXIT_CRITICAL(&authentication_state_lock);
-
-    xSemaphoreGive(display_mode_mutex);
-    ESP_LOGI(TAG, "Camera paused; PIN screen is active");
-    vTaskDelete(NULL);
-}
-
-static void authentication_request_pin(const char *recognized_name)
-{
-    if (!recognized_name || recognized_name[0] == '\0' ||
-        strcmp(recognized_name, "unknown") == 0 ||
-        app_sleep_is_requested()) {
-        return;
-    }
-
-    bool reserved = false;
-
-    portENTER_CRITICAL(&authentication_state_lock);
-
-    if (!pin_transition_pending &&
-        !pin_screen_active &&
-        !pin_rearm_required) {
-        pin_transition_pending = true;
-        pin_rearm_required = true;
-        pin_rearm_no_face_passes = 0;
-        reserved = true;
-    }
-
-    portEXIT_CRITICAL(&authentication_state_lock);
-
-    if (!reserved) {
-        return;
-    }
-
-    const size_t identity_length = strnlen(
-        recognized_name,
-        sizeof(pending_identity) - 1);
-    memcpy(pending_identity, recognized_name, identity_length);
-    pending_identity[identity_length] = '\0';
-
-    BaseType_t created = xTaskCreatePinnedToCore(
-        pin_screen_transition_task,
-        "pin_screen",
-        6144,
-        NULL,
-        7,
-        NULL,
-        1);
-
-    if (created != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create PIN-screen transition task");
-        authentication_mark_transition_failed();
-    }
-}
 
 /*
  * Remove LVGL's performance and memory labels before the camera preview is
@@ -773,14 +520,6 @@ static void camera_application_start_task(void *arg)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Camera buffer setup failed: %s", esp_err_to_name(ret));
         app_ui_show_error("Camera-buffer setup failed. Restart the device.");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    display_mode_mutex = xSemaphoreCreateMutex();
-    if (!display_mode_mutex) {
-        ESP_LOGE(TAG, "Failed to create display-mode mutex");
-        app_ui_show_error("Display synchronization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -954,34 +693,8 @@ static void camera_video_frame_operation(
     size_t camera_buf_len,
     void *user_data)
 {
-    if (!display_mode_mutex ||
-        xSemaphoreTake(display_mode_mutex, 0) != pdTRUE) {
-        return;
-    }
 
-    camera_video_frame_process(
-        camera_buf,
-        camera_buf_index,
-        camera_buf_hes,
-        camera_buf_ves,
-        camera_buf_len,
-        user_data);
-
-    xSemaphoreGive(display_mode_mutex);
-}
-
-static void camera_video_frame_process(
-    uint8_t *camera_buf,
-    uint8_t camera_buf_index,
-    uint32_t camera_buf_hes,
-    uint32_t camera_buf_ves,
-    size_t camera_buf_len,
-    void *user_data)
-{
-
-    if (!dummy_draw_enabled ||
-        dummy_mode_delay_flag ||
-        authentication_blocks_camera())
+    if (!dummy_draw_enabled || dummy_mode_delay_flag)
     {
         return;
     }
@@ -1116,7 +829,6 @@ static void camera_video_frame_process(
 
         ESP_LOGI(TAG, "Detection ran, face_count=%d", face_count);
         diagnostics_ai_detection_result(face_count);
-        authentication_note_detection_result(face_count);
 
         if (face_count > 0) {
             /*
@@ -1223,12 +935,6 @@ static void camera_video_frame_process(
                             name
                         );
                         updated_recognition_scores[i] = recog_score;
-
-                        /*
-                         * A known face is the first factor. Only a successful
-                         * recognition may open the second-factor PIN screen.
-                         */
-                        authentication_request_pin(updated_names[i]);
                     } else {
                         snprintf(
                             updated_names[i],

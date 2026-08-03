@@ -4,7 +4,6 @@ idf_component_register(
         "app/app_boot.c"
         "app/app_sleep.c"
         "features/gui_screens/app_ui.c"
-        "features/gui_screens/pin_screen.c"
         "platform/camera/video_capture.c"
         "services/vision/face_detection/face_detector.cpp"
         "services/vision/face_recognition/face_recognizer.cpp"

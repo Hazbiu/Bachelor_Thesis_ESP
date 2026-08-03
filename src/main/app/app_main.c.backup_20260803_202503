@@ -600,11 +600,11 @@ static void authentication_request_pin(const char *recognized_name)
         return;
     }
 
-    const size_t identity_length = strnlen(
-        recognized_name,
-        sizeof(pending_identity) - 1);
-    memcpy(pending_identity, recognized_name, identity_length);
-    pending_identity[identity_length] = '\0';
+    snprintf(
+        pending_identity,
+        sizeof(pending_identity),
+        "%s",
+        recognized_name);
 
     BaseType_t created = xTaskCreatePinnedToCore(
         pin_screen_transition_task,
