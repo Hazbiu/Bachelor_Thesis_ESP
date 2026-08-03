@@ -27,13 +27,13 @@
 #include "bsp/esp-bsp.h"
 #include "lvgl.h"
 #include "lv_demos.h"
-#include "wake_up.h"
+#include "power_save/wake_up.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "power_save/cpu_power.h"
 #include "config/app_config.h"
-#include "app_sleep.h"
+#include "app/app_sleep.h"
 
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 
@@ -1349,4 +1349,3 @@ static void camera_video_frame_process(
         }
     }
 }
-

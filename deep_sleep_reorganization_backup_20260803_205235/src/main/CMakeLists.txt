@@ -2,16 +2,16 @@ idf_component_register(
     SRCS
         "app/app_main.c"
         "app/app_boot.c"
+        "app/app_sleep.c"
         "features/gui_screens/app_ui.c"
         "features/gui_screens/pin_screen.c"
-        "features/sleep_deep/app_sleep.c"
-        "features/sleep_deep/deep_sleep.c"
-        "features/sleep_deep/wake_up.c"
         "platform/camera/video_capture.c"
         "services/vision/face_detection/face_detector.cpp"
         "services/vision/face_recognition/face_recognizer.cpp"
         "diagnostics/cpu_stats.c"
         "diagnostics/ai_pipeline_status.c"
+        "power_save/deep_sleep.c"
+        "power_save/wake_up.c"
         "power_save/cpu_power.c"
         "power_save/component_wifi.c"
 	"power_save/component_ethernet.c"
@@ -20,6 +20,4 @@ idf_component_register(
     INCLUDE_DIRS
         "include"
         "features/gui_screens"
-        "features/sleep_deep"
 )
-
