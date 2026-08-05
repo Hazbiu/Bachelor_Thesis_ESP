@@ -1,25 +1,36 @@
 idf_component_register(
     SRCS
+        # Application orchestration
         "app/app_main.c"
         "app/app_boot.c"
-        "features/gui_screens/app_ui.c"
-        "features/gui_screens/pin_screen.c"
-        "features/sleep_deep/app_sleep.c"
-        "features/sleep_deep/deep_sleep.c"
-        "features/sleep_deep/wake_up.c"
+
+        # User interface
+        "ui/app_ui.c"
+        "ui/pin_screen.c"
+
+        # Camera platform
         "platform/camera/video_capture.c"
+
+        # Vision services
         "services/vision/face_detection/face_detector.cpp"
         "services/vision/face_recognition/face_recognizer.cpp"
+
+        # Power management and deep sleep
+        "power/app_sleep.c"
+        "power/deep_sleep.c"
+        "power/wake_up.c"
+        "power/cpu_power.c"
+        "power/component_wifi.c"
+        "power/component_ethernet.c"
+        "power/component_sdcard.c"
+        "power/component_audio.c"
+
+        # Diagnostics
         "diagnostics/cpu_stats.c"
         "diagnostics/ai_pipeline_status.c"
-        "power_save/cpu_power.c"
-        "power_save/component_wifi.c"
-	"power_save/component_ethernet.c"
-        "power_save/component_sdcard.c"
-        "power_save/component_audio.c"
+
     INCLUDE_DIRS
         "include"
-        "features/gui_screens"
-        "features/sleep_deep"
+        "ui"
+        "power"
 )
-

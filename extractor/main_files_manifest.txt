@@ -1,0 +1,47 @@
+Main files manifest
+Generated on: Mon Aug  3 09:14:32 PM CEST 2026
+Source: /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/main
+==================================================
+src/main/app/app_boot.c
+src/main/app/app_main.c
+src/main/CMakeLists.txt
+src/main/diagnostics/ai_pipeline_status.c
+src/main/diagnostics/cpu_stats.c
+src/main/features/camera_perview/camera_preview.c
+src/main/features/gui_screens/app_ui.c
+src/main/features/gui_screens/app_ui.h
+src/main/features/gui_screens/pin_screen.c
+src/main/features/gui_screens/pin_screen.h
+src/main/features/sleep_deep/app_sleep.c
+src/main/features/sleep_deep/app_sleep.h
+src/main/features/sleep_deep/deep_sleep.c
+src/main/features/sleep_deep/deep_sleep.h
+src/main/features/sleep_deep/wake_up.c
+src/main/features/sleep_deep/wake_up.h
+src/main/idf_component.yml
+src/main/include/app/app_boot.h
+src/main/include/config/app_config.h
+src/main/include/config/app_features.h
+src/main/include/diagnostics/ai_pipeline_status.h
+src/main/include/diagnostics/core_trace.h
+src/main/include/diagnostics/cpu_stats.h
+src/main/include/platform/camera/video_capture.h
+src/main/include/power_save/component_audio.h
+src/main/include/power_save/component_ethernet.h
+src/main/include/power_save/component_sdcard.h
+src/main/include/power_save/component_wifi.h
+src/main/include/power_save/cpu_power.h
+src/main/include/services/vision/face_detector.h
+src/main/include/services/vision/face_recognizer.h
+src/main/platform/camera/camera_runtime.c
+src/main/platform/camera/video_capture.c
+src/main/platform/display/display_platform.c
+src/main/platform/storage/sd_card_storage.c
+src/main/platform/storage/spiffs_storage.c
+src/main/power_save/component_audio.c
+src/main/power_save/component_ethernet.c
+src/main/power_save/component_sdcard.c
+src/main/power_save/component_wifi.c
+src/main/power_save/cpu_power.c
+src/main/services/vision/face_detection/face_detector.cpp
+src/main/services/vision/face_recognition/face_recognizer.cpp
