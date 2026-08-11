@@ -1,5 +1,6 @@
 #include "app_sleep.h"
 
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -7,18 +8,24 @@
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
 #include "config/app_config.h"
+#include "deep_sleep.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "light_sleep.h"
 #include "platform/camera/video_capture.h"
 #include "power_save/component_audio.h"
+#include "power_save/component_ethernet.h"
 #include "power_save/component_sdcard.h"
 #include "power_save/component_wifi.h"
-#include "deep_sleep.h"
-#include "power_save/component_ethernet.h"
+
+#if APP_LIGHT_SLEEP_TIMEOUT_MS >= APP_DEEP_SLEEP_TIMEOUT_MS
+#error "APP_LIGHT_SLEEP_TIMEOUT_MS must be smaller than APP_DEEP_SLEEP_TIMEOUT_MS"
+#endif
 
 static const char *TAG = "app_sleep";
 
@@ -27,6 +34,9 @@ static portMUX_TYPE s_sleep_request_lock =
 
 static bool s_sleep_requested;
 static bool s_inactivity_monitor_started;
+static bool s_light_sleep_in_progress;
+static bool s_ignore_button_until_release;
+static bool s_light_sleep_failed_until_activity;
 static int64_t s_last_face_detected_us;
 
 static app_sleep_prepare_callback_t s_prepare_callback;
@@ -44,7 +54,6 @@ static bool claim_sleep_request(void)
     }
 
     portEXIT_CRITICAL(&s_sleep_request_lock);
-
     return claimed;
 }
 
@@ -55,22 +64,17 @@ static bool claim_inactivity_sleep_request(void)
         (int64_t)APP_DEEP_SLEEP_TIMEOUT_MS * 1000LL;
     bool claimed = false;
 
-    /*
-     * The timeout check and the sleep claim share the same lock as the
-     * face-detection reset. A face therefore cannot reset the timer between
-     * the final timeout check and acceptance of the sleep request.
-     */
     portENTER_CRITICAL(&s_sleep_request_lock);
 
     if (s_inactivity_monitor_started &&
         !s_sleep_requested &&
+        !s_light_sleep_in_progress &&
         (now_us - s_last_face_detected_us) >= timeout_us) {
         s_sleep_requested = true;
         claimed = true;
     }
 
     portEXIT_CRITICAL(&s_sleep_request_lock);
-
     return claimed;
 }
 
@@ -100,9 +104,98 @@ void app_sleep_notify_face_detected(void)
 
     if (s_inactivity_monitor_started && !s_sleep_requested) {
         s_last_face_detected_us = now_us;
+        s_light_sleep_failed_until_activity = false;
     }
 
     portEXIT_CRITICAL(&s_sleep_request_lock);
+}
+
+static bool button_event_is_reserved_for_light_sleep(void)
+{
+    bool reserved;
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    reserved = s_light_sleep_in_progress || s_ignore_button_until_release;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    return reserved;
+}
+
+static void clear_button_release_guard(void)
+{
+    portENTER_CRITICAL(&s_sleep_request_lock);
+
+    if (!s_light_sleep_in_progress) {
+        s_ignore_button_until_release = false;
+    }
+
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+}
+
+static void finish_light_sleep(
+    esp_err_t light_ret,
+    esp_sleep_wakeup_cause_t wake_cause)
+{
+    const int64_t now_us = esp_timer_get_time();
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+
+    s_light_sleep_in_progress = false;
+
+    if (light_ret != ESP_OK) {
+        /*
+         * Avoid retrying Light-sleep every 100 ms after a configuration or
+         * hardware failure. Normal activity clears this guard.
+         */
+        s_light_sleep_failed_until_activity = true;
+    } else if (wake_cause == ESP_SLEEP_WAKEUP_GPIO) {
+        /*
+         * The GPIO3 press is an intentional Light-sleep wake. Consume that
+         * press so the higher-priority Deep-sleep button task cannot interpret
+         * the same electrical LOW level as a new Deep-sleep request.
+         */
+        s_ignore_button_until_release = true;
+
+        if (!s_sleep_requested) {
+            s_last_face_detected_us = now_us;
+            s_light_sleep_failed_until_activity = false;
+        }
+    }
+
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+}
+
+static bool claim_light_sleep_window(uint32_t *remaining_ms)
+{
+    const int64_t now_us = esp_timer_get_time();
+    const int64_t light_timeout_us =
+        (int64_t)APP_LIGHT_SLEEP_TIMEOUT_MS * 1000LL;
+    const int64_t deep_timeout_us =
+        (int64_t)APP_DEEP_SLEEP_TIMEOUT_MS * 1000LL;
+    bool claimed = false;
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+
+    const int64_t inactive_us = now_us - s_last_face_detected_us;
+
+    if (remaining_ms != NULL &&
+        s_inactivity_monitor_started &&
+        !s_sleep_requested &&
+        !s_light_sleep_in_progress &&
+        !s_light_sleep_failed_until_activity &&
+        inactive_us >= light_timeout_us &&
+        inactive_us < deep_timeout_us) {
+        const int64_t remaining_us = deep_timeout_us - inactive_us;
+
+        *remaining_ms =
+            (uint32_t)((remaining_us + 999LL) / 1000LL);
+        s_light_sleep_in_progress = true;
+        claimed = true;
+    }
+
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    return claimed;
 }
 
 static void run_sleep_sequence(const char *reason)
@@ -113,36 +206,18 @@ static void run_sleep_sequence(const char *reason)
         reason != NULL ? reason : "unknown source");
 
     /*
-     * Power-profile mode:
-     *
-     * Every stage is held for five seconds so that the Joulescope graph
-     * shows a stable current plateau after each subsystem is disabled.
-     *
-     * Total additional shutdown time: approximately 35 seconds.
+     * Power-profile mode: each stage is held for five seconds so that the
+     * Joulescope graph can show a stable plateau for every subsystem.
      */
-    ESP_LOGI(
-        "POWER_PROFILE",
-        "STEP 0: all systems active");
-
+    ESP_LOGI("POWER_PROFILE", "STEP 0: all systems active");
     vTaskDelay(pdMS_TO_TICKS(5000));
 
-    /*
-     * Stop new PPA, face-detection, face-recognition and LCD operations
-     * before shutting down the camera stream.
-     */
+    /* Stop new PPA, AI and display work before camera shutdown. */
     if (s_prepare_callback != NULL) {
         s_prepare_callback(s_prepare_user_data);
     }
 
-    /*
-     * STEP 1:
-     * Stop the V4L2 stream task, issue VIDIOC_STREAMOFF and close the
-     * camera file descriptor.
-     */
-    ESP_LOGI(
-        "POWER_PROFILE",
-        "STEP 1: stopping camera");
-
+    ESP_LOGI("POWER_PROFILE", "STEP 1: stopping camera");
     esp_err_t camera_ret = app_video_shutdown();
 
     if (camera_ret == ESP_OK) {
@@ -156,23 +231,14 @@ static void run_sleep_sequence(const char *reason)
 
     vTaskDelay(pdMS_TO_TICKS(5000));
 
-    /*
-     * STEP 2:
-     * Switch the backlight off, stop LVGL and touch, switch LCD output
-     * off, delete the LCD panel and MIPI-DSI bus, and release the
-     * 2.5 V DPHY LDO.
-     */
     ESP_LOGI(
         "POWER_PROFILE",
         "STEP 2: disabling display, touch and MIPI-DSI");
 
-    esp_err_t display_ret =
-        bsp_display_shutdown_for_deep_sleep();
+    esp_err_t display_ret = bsp_display_shutdown_for_deep_sleep();
 
     if (display_ret == ESP_OK) {
-        ESP_LOGI(
-            TAG,
-            "Display and MIPI-DSI shut down successfully");
+        ESP_LOGI(TAG, "Display and MIPI-DSI shut down successfully");
     } else {
         ESP_LOGW(
             TAG,
@@ -182,25 +248,11 @@ static void run_sleep_sequence(const char *reason)
 
     vTaskDelay(pdMS_TO_TICKS(5000));
 
-    /*
-     * STEP 3:
-     * Disable the board's external audio power amplifier.
-     *
-     * Waveshare ESP32-P4-NANO:
-     * GPIO53 HIGH = amplifier enabled
-     * GPIO53 LOW  = amplifier disabled
-     */
-    ESP_LOGI(
-        "POWER_PROFILE",
-        "STEP 3: disabling audio amplifier");
-
-    esp_err_t audio_ret =
-        component_audio_disable_for_deep_sleep();
+    ESP_LOGI("POWER_PROFILE", "STEP 3: disabling audio amplifier");
+    esp_err_t audio_ret = component_audio_disable_for_deep_sleep();
 
     if (audio_ret == ESP_OK) {
-        ESP_LOGI(
-            TAG,
-            "Audio amplifier shut down successfully");
+        ESP_LOGI(TAG, "Audio amplifier shut down successfully");
     } else {
         ESP_LOGW(
             TAG,
@@ -210,22 +262,11 @@ static void run_sleep_sequence(const char *reason)
 
     vTaskDelay(pdMS_TO_TICKS(5000));
 
-    /*
-     * STEP 4:
-     * Unmount the FAT filesystem and disconnect the microSD card's
-     * SD1_VDD power rail.
-     */
-    ESP_LOGI(
-        "POWER_PROFILE",
-        "STEP 4: disabling microSD");
-
-    esp_err_t sdcard_ret =
-        component_sdcard_disable_for_deep_sleep();
+    ESP_LOGI("POWER_PROFILE", "STEP 4: disabling microSD");
+    esp_err_t sdcard_ret = component_sdcard_disable_for_deep_sleep();
 
     if (sdcard_ret == ESP_OK) {
-        ESP_LOGI(
-            TAG,
-            "microSD unmounted and powered off successfully");
+        ESP_LOGI(TAG, "microSD unmounted and powered off successfully");
     } else {
         ESP_LOGW(
             TAG,
@@ -235,21 +276,11 @@ static void run_sleep_sequence(const char *reason)
 
     vTaskDelay(pdMS_TO_TICKS(5000));
 
-    /*
-     * STEP 5:
-     * Hold the external ESP32-C6 Wi-Fi coprocessor in reset.
-     */
-    ESP_LOGI(
-        "POWER_PROFILE",
-        "STEP 5: disabling ESP32-C6");
-
-    esp_err_t wifi_ret =
-        component_wifi_disable_for_deep_sleep();
+    ESP_LOGI("POWER_PROFILE", "STEP 5: disabling ESP32-C6");
+    esp_err_t wifi_ret = component_wifi_disable_for_deep_sleep();
 
     if (wifi_ret == ESP_OK) {
-        ESP_LOGI(
-            TAG,
-            "Wi-Fi coprocessor shut down successfully");
+        ESP_LOGI(TAG, "Wi-Fi coprocessor shut down successfully");
     } else {
         ESP_LOGW(
             TAG,
@@ -257,31 +288,16 @@ static void run_sleep_sequence(const char *reason)
             esp_err_to_name(wifi_ret));
     }
 
-    /*
-     * Keep the ESP32-C6 reset state active for five seconds so that
-     * its current contribution can be measured separately.
-     */
     vTaskDelay(pdMS_TO_TICKS(5000));
 
-    /*
-     * STEP 6:
-     * Hold the onboard IP101GRI Ethernet PHY in hardware reset.
-     *
-     * Waveshare ESP32-P4-NANO:
-     * GPIO51 HIGH = Ethernet PHY released
-     * GPIO51 LOW  = Ethernet PHY held in reset
-     */
     ESP_LOGI(
         "POWER_PROFILE",
         "STEP 6: disabling IP101GRI Ethernet PHY");
 
-    esp_err_t ethernet_ret =
-        component_ethernet_disable_for_deep_sleep();
+    esp_err_t ethernet_ret = component_ethernet_disable_for_deep_sleep();
 
     if (ethernet_ret == ESP_OK) {
-        ESP_LOGI(
-            TAG,
-            "Ethernet PHY held in reset successfully");
+        ESP_LOGI(TAG, "Ethernet PHY held in reset successfully");
     } else {
         ESP_LOGW(
             TAG,
@@ -289,29 +305,14 @@ static void run_sleep_sequence(const char *reason)
             esp_err_to_name(ethernet_ret));
     }
 
-    /*
-     * Keep the Ethernet-reset state active for five seconds so that
-     * its current contribution can be measured separately.
-     */
     vTaskDelay(pdMS_TO_TICKS(5000));
 
-    /*
-     * STEP 7:
-     * Configure the GPIO3 wake source and enter hardware deep sleep.
-     */
-    ESP_LOGI(
-        "POWER_PROFILE",
-        "STEP 7: entering ESP32-P4 deep sleep");
-
+    ESP_LOGI("POWER_PROFILE", "STEP 7: entering ESP32-P4 deep sleep");
     enter_deep_sleep();
 
-    /*
-     * Normally unreachable. Release the Ethernet PHY only when
-     * entering deep sleep unexpectedly fails.
-     */
+    /* The following recovery path is reached only if Deep-sleep fails. */
     esp_err_t ethernet_restore_ret =
         component_ethernet_restore_after_failed_sleep();
-
     if (ethernet_restore_ret != ESP_OK) {
         ESP_LOGW(
             TAG,
@@ -319,13 +320,8 @@ static void run_sleep_sequence(const char *reason)
             esp_err_to_name(ethernet_restore_ret));
     }
 
-    /*
-     * Normally unreachable. Restore the audio amplifier only when
-     * entering deep sleep unexpectedly fails.
-     */
     esp_err_t audio_restore_ret =
         component_audio_restore_after_failed_sleep();
-
     if (audio_restore_ret != ESP_OK) {
         ESP_LOGW(
             TAG,
@@ -333,13 +329,8 @@ static void run_sleep_sequence(const char *reason)
             esp_err_to_name(audio_restore_ret));
     }
 
-    /*
-     * Normally unreachable. Restore card power and remount it only when
-     * entering deep sleep unexpectedly fails.
-     */
     esp_err_t sdcard_restore_ret =
         component_sdcard_restore_after_failed_sleep();
-
     if (sdcard_restore_ret != ESP_OK) {
         ESP_LOGW(
             TAG,
@@ -347,13 +338,8 @@ static void run_sleep_sequence(const char *reason)
             esp_err_to_name(sdcard_restore_ret));
     }
 
-    /*
-     * Normally unreachable. Restore the ESP32-C6 only when entering
-     * deep sleep unexpectedly fails.
-     */
     esp_err_t wifi_restore_ret =
         component_wifi_restore_after_failed_sleep();
-
     if (wifi_restore_ret != ESP_OK) {
         ESP_LOGW(
             TAG,
@@ -361,14 +347,8 @@ static void run_sleep_sequence(const char *reason)
             esp_err_to_name(wifi_restore_ret));
     }
 
-    /*
-     * Reached only when esp_deep_sleep_start() unexpectedly returns.
-     */
     release_sleep_request();
-
-    ESP_LOGE(
-        TAG,
-        "Deep sleep request returned without entering sleep");
+    ESP_LOGE(TAG, "Deep sleep request returned without entering sleep");
 }
 
 void app_sleep_request(const char *reason)
@@ -385,8 +365,7 @@ static void deep_sleep_button_task(void *arg)
     (void)arg;
 
     gpio_config_t button_config = {
-        .pin_bit_mask =
-            1ULL << APP_DEEP_SLEEP_BUTTON_GPIO,
+        .pin_bit_mask = 1ULL << APP_DEEP_SLEEP_BUTTON_GPIO,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -400,23 +379,16 @@ static void deep_sleep_button_task(void *arg)
             TAG,
             "Failed to configure deep-sleep button: %s",
             esp_err_to_name(ret));
-
         vTaskDelete(NULL);
         return;
     }
 
-    /*
-     * A wake-up press may still be held while the application boots.
-     * Wait for release so one press cannot wake the board and then
-     * immediately put it back to sleep.
-     */
+    /* Do not reuse the wake-up press as a new sleep request after boot. */
     while (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
-        vTaskDelay(
-            pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
+        vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
     }
 
-    vTaskDelay(
-        pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
+    vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
 
     ESP_LOGI(
         TAG,
@@ -424,59 +396,100 @@ static void deep_sleep_button_task(void *arg)
         APP_DEEP_SLEEP_BUTTON_GPIO);
 
     while (true) {
-        if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
-            vTaskDelay(
-                pdMS_TO_TICKS(
-                    APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
+        /*
+         * GPIO3 is also the Light-sleep wake source. While Light-sleep is
+         * active, or until its wake press is released, the button belongs to
+         * the Light-sleep path and must not request Deep-sleep.
+         */
+        if (button_event_is_reserved_for_light_sleep()) {
+            if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) != 0) {
+                clear_button_release_guard();
+            }
 
-            if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
+            continue;
+        }
+
+        if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
+
+            if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0 &&
+                !button_event_is_reserved_for_light_sleep()) {
                 app_sleep_request("GPIO3 button");
 
-                /*
-                 * Reached only if entering deep sleep failed.
-                 */
-                while (
-                    gpio_get_level(
-                        APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
-                    vTaskDelay(
-                        pdMS_TO_TICKS(
-                            APP_DEEP_SLEEP_BUTTON_POLL_MS));
+                /* Reached only if entering Deep-sleep failed. */
+                while (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
+                    vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
                 }
             }
         }
 
-        vTaskDelay(
-            pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
+        vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
     }
 }
 
-static void deep_sleep_timeout_task(void *arg)
+static void inactivity_power_policy_task(void *arg)
 {
     (void)arg;
 
     ESP_LOGI(
         TAG,
-        "Face-inactivity monitor armed: timeout=%d ms",
+        "Inactivity power policy armed: light=%d ms deep=%d ms",
+        APP_LIGHT_SLEEP_TIMEOUT_MS,
         APP_DEEP_SLEEP_TIMEOUT_MS);
 
     while (!app_sleep_is_requested()) {
-        vTaskDelay(
-            pdMS_TO_TICKS(
-                APP_DEEP_SLEEP_INACTIVITY_POLL_MS));
+        vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_INACTIVITY_POLL_MS));
 
         if (claim_inactivity_sleep_request()) {
             ESP_LOGI(
                 TAG,
-                "No face detected for %d ms; entering deep sleep",
+                "No activity for %d ms; entering Deep-sleep",
                 APP_DEEP_SLEEP_TIMEOUT_MS);
 
-            run_sleep_sequence("30-second face inactivity");
+            run_sleep_sequence("face inactivity after Light-sleep stage");
             break;
+        }
+
+        uint32_t remaining_ms = 0;
+        if (!claim_light_sleep_window(&remaining_ms)) {
+            continue;
+        }
+
+        ESP_LOGI(
+            TAG,
+            "No activity for %d ms; entering Light-sleep for up to %" PRIu32 " ms",
+            APP_LIGHT_SLEEP_TIMEOUT_MS,
+            remaining_ms);
+
+        esp_err_t light_ret = enter_light_sleep(remaining_ms, true);
+        esp_sleep_wakeup_cause_t wake_cause =
+            light_sleep_get_last_wakeup_cause();
+
+        finish_light_sleep(light_ret, wake_cause);
+
+        if (light_ret != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "Light-sleep stage failed; staying active until Deep-sleep deadline: %s",
+                esp_err_to_name(light_ret));
+            continue;
+        }
+
+        if (wake_cause == ESP_SLEEP_WAKEUP_GPIO) {
+            ESP_LOGI(
+                TAG,
+                "GPIO3 woke Light-sleep; inactivity window restarted");
+        } else if (wake_cause == ESP_SLEEP_WAKEUP_TIMER) {
+            ESP_LOGI(
+                TAG,
+                "Light-sleep timer reached the Deep-sleep inactivity deadline");
         }
     }
 
     portENTER_CRITICAL(&s_sleep_request_lock);
     s_inactivity_monitor_started = false;
+    s_light_sleep_in_progress = false;
     portEXIT_CRITICAL(&s_sleep_request_lock);
 
     vTaskDelete(NULL);
@@ -499,10 +512,7 @@ esp_err_t app_sleep_start_button_monitor(
         1);
 
     if (created != pdPASS) {
-        ESP_LOGE(
-            TAG,
-            "Failed to create deep-sleep button task");
-
+        ESP_LOGE(TAG, "Failed to create deep-sleep button task");
         return ESP_ERR_NO_MEM;
     }
 
@@ -522,13 +532,16 @@ esp_err_t app_sleep_start_timeout(void)
 
     s_last_face_detected_us = start_time_us;
     s_inactivity_monitor_started = true;
+    s_light_sleep_in_progress = false;
+    s_ignore_button_until_release = false;
+    s_light_sleep_failed_until_activity = false;
 
     portEXIT_CRITICAL(&s_sleep_request_lock);
 
     BaseType_t created = xTaskCreate(
-        deep_sleep_timeout_task,
-        "face_inactivity",
-        2048,
+        inactivity_power_policy_task,
+        "inactivity_power",
+        3072,
         NULL,
         5,
         NULL);
@@ -538,13 +551,9 @@ esp_err_t app_sleep_start_timeout(void)
         s_inactivity_monitor_started = false;
         portEXIT_CRITICAL(&s_sleep_request_lock);
 
-        ESP_LOGE(
-            TAG,
-            "Failed to create face-inactivity task");
-
+        ESP_LOGE(TAG, "Failed to create inactivity power-policy task");
         return ESP_ERR_NO_MEM;
     }
 
     return ESP_OK;
 }
-

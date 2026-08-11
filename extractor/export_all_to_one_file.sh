@@ -69,12 +69,12 @@ fi
 ###############################################################################
 
 required_sleep_files=(
-    "${MAIN_DIR}/features/sleep_deep/app_sleep.c"
-    "${MAIN_DIR}/features/sleep_deep/app_sleep.h"
-    "${MAIN_DIR}/features/sleep_deep/deep_sleep.c"
-    "${MAIN_DIR}/features/sleep_deep/deep_sleep.h"
-    "${MAIN_DIR}/features/sleep_deep/wake_up.c"
-    "${MAIN_DIR}/features/sleep_deep/wake_up.h"
+    "${MAIN_DIR}/power/app_sleep.c"
+    "${MAIN_DIR}/power/app_sleep.h"
+    "${MAIN_DIR}/power/deep_sleep.c"
+    "${MAIN_DIR}/power/deep_sleep.h"
+    "${MAIN_DIR}/power/wake_up.c"
+    "${MAIN_DIR}/power/wake_up.h"
 )
 
 for file in "${required_sleep_files[@]}"; do

@@ -15,8 +15,9 @@ idf_component_register(
         "services/vision/face_detection/face_detector.cpp"
         "services/vision/face_recognition/face_recognizer.cpp"
 
-        # Power management and deep sleep
+        # Power management and sleep modes
         "power/app_sleep.c"
+        "power/light_sleep.c"
         "power/deep_sleep.c"
         "power/wake_up.c"
         "power/cpu_power.c"
