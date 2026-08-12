@@ -61,6 +61,16 @@ dependencies:
     - esp32s3
     - esp32s31
     version: 3.3.9
+  espressif/esp-nn:
+    component_hash: d341d40c8a135158f2bd47bd3c956bb8eda43358cd555cd887b410310a14c547
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.2'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.2.5
   espressif/esp_cam_sensor:
     dependencies: []
     source:
@@ -534,6 +544,7 @@ dependencies:
 direct_dependencies:
 - espressif/cmake_utilities
 - espressif/esp-dl
+- espressif/esp-nn
 - espressif/esp_codec_dev
 - espressif/esp_lcd_ek79007
 - espressif/esp_lcd_st7701
@@ -551,6 +562,6 @@ direct_dependencies:
 - waveshare/esp_lcd_ili9881c
 - waveshare/esp_lcd_jd9365
 - waveshare/esp_lcd_ota7290b
-manifest_hash: 7b778a25e1e6f11e5a3f0038d6932f20117101a057a227de7ea017a80ea0a501
+manifest_hash: c6013490bd31445c4e72bd9c9c93161b4215c52e6e4a1951911d54477bb48406
 target: esp32p4
 version: 2.0.0

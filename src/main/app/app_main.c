@@ -680,8 +680,24 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
 
     ESP_LOGI(TAG, "Suspending camera and MIPI-DSI for Light-sleep");
 
-    /* Prevent the frame callback from beginning any new PPA/AI/LCD work. */
+    /*
+     * Establish an exclusive display barrier before asking the video task to
+     * exit. A frame callback already in progress is allowed to finish; after
+     * this mutex is acquired, every new callback fails its non-blocking mutex
+     * attempt and returns immediately. This removes the stop-vs-display race
+     * that previously caused the video-stop semaphore to time out.
+     */
+    if (xSemaphoreTake(
+            display_mode_mutex,
+            pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGE(
+            TAG,
+            "Timed out waiting for active frame callback before Light-sleep");
+        return ESP_ERR_TIMEOUT;
+    }
+
     dummy_mode_delay_flag = true;
+    ESP_LOGI(TAG, "Light-sleep display barrier acquired; stopping camera");
 
     esp_err_t ret = app_video_stream_task_stop(video_cam_fd0);
     if (ret != ESP_OK) {
@@ -689,14 +705,8 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
             TAG,
             "Camera stream did not stop for Light-sleep: %s",
             esp_err_to_name(ret));
+        xSemaphoreGive(display_mode_mutex);
         return ret;
-    }
-
-    if (xSemaphoreTake(
-            display_mode_mutex,
-            pdMS_TO_TICKS(2000)) != pdTRUE) {
-        ESP_LOGE(TAG, "Timed out waiting for display ownership before Light-sleep");
-        return ESP_ERR_TIMEOUT;
     }
 
     display_backlight_enabled = false;
@@ -1205,7 +1215,15 @@ static void camera_video_frame_process(
                 pcTaskGetName(NULL),
                 xTaskGetCoreID(xTaskGetCurrentTaskHandle()));
     }
-    if ((frame_count % APP_FACE_DETECT_INTERVAL_FRAMES) == 0) {
+    /*
+     * The interval grows as inactivity approaches Light-sleep. This reduces
+     * CPU/AI duty cycle while face detection remains available throughout the
+     * complete active window.
+     */
+    const uint32_t detect_interval_frames =
+        cpu_power_get_face_detect_interval_frames();
+
+    if ((frame_count % detect_interval_frames) == 0) {
         face_box_t boxes[APP_MAX_FACE_BOXES];
         diagnostics_ai_frame_sent_to_detector();
 

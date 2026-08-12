@@ -111,24 +111,23 @@ uint32_t app_video_get_buf_size(void);
 esp_err_t app_video_stream_task_start(int video_fd, int core_id, void *user_data);
 
 /**
- * @brief Restart the video stream task.
+ * @brief Resume the persistent video stream task.
  *
- * This function stops the current video stream task and restarts it with the specified
- * video device file descriptor. It first sets the necessary buffers for the video stream,
- * then attempts to start the video stream task on the specified core.
+ * Restores the capture buffers, starts V4L2 streaming, and resumes the same
+ * FreeRTOS video task that was paused by app_video_stream_task_stop().
  *
  * @param video_fd File descriptor for the video device.
  * @return
- * - ESP_OK on successful restart of the video stream task.
- * - ESP_FAIL if there was an error while restarting the task.
+ * - ESP_OK on successful stream/task resume.
+ * - ESP_FAIL if buffers or streaming could not be restored.
  */
 esp_err_t app_video_stream_task_restart(int video_fd);
 
 /**
  * @brief Stop the video stream task.
  *
- * Deletes the video stream task if it is running and stops the video stream.
- * Ensures the task handle is reset to NULL after deletion.
+ * Stops V4L2 streaming and moves the persistent video task into a controlled
+ * suspended state. The task is resumed by app_video_stream_task_restart().
  *
  * @param video_fd File descriptor for the video device.
  * @return ESP_OK on success.

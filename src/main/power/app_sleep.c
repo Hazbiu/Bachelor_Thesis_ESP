@@ -24,6 +24,7 @@
 #include "power_save/component_ethernet.h"
 #include "power_save/component_sdcard.h"
 #include "power_save/component_wifi.h"
+#include "power_save/cpu_power.h"
 
 #if APP_LIGHT_SLEEP_TIMEOUT_MS >= APP_DEEP_SLEEP_TIMEOUT_MS
 #error "APP_LIGHT_SLEEP_TIMEOUT_MS must be smaller than APP_DEEP_SLEEP_TIMEOUT_MS"
@@ -144,15 +145,37 @@ bool app_sleep_is_requested(void)
 void app_sleep_notify_face_detected(void)
 {
     const int64_t now_us = esp_timer_get_time();
+    bool activity_accepted = false;
 
     portENTER_CRITICAL(&s_sleep_request_lock);
 
     if (s_inactivity_monitor_started && !s_sleep_requested) {
         s_last_face_detected_us = now_us;
         s_light_sleep_failed_until_activity = false;
+        activity_accepted = true;
     }
 
     portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    if (activity_accepted) {
+        cpu_power_notify_activity();
+    }
+}
+
+static uint32_t get_inactivity_ms(void)
+{
+    const int64_t now_us = esp_timer_get_time();
+    int64_t inactive_us = 0;
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+
+    if (s_inactivity_monitor_started && now_us > s_last_face_detected_us) {
+        inactive_us = now_us - s_last_face_detected_us;
+    }
+
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    return (uint32_t)(inactive_us / 1000LL);
 }
 
 static bool button_event_is_reserved_for_light_sleep(void)
@@ -183,6 +206,7 @@ static void finish_light_sleep(
     bool user_activity)
 {
     const int64_t now_us = esp_timer_get_time();
+    bool restore_performance = false;
 
     portENTER_CRITICAL(&s_sleep_request_lock);
 
@@ -206,10 +230,15 @@ static void finish_light_sleep(
         if (!s_sleep_requested) {
             s_last_face_detected_us = now_us;
             s_light_sleep_failed_until_activity = false;
+            restore_performance = true;
         }
     }
 
     portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    if (restore_performance) {
+        cpu_power_notify_activity();
+    }
 }
 
 static bool claim_light_sleep_window(uint32_t *remaining_ms)
@@ -484,6 +513,12 @@ static void inactivity_power_policy_task(void *arg)
     while (!app_sleep_is_requested()) {
         vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_INACTIVITY_POLL_MS));
 
+        /*
+         * Apply the staged active CPU policy and reduce AI duty cycle before
+         * entering the coordinated Light-sleep window.
+         */
+        cpu_power_update_inactivity(get_inactivity_ms());
+
         if (claim_inactivity_sleep_request()) {
             ESP_LOGI(
                 TAG,
@@ -693,6 +728,8 @@ esp_err_t app_sleep_start_timeout(void)
     s_light_sleep_failed_until_activity = false;
 
     portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    cpu_power_notify_activity();
 
     BaseType_t created = xTaskCreate(
         inactivity_power_policy_task,

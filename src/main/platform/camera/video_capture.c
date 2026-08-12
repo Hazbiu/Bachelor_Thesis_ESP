@@ -32,7 +32,6 @@ static const char *TAG = "app_video";
 #define VIDEO_TASK_STACK_SIZE             (4 * 1024)
 #define VIDEO_TASK_PRIORITY               4
 #define VIDEO_STOP_TIMEOUT_MS             1500
-#define VIDEO_CLOSE_GRACE_TIMEOUT_MS      250
 #define VIDEO_NO_FRAME_RETRY_DELAY_MS     2
 #define VIDEO_ERROR_RETRY_DELAY_MS        10
 
@@ -51,6 +50,8 @@ typedef struct {
     TaskHandle_t video_stream_task_handle;
     uint8_t video_task_core_id;
     volatile bool video_task_delete;
+    volatile bool video_task_paused;
+    volatile bool video_stop_nudge_complete;
     volatile bool video_streaming;
     SemaphoreHandle_t video_stopped_sem;
 
@@ -78,6 +79,8 @@ static void reset_camera_runtime_state(void)
     app_camera_video.video_fd = -1;
     app_camera_video.video_streaming = false;
     app_camera_video.video_task_delete = false;
+    app_camera_video.video_task_paused = false;
+    app_camera_video.video_stop_nudge_complete = false;
     app_camera_video.video_stream_task_handle = NULL;
     app_camera_video.camera_buf_count = 0;
     app_camera_video.camera_buf_size = 0;
@@ -500,92 +503,125 @@ static void video_stream_task(void *arg)
         xPortGetCoreID(),
         pcTaskGetName(NULL));
 
-    while (!app_camera_video.video_task_delete) {
-        esp_err_t ret =
-            video_receive_video_frame(video_fd);
+    for (;;) {
+        while (!app_camera_video.video_task_delete) {
+            esp_err_t ret =
+                video_receive_video_frame(video_fd);
 
-        if (ret == ESP_ERR_NOT_FOUND) {
+            if (ret == ESP_ERR_NOT_FOUND) {
+                /*
+                 * No frame is ready yet. Yield briefly and then check the
+                 * shutdown flag again.
+                 */
+                vTaskDelay(
+                    pdMS_TO_TICKS(
+                        VIDEO_NO_FRAME_RETRY_DELAY_MS));
+                continue;
+            }
+
+            if (ret == ESP_ERR_INVALID_STATE) {
+                if (app_camera_video.video_task_delete) {
+                    break;
+                }
+
+                taskYIELD();
+                continue;
+            }
+
+            if (ret != ESP_OK) {
+                if (app_camera_video.video_task_delete) {
+                    break;
+                }
+
+                vTaskDelay(
+                    pdMS_TO_TICKS(
+                        VIDEO_ERROR_RETRY_DELAY_MS));
+                continue;
+            }
+
             /*
-             * No frame is ready yet. Yield briefly and then check the
-             * shutdown flag again.
+             * Once shutdown is requested, do not process or requeue another
+             * completed frame.
              */
-            vTaskDelay(
-                pdMS_TO_TICKS(
-                    VIDEO_NO_FRAME_RETRY_DELAY_MS));
-            continue;
-        }
-
-        if (ret == ESP_ERR_INVALID_STATE) {
             if (app_camera_video.video_task_delete) {
                 break;
             }
 
-            taskYIELD();
-            continue;
-        }
+            video_operation_video_frame();
 
-        if (ret != ESP_OK) {
             if (app_camera_video.video_task_delete) {
                 break;
             }
 
-            vTaskDelay(
-                pdMS_TO_TICKS(
-                    VIDEO_ERROR_RETRY_DELAY_MS));
-            continue;
+            ret = video_free_video_frame(video_fd);
+            if (ret != ESP_OK) {
+                if (!app_camera_video.video_task_delete) {
+                    ESP_LOGE(
+                        TAG,
+                        "Failed to return video frame to the driver");
+                }
+                break;
+            }
+        }
+
+        const bool requested_stop = app_camera_video.video_task_delete;
+
+        /*
+         * During a requested stop, app_video_stream_task_stop() already
+         * executes VIDIOC_STREAMOFF. If capture failed independently, this
+         * task remains responsible for stopping the device.
+         */
+        if (!requested_stop) {
+            esp_err_t stop_ret = video_stream_stop(video_fd);
+
+            if (stop_ret != ESP_OK) {
+                ESP_LOGW(TAG, "Video stream did not stop cleanly");
+            }
         }
 
         /*
-         * Once shutdown is requested, do not process or requeue another
-         * completed frame.
+         * The controller must finish its wake/abort calls before this task
+         * suspends itself; otherwise a late vTaskResume() could accidentally
+         * undo the intentional Light-sleep pause.
          */
-        if (app_camera_video.video_task_delete) {
-            break;
+        while (requested_stop &&
+               !app_camera_video.video_stop_nudge_complete) {
+            taskYIELD();
         }
 
-        video_operation_video_frame();
+        app_camera_video.video_task_delete = false;
+        app_camera_video.video_task_paused = true;
 
-        if (app_camera_video.video_task_delete) {
-            break;
+        if (app_camera_video.video_stopped_sem != NULL) {
+            xSemaphoreGive(app_camera_video.video_stopped_sem);
         }
 
-        ret = video_free_video_frame(video_fd);
-        if (ret != ESP_OK) {
-            if (!app_camera_video.video_task_delete) {
-                ESP_LOGE(
-                    TAG,
-                    "Failed to return video frame to the driver");
-            }
-            break;
-        }
+        ESP_LOGI(TAG, "VIDEO-STOP-V6: video task paused");
+        vTaskSuspend(NULL);
+
+        app_camera_video.video_task_paused = false;
+        ESP_LOGI(TAG, "VIDEO-STOP-V6: video task resumed");
     }
+}
+
+static void wake_video_task_for_stop(TaskHandle_t video_task)
+{
+    if (video_task == NULL) {
+        return;
+    }
+
+#if (INCLUDE_xTaskAbortDelay == 1)
+    if (xTaskAbortDelay(video_task) == pdPASS) {
+        ESP_LOGI(TAG, "VIDEO-STOP-V6: aborted blocked capture wait");
+    }
+#endif
 
     /*
-     * During a requested shutdown, app_video_stream_task_stop()
-     * already executes VIDIOC_STREAMOFF. Do not execute it again
-     * from this task, because two simultaneous STREAMOFF calls can
-     * race and produce EBUSY (errno 16).
-     *
-     * If the task exits independently because of a streaming error,
-     * it remains responsible for stopping the stream.
+     * Some ESP-Video 0.8 capture paths can report the task as Suspended after
+     * a restart. vTaskResume() is harmless for a Ready/Running/Blocked task and
+     * releases a genuinely suspended capture wait.
      */
-    if (!app_camera_video.video_task_delete) {
-        esp_err_t stop_ret = video_stream_stop(video_fd);
-
-        if (stop_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Video stream did not stop cleanly");
-        }
-    }
-    
-    app_camera_video.video_task_delete = false;
-    app_camera_video.video_stream_task_handle = NULL;
-
-    if (app_camera_video.video_stopped_sem != NULL) {
-        xSemaphoreGive(app_camera_video.video_stopped_sem);
-    }
-
-    ESP_LOGI(TAG, "Video stream task stopped");
-    vTaskDelete(NULL);
+    vTaskResume(video_task);
 }
 
 esp_err_t app_video_stream_task_start(
@@ -620,6 +656,8 @@ esp_err_t app_video_stream_task_start(
         app_camera_video.video_stopped_sem);
 
     app_camera_video.video_task_delete = false;
+    app_camera_video.video_task_paused = false;
+    app_camera_video.video_stop_nudge_complete = false;
     app_camera_video.video_task_core_id = core_id;
     app_camera_video.video_task_user_data = user_data;
     app_camera_video.video_fd = video_fd;
@@ -662,10 +700,11 @@ esp_err_t app_video_stream_task_restart(int video_fd)
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (app_camera_video.video_stream_task_handle != NULL) {
+    if (app_camera_video.video_stream_task_handle == NULL ||
+        !app_camera_video.video_task_paused) {
         ESP_LOGE(
             TAG,
-            "Cannot restart while video stream task is running");
+            "Cannot resume because video stream task is not paused");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -679,17 +718,21 @@ esp_err_t app_video_stream_task_restart(int video_fd)
         return ret;
     }
 
-    ret = app_video_stream_task_start(
-        video_fd,
-        app_camera_video.video_task_core_id,
-        app_camera_video.video_task_user_data);
+    app_camera_video.video_task_delete = false;
+    app_camera_video.video_stop_nudge_complete = false;
+
+    ret = video_stream_start(video_fd);
 
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
-            "Failed to restart video stream task");
+            "Failed to restart video stream");
         return ret;
     }
+
+    ESP_LOGI(TAG, "VIDEO-STOP-V6: resuming persistent video task");
+    app_camera_video.video_task_paused = false;
+    vTaskResume(app_camera_video.video_stream_task_handle);
 
     return ESP_OK;
 }
@@ -701,6 +744,10 @@ esp_err_t app_video_stream_task_stop(int video_fd)
     }
 
     if (app_camera_video.video_stream_task_handle == NULL) {
+        return ESP_OK;
+    }
+
+    if (app_camera_video.video_task_paused) {
         return ESP_OK;
     }
 
@@ -727,6 +774,7 @@ esp_err_t app_video_stream_task_stop(int video_fd)
      * the flag within a few milliseconds even if STREAMOFF does not wake the
      * driver immediately.
      */
+    app_camera_video.video_stop_nudge_complete = false;
     app_camera_video.video_task_delete = true;
 
     esp_err_t streamoff_ret =
@@ -738,16 +786,24 @@ esp_err_t app_video_stream_task_stop(int video_fd)
             "STREAMOFF failed while requesting task shutdown");
     }
 
+    /*
+     * STREAMOFF does not consistently release the capture task after a second
+     * Light-sleep cycle with ESP-Video 0.8. Wake either kind of RTOS wait, then
+     * allow the task to enter its controlled persistent pause.
+     */
+    wake_video_task_for_stop(app_camera_video.video_stream_task_handle);
+    app_camera_video.video_stop_nudge_complete = true;
+
     if (xSemaphoreTake(
             app_camera_video.video_stopped_sem,
             pdMS_TO_TICKS(VIDEO_STOP_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGE(
             TAG,
-            "Timed out while stopping video stream task");
+            "VIDEO-STOP-V6: timed out while pausing video stream task");
 
         /*
          * Keep video_task_delete asserted. app_video_shutdown() will close
-         * the file descriptor and perform one final bounded wait.
+         * the file descriptor before deleting the remaining task.
          */
         return ESP_ERR_TIMEOUT;
     }
@@ -798,37 +854,16 @@ esp_err_t app_video_shutdown(void)
     app_camera_video.video_streaming = false;
 
     /*
-     * Closing the descriptor should release a task that was still inside a
-     * driver operation. Give it one final bounded interval to signal exit.
+     * Light-sleep preserves the paused task, but Deep-sleep closes the camera
+     * permanently. Explicitly suspend before deletion so another core cannot
+     * be executing the task while its resources are released.
      */
-    if (app_camera_video.video_stream_task_handle != NULL &&
-        app_camera_video.video_stopped_sem != NULL) {
-        if (xSemaphoreTake(
-                app_camera_video.video_stopped_sem,
-                pdMS_TO_TICKS(
-                    VIDEO_CLOSE_GRACE_TIMEOUT_MS)) == pdTRUE) {
-            ESP_LOGW(
-                TAG,
-                "Video task exited after forced device close");
-        } else {
-            /*
-             * Deep sleep follows immediately and resets the complete CSI
-             * subsystem. Delete the application task so no task can access
-             * the now-closed descriptor during the remaining shutdown steps.
-             */
-            TaskHandle_t stuck_task =
-                app_camera_video.video_stream_task_handle;
+    TaskHandle_t video_task = app_camera_video.video_stream_task_handle;
+    app_camera_video.video_stream_task_handle = NULL;
 
-            app_camera_video.video_stream_task_handle = NULL;
-            app_camera_video.video_task_delete = false;
-
-            if (stuck_task != NULL) {
-                ESP_LOGW(
-                    TAG,
-                    "Force deleting video task after shutdown timeout");
-                vTaskDelete(stuck_task);
-            }
-        }
+    if (video_task != NULL) {
+        vTaskSuspend(video_task);
+        vTaskDelete(video_task);
     }
 
     reset_camera_runtime_state();
