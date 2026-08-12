@@ -1,4 +1,5 @@
 #include "sdkconfig.h"
+#include <stdbool.h>
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "esp_err.h"
@@ -147,6 +148,7 @@ static esp_lcd_panel_io_handle_t io_handle = NULL;
 static esp_lcd_dsi_bus_handle_t display_mipi_dsi_bus = NULL;
 static esp_lcd_panel_io_handle_t display_touch_io_handle = NULL;
 static esp_ldo_channel_handle_t display_phy_pwr_chan = NULL;
+static bool display_adapter_initialized = false;
 
 sdmmc_card_t *bsp_sdcard = NULL; // Global uSD card handler
 
@@ -1051,7 +1053,17 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
 static lv_indev_t *bsp_display_indev_init(const bsp_display_cfg_t *cfg, lv_display_t *disp)
 {
     assert(cfg != NULL);
-    BSP_ERROR_CHECK_RETURN_NULL(bsp_touch_new(cfg, &tp));
+
+    /*
+     * Manual Light-sleep keeps the GT911 handle and its I2C panel-IO alive so
+     * the sleeping application can poll for a touch. Reuse that retained
+     * handle when rebuilding LVGL/MIPI-DSI after wake.
+     */
+    if (tp == NULL)
+    {
+        BSP_ERROR_CHECK_RETURN_NULL(bsp_touch_new(cfg, &tp));
+    }
+
     assert(tp);
 
     /* Add touch input (for selected screen) */
@@ -1078,7 +1090,24 @@ lv_display_t *bsp_display_start_with_config(bsp_display_cfg_t *cfg)
     lv_display_t *disp;
 
     assert(cfg != NULL);
-    BSP_ERROR_CHECK_RETURN_NULL(esp_lv_adapter_init(&cfg->lv_adapter_cfg));
+
+    if (display_adapter_initialized)
+    {
+        ESP_LOGE(TAG, "Display adapter is already initialized");
+        return NULL;
+    }
+
+    esp_err_t adapter_ret = esp_lv_adapter_init(&cfg->lv_adapter_cfg);
+    if (adapter_ret != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "LVGL adapter initialization failed: %s",
+            esp_err_to_name(adapter_ret));
+        return NULL;
+    }
+
+    display_adapter_initialized = true;
 
     BSP_ERROR_CHECK_RETURN_NULL(bsp_display_brightness_init());
 
@@ -1091,10 +1120,22 @@ lv_display_t *bsp_display_start_with_config(bsp_display_cfg_t *cfg)
     return disp;
 }
 
-esp_err_t bsp_display_shutdown_for_deep_sleep(void)
+static esp_err_t bsp_display_shutdown_internal(bool preserve_touch)
 {
     esp_err_t first_error = ESP_OK;
     esp_err_t ret;
+
+    if (!display_adapter_initialized &&
+        tp == NULL &&
+        panel_handle == NULL &&
+        io_handle == NULL &&
+        display_touch_io_handle == NULL &&
+        display_mipi_dsi_bus == NULL &&
+        display_phy_pwr_chan == NULL)
+    {
+        ESP_LOGI(TAG, "Display stack is already shut down");
+        return ESP_OK;
+    }
 
     ret = bsp_display_backlight_off();
     if (ret != ESP_OK)
@@ -1122,34 +1163,39 @@ esp_err_t bsp_display_shutdown_for_deep_sleep(void)
      * initialized here. Calling deinit directly avoids depending on a
      * version-specific esp_lv_adapter_is_initialized() helper.
      */
-    ret = esp_lv_adapter_deinit();
-
-    if (ret != ESP_OK)
+    if (display_adapter_initialized)
     {
-        ESP_LOGE(
-            TAG,
-            "LVGL adapter deinitialization failed: %s",
-            esp_err_to_name(ret));
+        ret = esp_lv_adapter_deinit();
 
-        if (first_error == ESP_OK)
+        if (ret != ESP_OK)
         {
-            first_error = ret;
+            ESP_LOGE(
+                TAG,
+                "LVGL adapter deinitialization failed: %s",
+                esp_err_to_name(ret));
+
+            if (first_error == ESP_OK)
+            {
+                first_error = ret;
+            }
         }
-    }
-    else
-    {
-        ESP_LOGI(TAG, "LVGL adapter deinitialized");
-        disp_indev = NULL;
+        else
+        {
+            ESP_LOGI(TAG, "LVGL adapter deinitialized");
+            display_adapter_initialized = false;
+            disp_indev = NULL;
+        }
     }
 
     /*
-     * Delete only the GT911 software driver.
+     * Deep-sleep deletes the GT911 software driver. Manual Light-sleep keeps
+     * both this handle and its I2C panel-I/O alive for timer-based polling.
      *
      * Do not call esp_lcd_touch_enter_sleep(). This board does not expose
      * the GT911 interrupt or reset pins, so the controller could not be
-     * awakened after ESP32-P4 deep sleep.
+     * awakened through those pins.
      */
-    if (tp != NULL)
+    if (!preserve_touch && tp != NULL)
     {
         ret = esp_lcd_touch_del(tp);
 
@@ -1172,7 +1218,9 @@ esp_err_t bsp_display_shutdown_for_deep_sleep(void)
         }
     }
 
-    if (display_touch_io_handle != NULL && tp == NULL)
+    if (!preserve_touch &&
+        display_touch_io_handle != NULL &&
+        tp == NULL)
     {
         ret = esp_lcd_panel_io_del(display_touch_io_handle);
 
@@ -1390,9 +1438,18 @@ esp_err_t bsp_display_shutdown_for_deep_sleep(void)
 
     if (first_error == ESP_OK)
     {
-        ESP_LOGI(
-            TAG,
-            "Display, touch, LVGL and MIPI-DSI shutdown complete");
+        if (preserve_touch)
+        {
+            ESP_LOGI(
+                TAG,
+                "Display, LVGL and MIPI-DSI shutdown complete; GT911 retained for polling");
+        }
+        else
+        {
+            ESP_LOGI(
+                TAG,
+                "Display, touch, LVGL and MIPI-DSI shutdown complete");
+        }
     }
     else
     {
@@ -1403,6 +1460,73 @@ esp_err_t bsp_display_shutdown_for_deep_sleep(void)
     }
 
     return first_error;
+}
+
+esp_err_t bsp_display_shutdown_for_deep_sleep(void)
+{
+    return bsp_display_shutdown_internal(false);
+}
+
+esp_err_t bsp_display_suspend_for_light_sleep(void)
+{
+    ESP_LOGI(
+        TAG,
+        "TOUCH-POLL-V3: suspending display while retaining GT911 and I2C");
+
+    return bsp_display_shutdown_internal(true);
+}
+
+lv_display_t *bsp_display_resume_from_light_sleep(void)
+{
+    ESP_LOGI(TAG, "Reinitializing complete display stack after Light-sleep");
+    return bsp_display_start();
+}
+
+esp_err_t bsp_touch_poll_for_light_sleep(bool *touched)
+{
+    if (touched == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *touched = false;
+
+    if (tp == NULL || display_touch_io_handle == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t ret = esp_lcd_touch_read_data(tp);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "GT911 polling read failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    uint16_t touch_x = 0;
+    uint16_t touch_y = 0;
+    uint8_t touch_count = 0;
+
+    bool pressed = esp_lcd_touch_get_coordinates(
+        tp,
+        &touch_x,
+        &touch_y,
+        NULL,
+        &touch_count,
+        1);
+
+    *touched = pressed && touch_count > 0;
+
+    if (*touched)
+    {
+        ESP_LOGI(
+            TAG,
+            "GT911 touch detected during Light-sleep polling: x=%u y=%u",
+            (unsigned)touch_x,
+            (unsigned)touch_y);
+    }
+
+    return ESP_OK;
 }
 
 lv_indev_t *bsp_display_get_input_dev(void)

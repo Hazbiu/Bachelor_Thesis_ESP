@@ -25,6 +25,7 @@
 #include "esp_lcd_panel_vendor.h"
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
+#include "bsp/esp32_p4_platform.h"
 #include "lvgl.h"
 #include "lv_demos.h"
 #include "wake_up.h"
@@ -362,6 +363,8 @@ static uint8_t display_buffer_index = 0;
 static bool display_backlight_enabled = false;
 static lv_display_t *disp;
 static lv_indev_t *launcher_touch_indev = NULL;
+static int video_cam_fd0 = -1;
+static bool display_suspended_for_light_sleep = false;
 
 static uint32_t frame_count = 0;
 
@@ -666,13 +669,134 @@ static void prepare_application_for_sleep(void *user_data)
     display_backlight_enabled = false;
 }
 
+static esp_err_t suspend_application_for_light_sleep(void *user_data)
+{
+    (void)user_data;
+
+    if (video_cam_fd0 < 0 || display_mode_mutex == NULL || disp == NULL) {
+        ESP_LOGE(TAG, "Camera/display are not ready for Light-sleep suspend");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "Suspending camera and MIPI-DSI for Light-sleep");
+
+    /* Prevent the frame callback from beginning any new PPA/AI/LCD work. */
+    dummy_mode_delay_flag = true;
+
+    esp_err_t ret = app_video_stream_task_stop(video_cam_fd0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Camera stream did not stop for Light-sleep: %s",
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    if (xSemaphoreTake(
+            display_mode_mutex,
+            pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGE(TAG, "Timed out waiting for display ownership before Light-sleep");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    display_backlight_enabled = false;
+    ret = bsp_display_suspend_for_light_sleep();
+
+    /* The adapter invalidates every LVGL display/input object on shutdown. */
+    disp = NULL;
+    launcher_touch_indev = NULL;
+    dummy_draw_enabled = false;
+    display_suspended_for_light_sleep = true;
+
+    portENTER_CRITICAL(&authentication_state_lock);
+    pin_transition_pending = false;
+    pin_screen_active = false;
+    pin_rearm_required = false;
+    pin_rearm_no_face_passes = 0;
+    pending_identity[0] = '\0';
+    portEXIT_CRITICAL(&authentication_state_lock);
+
+    xSemaphoreGive(display_mode_mutex);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Display suspend completed with errors: %s",
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "Camera and MIPI-DSI suspended for Light-sleep");
+    return ESP_OK;
+}
+
+static esp_err_t resume_application_from_light_sleep(void *user_data)
+{
+    (void)user_data;
+
+    if (!display_suspended_for_light_sleep || video_cam_fd0 < 0 ||
+        display_mode_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(
+            display_mode_mutex,
+            pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGE(TAG, "Timed out waiting to restore display after Light-sleep");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    ESP_LOGI(TAG, "Restoring MIPI-DSI and camera after Light-sleep activity");
+
+    disp = bsp_display_resume_from_light_sleep();
+    if (disp == NULL) {
+        ESP_LOGE(TAG, "Display reinitialization after Light-sleep failed");
+        xSemaphoreGive(display_mode_mutex);
+        return ESP_FAIL;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(150));
+    launcher_touch_indev = bsp_display_get_input_dev();
+
+    esp_err_t ret = esp_lv_adapter_set_dummy_draw(disp, true);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not restore direct camera display mode: %s",
+            esp_err_to_name(ret));
+        xSemaphoreGive(display_mode_mutex);
+        return ret;
+    }
+
+    dummy_draw_enabled = true;
+    display_buffer_index = 0;
+    display_disable_lvgl_overlays();
+
+    ret = app_video_stream_task_restart(video_cam_fd0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Camera stream restart after Light-sleep failed: %s",
+            esp_err_to_name(ret));
+        xSemaphoreGive(display_mode_mutex);
+        return ret;
+    }
+
+    /* The first complete camera frame turns the backlight on again. */
+    display_backlight_enabled = false;
+    display_suspended_for_light_sleep = false;
+    dummy_mode_delay_flag = false;
+
+    xSemaphoreGive(display_mode_mutex);
+    ESP_LOGI(TAG, "Camera and display restored after Light-sleep");
+    return ESP_OK;
+}
+
 static void camera_application_start_task(void *arg)
 {
     (void)arg;
 
     esp_err_t ret;
-    int video_cam_fd0 = -1;
-
     app_ui_set_status("Initializing display accelerator...");
 
     ppa_client_config_t ppa_srm_config = {
@@ -929,6 +1053,22 @@ void app_main(void)
 
     bsp_display_backlight_on();
     display_backlight_enabled = true;
+
+    esp_err_t light_callbacks_ret =
+        app_sleep_register_light_sleep_callbacks(
+            suspend_application_for_light_sleep,
+            resume_application_from_light_sleep,
+            NULL);
+
+    if (light_callbacks_ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Failed to register Light-sleep transitions: %s",
+            esp_err_to_name(light_callbacks_ret));
+
+        app_ui_show_error(
+            "Light-sleep setup failed. Restart the device.");
+    }
 
     /* The physical button works both on the launcher and in camera mode. */
     esp_err_t sleep_button_ret = app_sleep_start_button_monitor(
@@ -1349,4 +1489,3 @@ static void camera_video_frame_process(
         }
     }
 }
-

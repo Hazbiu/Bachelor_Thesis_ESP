@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 #include "sdkconfig.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -303,6 +305,26 @@ void bsp_display_unlock(void);
  * A deep-sleep wake reboots and initializes the display again.
  */
 esp_err_t bsp_display_shutdown_for_deep_sleep(void);
+
+/**
+ * Stop LVGL and LCD output, retain GT911/I2C for polling, remove MIPI-DSI,
+ * and release the ESP32-P4 DPHY LDO before manual Light-sleep.
+ *
+ * The operation is idempotent. Call bsp_display_resume_from_light_sleep()
+ * after a touch or GPIO wake to rebuild the complete display stack.
+ */
+esp_err_t bsp_display_suspend_for_light_sleep(void);
+
+/** Reinitialize the complete display/touch stack after manual Light-sleep. */
+lv_display_t *bsp_display_resume_from_light_sleep(void);
+
+/**
+ * Poll the retained GT911 controller while the LCD/MIPI-DSI stack is off.
+ *
+ * This board does not route GT911 INT to the ESP32-P4, so Light-sleep uses a
+ * short RTC timer and calls this function after each timer wake.
+ */
+esp_err_t bsp_touch_poll_for_light_sleep(bool *touched);
 
 esp_lcd_panel_handle_t bsp_display_get_panel_handle(void);
 #endif // BSP_CONFIG_NO_GRAPHIC_LIB == 0

@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
 #include "esp_h264_alloc.h"
 #include "esp_h264_enc_hw_param.h"
 
@@ -13,13 +14,14 @@ static const char *TAG = "H264_ENC.HW.SET";
 
 #define ESP_H264_ROI_SUP_NUM    (8)
 #define ESP_H264_REDUNDANT_BYTE (8 + 64)
-#define SPS_PPS_BUF_SIZE        (100)
+#define SPS_PPS_BUF_SIZE        (160)
 
 typedef struct esp_h264_param {
     esp_h264_enc_param_hw_t    hw_base;
     esp_h264_set_dev_t         device;
     uint8_t                    fps;
     uint8_t                    gop;
+    bool                       force_idr;
     esp_h264_rc_hd_t           rc_hd;
     uint8_t                    qp_init;
     uint32_t                   bitrate;
@@ -95,12 +97,20 @@ static esp_h264_err_t set_fps(esp_h264_enc_param_handle_t handle, uint8_t fps)
 {
     esp_h264_enc_param_hw_handle_t param_base = __containerof(handle, esp_h264_enc_param_hw_t, base);
     esp_h264_param_t *param = __containerof(param_base, esp_h264_param_t, hw_base);
+
+    if (fps == 0) {
+        return ESP_H264_ERR_ARG;
+    }
     param->fps = fps;
     esp_h264_mutex_lock(param->mutex, ESP_H264_MAX_DELAY);
     if (param->rc_hd) {
         esp_h264_enc_hw_rc_set_bt_fps(param->rc_hd, param->bitrate, param->fps);
     }
-    esp_h264_enc_set_sps(param->nal_buf, param->nal_buf_len, param->height, param->width, param->fps);
+    /* Regenerate full SPS+PPS blob; SPS length can change (e.g. VUI timing_info). */
+    param->nal_bit_len = esp_h264_enc_set_sps(param->nal_buf, param->nal_buf_len, param->height, param->width, param->fps);
+    param->nal_bit_len += esp_h264_enc_set_pps(param->nal_buf + (param->nal_bit_len >> 3),
+                          param->nal_buf_len - (param->nal_bit_len >> 3),
+                          param->qp_init, true);
     esp_h264_mutex_unlock(param->mutex);
     return ESP_H264_ERR_OK;
 }
@@ -147,6 +157,14 @@ static esp_h264_err_t get_bitrate(esp_h264_enc_param_handle_t handle, uint32_t *
     esp_h264_enc_param_hw_handle_t param_base = __containerof(handle, esp_h264_enc_param_hw_t, base);
     esp_h264_param_t *param = __containerof(param_base, esp_h264_param_t, hw_base);
     *bitrate = param->bitrate;
+    return ESP_H264_ERR_OK;
+}
+
+static esp_h264_err_t force_idr(esp_h264_enc_param_handle_t handle)
+{
+    esp_h264_enc_param_hw_handle_t param_base = __containerof(handle, esp_h264_enc_param_hw_t, base);
+    esp_h264_param_t *param = __containerof(param_base, esp_h264_param_t, hw_base);
+    __atomic_store_n(&param->force_idr, true, __ATOMIC_RELEASE);
     return ESP_H264_ERR_OK;
 }
 
@@ -360,10 +378,10 @@ esp_h264_err_t esp_h264_enc_hw_new_param(esp_h264_enc_hw_param_cfg_t *cfg, esp_h
     param->nal_bit_len = esp_h264_enc_set_sps(param->nal_buf, param->nal_buf_len, param->height, param->width, param->fps);
     param->nal_bit_len += esp_h264_enc_set_pps(param->nal_buf + (param->nal_bit_len >> 3), param->nal_buf_len - (param->nal_bit_len >> 3), param->qp_init, true);
 
-    /** Allocated reference frame and DB memory */
-    param->ref = (uint8_t *)esp_h264_aligned_calloc(16, 1, max_refame_buffer_size(param->mb_width), &actual_size, ESP_H264_MEM_INTERNAL);
+    /** Allocated reference frame and DB memory (malloc: large buffers, no need to zero) */
+    param->ref = (uint8_t *)esp_h264_aligned_malloc(16, 1, max_refame_buffer_size(param->mb_width), &actual_size, ESP_H264_MEM_INTERNAL);
     ESP_H264_GOTO_ON_FALSE(param->ref, ESP_H264_ERR_MEM, __exit__, TAG, "No memory for reference frame");
-    param->db = (uint8_t *)esp_h264_calloc_prefer(1, max_db_buffer_size(param->mb_width, param->mb_height), &actual_size, ESP_H264_MEM_INTERNAL, ESP_H264_MEM_SPIRAM);
+    param->db = (uint8_t *)esp_h264_malloc_prefer(1, max_db_buffer_size(param->mb_width, param->mb_height), &actual_size, ESP_H264_MEM_INTERNAL, ESP_H264_MEM_SPIRAM);
     ESP_H264_GOTO_ON_FALSE(param->db, ESP_H264_ERR_MEM, __exit__, TAG, "No memory for data");
 
     /** Allocated descriptor memory*/
@@ -396,6 +414,7 @@ esp_h264_err_t esp_h264_enc_hw_new_param(esp_h264_enc_hw_param_cfg_t *cfg, esp_h
     param->hw_base.base.get_gop = get_gop;
     param->hw_base.base.set_bitrate = set_bitrate;
     param->hw_base.base.get_bitrate = get_bitrate;
+    param->hw_base.base.force_idr = force_idr;
     param->hw_base.cfg_mv = cfg_mv;
     param->hw_base.get_mv_cfg_info = get_mv_cfg_info;
     param->hw_base.set_mv_pkt = set_mv_pkt;
@@ -419,6 +438,12 @@ esp_h264_err_t esp_h264_enc_hw_get_mutex(esp_h264_enc_param_hw_handle_t handle, 
     return ESP_H264_ERR_OK;
 }
 
+bool esp_h264_enc_hw_take_force_idr(esp_h264_enc_param_hw_handle_t handle)
+{
+    esp_h264_param_t *param = __containerof(handle, esp_h264_param_t, hw_base);
+    return __atomic_exchange_n(&param->force_idr, false, __ATOMIC_ACQ_REL);
+}
+
 esp_h264_err_t esp_h264_enc_hw_get_qp_init(esp_h264_enc_param_hw_handle_t handle, uint8_t *out_qp_init)
 {
     esp_h264_param_t *param = __containerof(handle, esp_h264_param_t, hw_base);
@@ -426,10 +451,15 @@ esp_h264_err_t esp_h264_enc_hw_get_qp_init(esp_h264_enc_param_hw_handle_t handle
     return ESP_H264_ERR_OK;
 }
 
-esp_h264_err_t esp_h264_enc_hw_get_nal(esp_h264_enc_param_hw_handle_t handle, uint8_t *out_nal_buf, uint16_t *out_nal_bit_len)
+esp_h264_err_t esp_h264_enc_hw_get_nal(esp_h264_enc_param_hw_handle_t handle, uint8_t *out_nal_buf, uint32_t out_nal_buf_len, uint16_t *out_nal_bit_len)
 {
     esp_h264_param_t *param = __containerof(handle, esp_h264_param_t, hw_base);
-    memcpy(out_nal_buf, param->nal_buf, param->nal_bit_len >> 3);
+    uint32_t nal_bytes = (uint32_t)(param->nal_bit_len >> 3);
+
+    if (nal_bytes > out_nal_buf_len) {
+        return ESP_H264_ERR_MEM;
+    }
+    memcpy(out_nal_buf, param->nal_buf, nal_bytes);
     *out_nal_bit_len = param->nal_bit_len;
     return ESP_H264_ERR_OK;
 }

@@ -7,12 +7,14 @@
 
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
+#include "bsp/esp32_p4_platform.h"
 #include "config/app_config.h"
 #include "deep_sleep.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -26,6 +28,21 @@
 #if APP_LIGHT_SLEEP_TIMEOUT_MS >= APP_DEEP_SLEEP_TIMEOUT_MS
 #error "APP_LIGHT_SLEEP_TIMEOUT_MS must be smaller than APP_DEEP_SLEEP_TIMEOUT_MS"
 #endif
+
+#if APP_LIGHT_SLEEP_TOUCH_POLL_MS == 0
+#error "APP_LIGHT_SLEEP_TOUCH_POLL_MS must be greater than zero"
+#endif
+
+/*
+ * Set this to 5000 only when deliberately recording per-subsystem current
+ * plateaus. Normal firmware must proceed directly through the shutdown stages;
+ * otherwise the old profiling delays keep the board awake for 35 seconds.
+ */
+#ifndef APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS
+#define APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS 0
+#endif
+
+#define APP_INACTIVITY_POWER_TASK_STACK_SIZE 8192
 
 static const char *TAG = "app_sleep";
 
@@ -41,6 +58,34 @@ static int64_t s_last_face_detected_us;
 
 static app_sleep_prepare_callback_t s_prepare_callback;
 static void *s_prepare_user_data;
+static app_sleep_light_transition_callback_t s_light_suspend_callback;
+static app_sleep_light_transition_callback_t s_light_resume_callback;
+static void *s_light_transition_user_data;
+
+static void power_profile_stage_delay(void)
+{
+#if APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS > 0
+    vTaskDelay(pdMS_TO_TICKS(APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS));
+#endif
+}
+
+esp_err_t app_sleep_register_light_sleep_callbacks(
+    app_sleep_light_transition_callback_t suspend_callback,
+    app_sleep_light_transition_callback_t resume_callback,
+    void *user_data)
+{
+    if (suspend_callback == NULL || resume_callback == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    s_light_suspend_callback = suspend_callback;
+    s_light_resume_callback = resume_callback;
+    s_light_transition_user_data = user_data;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    return ESP_OK;
+}
 
 static bool claim_sleep_request(void)
 {
@@ -134,7 +179,8 @@ static void clear_button_release_guard(void)
 
 static void finish_light_sleep(
     esp_err_t light_ret,
-    esp_sleep_wakeup_cause_t wake_cause)
+    esp_sleep_wakeup_cause_t wake_cause,
+    bool user_activity)
 {
     const int64_t now_us = esp_timer_get_time();
 
@@ -148,13 +194,14 @@ static void finish_light_sleep(
          * hardware failure. Normal activity clears this guard.
          */
         s_light_sleep_failed_until_activity = true;
-    } else if (wake_cause == ESP_SLEEP_WAKEUP_GPIO) {
-        /*
-         * The GPIO3 press is an intentional Light-sleep wake. Consume that
-         * press so the higher-priority Deep-sleep button task cannot interpret
-         * the same electrical LOW level as a new Deep-sleep request.
-         */
-        s_ignore_button_until_release = true;
+    } else if (user_activity) {
+        if (wake_cause == ESP_SLEEP_WAKEUP_GPIO) {
+            /*
+             * Consume the GPIO3 wake press so the Deep-sleep button task does
+             * not interpret the same electrical LOW as a second request.
+             */
+            s_ignore_button_until_release = true;
+        }
 
         if (!s_sleep_requested) {
             s_last_face_detected_us = now_us;
@@ -205,12 +252,8 @@ static void run_sleep_sequence(const char *reason)
         "Deep sleep requested by %s",
         reason != NULL ? reason : "unknown source");
 
-    /*
-     * Power-profile mode: each stage is held for five seconds so that the
-     * Joulescope graph can show a stable plateau for every subsystem.
-     */
     ESP_LOGI("POWER_PROFILE", "STEP 0: all systems active");
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    power_profile_stage_delay();
 
     /* Stop new PPA, AI and display work before camera shutdown. */
     if (s_prepare_callback != NULL) {
@@ -229,7 +272,7 @@ static void run_sleep_sequence(const char *reason)
             esp_err_to_name(camera_ret));
     }
 
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    power_profile_stage_delay();
 
     ESP_LOGI(
         "POWER_PROFILE",
@@ -246,7 +289,7 @@ static void run_sleep_sequence(const char *reason)
             esp_err_to_name(display_ret));
     }
 
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    power_profile_stage_delay();
 
     ESP_LOGI("POWER_PROFILE", "STEP 3: disabling audio amplifier");
     esp_err_t audio_ret = component_audio_disable_for_deep_sleep();
@@ -260,7 +303,7 @@ static void run_sleep_sequence(const char *reason)
             esp_err_to_name(audio_ret));
     }
 
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    power_profile_stage_delay();
 
     ESP_LOGI("POWER_PROFILE", "STEP 4: disabling microSD");
     esp_err_t sdcard_ret = component_sdcard_disable_for_deep_sleep();
@@ -274,7 +317,7 @@ static void run_sleep_sequence(const char *reason)
             esp_err_to_name(sdcard_ret));
     }
 
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    power_profile_stage_delay();
 
     ESP_LOGI("POWER_PROFILE", "STEP 5: disabling ESP32-C6");
     esp_err_t wifi_ret = component_wifi_disable_for_deep_sleep();
@@ -288,7 +331,7 @@ static void run_sleep_sequence(const char *reason)
             esp_err_to_name(wifi_ret));
     }
 
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    power_profile_stage_delay();
 
     ESP_LOGI(
         "POWER_PROFILE",
@@ -305,7 +348,7 @@ static void run_sleep_sequence(const char *reason)
             esp_err_to_name(ethernet_ret));
     }
 
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    power_profile_stage_delay();
 
     ESP_LOGI("POWER_PROFILE", "STEP 7: entering ESP32-P4 deep sleep");
     enter_deep_sleep();
@@ -462,28 +505,141 @@ static void inactivity_power_policy_task(void *arg)
             APP_LIGHT_SLEEP_TIMEOUT_MS,
             remaining_ms);
 
-        esp_err_t light_ret = enter_light_sleep(remaining_ms, true);
-        esp_sleep_wakeup_cause_t wake_cause =
-            light_sleep_get_last_wakeup_cause();
-
-        finish_light_sleep(light_ret, wake_cause);
-
-        if (light_ret != ESP_OK) {
-            ESP_LOGW(
+        if (s_light_suspend_callback == NULL ||
+            s_light_resume_callback == NULL) {
+            ESP_LOGE(
                 TAG,
-                "Light-sleep stage failed; staying active until Deep-sleep deadline: %s",
-                esp_err_to_name(light_ret));
-            continue;
+                "Light-sleep callbacks are not registered; restarting safely");
+            esp_restart();
         }
 
-        if (wake_cause == ESP_SLEEP_WAKEUP_GPIO) {
+        esp_err_t suspend_ret =
+            s_light_suspend_callback(s_light_transition_user_data);
+
+        if (suspend_ret != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "Application Light-sleep suspend failed: %s; restarting safely",
+                esp_err_to_name(suspend_ret));
+            esp_restart();
+        }
+
+        /*
+         * Flush any coordinate that LVGL consumed immediately before the
+         * adapter was stopped. It must not be mistaken for a new wake touch.
+         */
+        bool stale_touch = false;
+        esp_err_t touch_ret =
+            bsp_touch_poll_for_light_sleep(&stale_touch);
+
+        if (touch_ret != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "Could not prepare GT911 polling: %s; restarting safely",
+                esp_err_to_name(touch_ret));
+            esp_restart();
+        }
+
+        ESP_LOGI(
+            TAG,
+            "GT911 polling armed every %d ms until the %d ms Deep-sleep deadline",
+            APP_LIGHT_SLEEP_TOUCH_POLL_MS,
+            APP_DEEP_SLEEP_TIMEOUT_MS);
+
+        esp_err_t light_ret = ESP_OK;
+        esp_sleep_wakeup_cause_t wake_cause =
+            ESP_SLEEP_WAKEUP_UNDEFINED;
+        bool touchscreen_touched = false;
+
+        while (remaining_ms > 0 && !touchscreen_touched) {
+            uint32_t poll_slice_ms = APP_LIGHT_SLEEP_TOUCH_POLL_MS;
+            if (poll_slice_ms > remaining_ms) {
+                poll_slice_ms = remaining_ms;
+            }
+
+            light_ret = enter_light_sleep_poll_slice(
+                poll_slice_ms,
+                true);
+            wake_cause = light_sleep_get_last_wakeup_cause();
+
+            if (light_ret != ESP_OK ||
+                wake_cause == ESP_SLEEP_WAKEUP_GPIO) {
+                break;
+            }
+
+            if (wake_cause != ESP_SLEEP_WAKEUP_TIMER) {
+                ESP_LOGE(
+                    TAG,
+                    "Unexpected Light-sleep wake cause %d; restarting safely",
+                    (int)wake_cause);
+                esp_restart();
+            }
+
+            remaining_ms -= poll_slice_ms;
+
+            touch_ret = bsp_touch_poll_for_light_sleep(
+                &touchscreen_touched);
+
+            if (touch_ret != ESP_OK) {
+                ESP_LOGE(
+                    TAG,
+                    "GT911 Light-sleep poll failed: %s; restarting safely",
+                    esp_err_to_name(touch_ret));
+                esp_restart();
+            }
+        }
+
+        const bool user_activity = touchscreen_touched ||
+            wake_cause == ESP_SLEEP_WAKEUP_GPIO;
+
+        finish_light_sleep(light_ret, wake_cause, user_activity);
+
+        if (light_ret != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "Light-sleep failed after hardware suspend: %s; restarting safely",
+                esp_err_to_name(light_ret));
+            esp_restart();
+        }
+
+        if (user_activity) {
+            esp_err_t resume_ret =
+                s_light_resume_callback(s_light_transition_user_data);
+
+            if (resume_ret != ESP_OK) {
+                ESP_LOGE(
+                    TAG,
+                    "Application Light-sleep resume failed: %s; restarting safely",
+                    esp_err_to_name(resume_ret));
+                esp_restart();
+            }
+
+            if (touchscreen_touched) {
+                ESP_LOGI(
+                    TAG,
+                    "Touchscreen activity restored camera/display without reboot");
+            } else {
+                ESP_LOGI(
+                    TAG,
+                    "GPIO3 woke Light-sleep; camera/display restored without reboot");
+            }
+        } else if (wake_cause == ESP_SLEEP_WAKEUP_TIMER &&
+                   remaining_ms == 0) {
             ESP_LOGI(
                 TAG,
-                "GPIO3 woke Light-sleep; inactivity window restarted");
-        } else if (wake_cause == ESP_SLEEP_WAKEUP_TIMER) {
-            ESP_LOGI(
-                TAG,
-                "Light-sleep timer reached the Deep-sleep inactivity deadline");
+                "GT911 polling reached the %d ms Deep-sleep inactivity deadline",
+                APP_DEEP_SLEEP_TIMEOUT_MS);
+
+            /*
+             * Camera and display are already off. Claim the request directly
+             * and continue into the destructive shutdown without powering
+             * either pipeline back up for a single scheduler iteration.
+             */
+            if (claim_sleep_request()) {
+                run_sleep_sequence(
+                    "face inactivity after Light-sleep timer");
+            }
+            break;
         }
     }
 
@@ -541,7 +697,7 @@ esp_err_t app_sleep_start_timeout(void)
     BaseType_t created = xTaskCreate(
         inactivity_power_policy_task,
         "inactivity_power",
-        3072,
+        APP_INACTIVITY_POWER_TASK_STACK_SIZE,
         NULL,
         5,
         NULL);

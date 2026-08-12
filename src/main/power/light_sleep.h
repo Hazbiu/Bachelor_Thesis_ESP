@@ -17,10 +17,8 @@ extern "C" {
  * active-low wake source. If timeout_ms is greater than zero, the RTC timer is
  * enabled as another wake source. At least one wake source must be requested.
  *
- * Unlike the deep-sleep path, this function does not shut down the camera,
- * display, microSD, ESP32-C6, Ethernet PHY, or audio amplifier. Those board
- * peripherals need a reversible suspend/resume policy before they should be
- * powered down around Light-sleep.
+ * This low-level helper only configures wake sources and enters Light-sleep.
+ * The application owns the reversible camera/display suspend-resume policy.
  *
  * @param timeout_ms Optional timer wake-up in milliseconds; 0 disables it.
  * @param enable_gpio_wakeup Enable active-low GPIO wake-up when true.
@@ -28,6 +26,16 @@ extern "C" {
  *         error returned while configuring, entering, or cleaning up sleep.
  */
 esp_err_t enter_light_sleep(uint32_t timeout_ms, bool enable_gpio_wakeup);
+
+/**
+ * Enter one quiet Light-sleep polling slice.
+ *
+ * Configuration failures are still logged, but normal timer entry/wake lines
+ * are suppressed so 250 ms touchscreen polling does not flood the monitor.
+ */
+esp_err_t enter_light_sleep_poll_slice(
+    uint32_t timeout_ms,
+    bool enable_gpio_wakeup);
 
 /** Return the wake-up cause recorded by the most recent Light-sleep cycle. */
 esp_sleep_wakeup_cause_t light_sleep_get_last_wakeup_cause(void);

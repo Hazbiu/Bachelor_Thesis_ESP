@@ -9,7 +9,7 @@ extern "C" {
 /**
  * Configure dynamic CPU-frequency scaling:
  * minimum = 40 MHz
- * maximum = 360 MHz
+ * maximum = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ (360 MHz in the current sdkconfig)
  * automatic Light-sleep disabled
  */
 esp_err_t cpu_power_init(void);

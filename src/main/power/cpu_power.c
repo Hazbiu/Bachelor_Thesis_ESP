@@ -2,14 +2,28 @@
 
 #include <stdbool.h>
 
+#include "sdkconfig.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_pm.h"
 
 static const char *TAG = "cpu_power";
 
+/*
+ * Dynamic-frequency-scaling limits while the application is awake.
+ *
+ * The CPU is clock-gated during actual Light-sleep, so these values affect
+ * only active execution before sleep and after wake-up. AI inference uses the
+ * maximum-frequency lock below and therefore runs at the CPU frequency selected
+ * by CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ. When no frequency lock is held, DFS may
+ * reduce the CPU to 40 MHz.
+ *
+ * ESP32-P4 validates the maximum against the frequency selected at build time.
+ * Using a hard-coded 240 MHz with a 360 MHz sdkconfig caused esp_pm_configure()
+ * to fail, which left every AI lock request in ESP_ERR_INVALID_STATE.
+ */
 #define CPU_MIN_FREQ_MHZ 40
-#define CPU_MAX_FREQ_MHZ 360
+#define CPU_MAX_FREQ_MHZ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ
 
 static esp_pm_lock_handle_t s_ai_cpu_lock = NULL;
 static bool s_initialized = false;
@@ -24,6 +38,9 @@ esp_err_t cpu_power_init(void)
      * Dynamic frequency scaling is enabled, but automatic Light-sleep
      * remains disabled because the application uses the display,
      * MIPI-CSI camera, touchscreen and LVGL.
+     *
+     * The application's existing inactivity policy enters Light-sleep
+     * explicitly through esp_light_sleep_start().
      */
     const esp_pm_config_t config = {
         .max_freq_mhz = CPU_MAX_FREQ_MHZ,
@@ -35,13 +52,17 @@ esp_err_t cpu_power_init(void)
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
-            "esp_pm_configure failed: %s",
+            "esp_pm_configure failed for min=%d MHz max=%d MHz: %s",
+            CPU_MIN_FREQ_MHZ,
+            CPU_MAX_FREQ_MHZ,
             esp_err_to_name(ret));
         return ret;
     }
 
     /*
-     * This lock requests 360 MHz while AI inference is executing.
+     * Request the configured build-time maximum only while AI inference runs.
+     * Detection and recognition must release this lock on every successful
+     * acquisition so DFS can return to the 40 MHz minimum afterward.
      */
     ret = esp_pm_lock_create(
         ESP_PM_CPU_FREQ_MAX,
@@ -61,7 +82,7 @@ esp_err_t cpu_power_init(void)
 
     ESP_LOGI(
         TAG,
-        "Dynamic CPU scaling configured: min=%d MHz, max=%d MHz",
+        "Dynamic CPU scaling configured: min=%d MHz, AI max=%d MHz",
         CPU_MIN_FREQ_MHZ,
         CPU_MAX_FREQ_MHZ);
 

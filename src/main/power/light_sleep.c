@@ -48,7 +48,10 @@ static void log_wakeup_cause(esp_sleep_wakeup_cause_t cause)
     }
 }
 
-esp_err_t enter_light_sleep(uint32_t timeout_ms, bool enable_gpio_wakeup)
+static esp_err_t enter_light_sleep_internal(
+    uint32_t timeout_ms,
+    bool enable_gpio_wakeup,
+    bool verbose)
 {
     const gpio_num_t wake_gpio = APP_LIGHT_SLEEP_WAKE_GPIO;
 
@@ -83,10 +86,12 @@ esp_err_t enter_light_sleep(uint32_t timeout_ms, bool enable_gpio_wakeup)
          * button is already held would cause an immediate wake-up.
          */
         if (gpio_get_level(wake_gpio) == 0) {
-            ESP_LOGI(
-                TAG,
-                "GPIO%d is LOW; waiting for button release before Light-sleep",
-                wake_gpio);
+            if (verbose) {
+                ESP_LOGI(
+                    TAG,
+                    "GPIO%d is LOW; waiting for button release before Light-sleep",
+                    wake_gpio);
+            }
 
             while (gpio_get_level(wake_gpio) == 0) {
                 vTaskDelay(pdMS_TO_TICKS(APP_LIGHT_SLEEP_BUTTON_POLL_MS));
@@ -132,19 +137,21 @@ esp_err_t enter_light_sleep(uint32_t timeout_ms, bool enable_gpio_wakeup)
             return ret;
         }
 
-        if (enable_gpio_wakeup) {
-            ESP_LOGI(
-                TAG,
-                "Entering Light-sleep: GPIO%d LOW or timer after %" PRIu32 " ms",
-                wake_gpio,
-                timeout_ms);
-        } else {
-            ESP_LOGI(
-                TAG,
-                "Entering Light-sleep: timer after %" PRIu32 " ms",
-                timeout_ms);
+        if (verbose) {
+            if (enable_gpio_wakeup) {
+                ESP_LOGI(
+                    TAG,
+                    "Entering Light-sleep: GPIO%d LOW or timer after %" PRIu32 " ms",
+                    wake_gpio,
+                    timeout_ms);
+            } else {
+                ESP_LOGI(
+                    TAG,
+                    "Entering Light-sleep: timer after %" PRIu32 " ms",
+                    timeout_ms);
+            }
         }
-    } else {
+    } else if (verbose) {
         ESP_LOGI(
             TAG,
             "Entering Light-sleep: GPIO%d LOW wake-up only",
@@ -156,7 +163,9 @@ esp_err_t enter_light_sleep(uint32_t timeout_ms, bool enable_gpio_wakeup)
     ret = esp_light_sleep_start();
     if (ret == ESP_OK) {
         s_last_wakeup_cause = esp_sleep_get_wakeup_cause();
-        log_wakeup_cause(s_last_wakeup_cause);
+        if (verbose) {
+            log_wakeup_cause(s_last_wakeup_cause);
+        }
     } else {
         s_last_wakeup_cause = ESP_SLEEP_WAKEUP_UNDEFINED;
         ESP_LOGE(
@@ -215,6 +224,24 @@ esp_err_t enter_light_sleep(uint32_t timeout_ms, bool enable_gpio_wakeup)
     }
 
     return cleanup_error;
+}
+
+esp_err_t enter_light_sleep(uint32_t timeout_ms, bool enable_gpio_wakeup)
+{
+    return enter_light_sleep_internal(
+        timeout_ms,
+        enable_gpio_wakeup,
+        true);
+}
+
+esp_err_t enter_light_sleep_poll_slice(
+    uint32_t timeout_ms,
+    bool enable_gpio_wakeup)
+{
+    return enter_light_sleep_internal(
+        timeout_ms,
+        enable_gpio_wakeup,
+        false);
 }
 
 esp_sleep_wakeup_cause_t light_sleep_get_last_wakeup_cause(void)
