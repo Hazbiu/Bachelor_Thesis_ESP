@@ -11,6 +11,7 @@
 #include "esp_heap_caps.h"
 #include "esp_private/esp_cache_private.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "driver/ppa.h"
 #include "platform/camera/video_capture.h"
 #include "services/vision/face_detector.h"
@@ -58,7 +59,6 @@ static int smooth_coord(int old_value, int new_value)
 {
     return (old_value * 3 + new_value) / 4;
 }
-
 static void draw_rect_rgb565(
     uint16_t *fb,
     uint32_t fb_w,
@@ -365,6 +365,9 @@ static lv_display_t *disp;
 static lv_indev_t *launcher_touch_indev = NULL;
 static int video_cam_fd0 = -1;
 static bool display_suspended_for_light_sleep = false;
+static volatile bool display_suspended_for_idle_scan = false;
+static bool idle_scan_resume_task_pending = false;
+static portMUX_TYPE idle_scan_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static uint32_t frame_count = 0;
 
@@ -669,11 +672,247 @@ static void prepare_application_for_sleep(void *user_data)
     display_backlight_enabled = false;
 }
 
-static esp_err_t suspend_application_for_light_sleep(void *user_data)
+static bool idle_scan_display_is_suspended(void)
+{
+    bool suspended;
+    portENTER_CRITICAL(&idle_scan_state_lock);
+    suspended = display_suspended_for_idle_scan;
+    portEXIT_CRITICAL(&idle_scan_state_lock);
+    return suspended;
+}
+
+static void idle_scan_touch_poll_task(void *arg)
+{
+    (void)arg;
+
+    /* Discard a coordinate consumed immediately before LVGL was stopped. */
+    bool touched = false;
+    (void)bsp_touch_poll_for_light_sleep(&touched);
+
+    while (idle_scan_display_is_suspended() &&
+           !display_suspended_for_light_sleep &&
+           !app_sleep_is_requested()) {
+        vTaskDelay(pdMS_TO_TICKS(APP_LIGHT_SLEEP_TOUCH_POLL_MS));
+
+        esp_err_t ret = bsp_touch_poll_for_light_sleep(&touched);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "IDLE-SCAN touch polling failed: %s",
+                     esp_err_to_name(ret));
+            break;
+        }
+
+        if (touched) {
+            ESP_LOGI(TAG, "IDLE-SCAN touchscreen activity detected");
+            app_sleep_notify_face_detected();
+            break;
+        }
+    }
+
+    vTaskDelete(NULL);
+}
+
+/*
+ * Called by cpu_power before it applies 180 MHz. The camera task remains
+ * active, but no future callback is allowed to submit a display buffer.
+ */
+static esp_err_t suspend_display_for_idle_scan(void *user_data)
 {
     (void)user_data;
 
     if (video_cam_fd0 < 0 || display_mode_mutex == NULL || disp == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(display_mode_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGE(TAG, "IDLE-SCAN timed out waiting for frame callback");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (idle_scan_display_is_suspended()) {
+        xSemaphoreGive(display_mode_mutex);
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "IDLE-SCAN suspending LVGL and MIPI-DSI; camera stays active");
+
+    dummy_mode_delay_flag = true;
+    bsp_display_backlight_off();
+    display_backlight_enabled = false;
+
+    esp_err_t ret = bsp_display_suspend_for_light_sleep();
+    if (ret != ESP_OK) {
+        xSemaphoreGive(display_mode_mutex);
+        ESP_LOGE(TAG, "IDLE-SCAN display suspend failed: %s",
+                 esp_err_to_name(ret));
+        esp_restart();
+        return ret;
+    }
+
+    /* The BSP invalidates all LVGL display and input handles. */
+    disp = NULL;
+    launcher_touch_indev = NULL;
+    dummy_draw_enabled = false;
+
+    portENTER_CRITICAL(&idle_scan_state_lock);
+    display_suspended_for_idle_scan = true;
+    portEXIT_CRITICAL(&idle_scan_state_lock);
+
+    /* Permit camera-only callbacks now that no DSI object can be accessed. */
+    dummy_mode_delay_flag = false;
+
+    portENTER_CRITICAL(&authentication_state_lock);
+    pin_transition_pending = false;
+    pin_screen_active = false;
+    pin_rearm_required = false;
+    pin_rearm_no_face_passes = 0;
+    pending_identity[0] = '\0';
+    portEXIT_CRITICAL(&authentication_state_lock);
+
+    xSemaphoreGive(display_mode_mutex);
+
+    BaseType_t created = xTaskCreate(
+        idle_scan_touch_poll_task,
+        "idle_scan_touch",
+        3072,
+        NULL,
+        4,
+        NULL);
+
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Could not create IDLE-SCAN touch polling task");
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "IDLE-SCAN display is off; camera-only scan is ready");
+    return ESP_OK;
+}
+
+static void resume_display_from_idle_scan_task(void *arg)
+{
+    (void)arg;
+
+    if (xSemaphoreTake(display_mode_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGE(TAG, "ACTIVE restore timed out waiting for frame callback");
+        esp_restart();
+    }
+
+    if (!idle_scan_display_is_suspended() ||
+        display_suspended_for_light_sleep ||
+        app_sleep_is_requested()) {
+        portENTER_CRITICAL(&idle_scan_state_lock);
+        idle_scan_resume_task_pending = false;
+        portEXIT_CRITICAL(&idle_scan_state_lock);
+        xSemaphoreGive(display_mode_mutex);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "ACTIVE 360 MHz confirmed; restoring MIPI-DSI and LVGL");
+
+    dummy_mode_delay_flag = true;
+
+    /*
+     * The ESP32-P4 camera CSI and LCD DSI paths share DMA infrastructure.
+     * Recreating MIPI-DSI while CSI is streaming can hand the LCD driver an
+     * invalid GDMA device and cause a Store access fault. Pause CSI first,
+     * restore the complete display stack, then restart the same camera task.
+     */
+    ESP_LOGI(TAG, "ACTIVE pausing camera DMA before MIPI-DSI restoration");
+    esp_err_t ret = app_video_stream_task_stop(video_cam_fd0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ACTIVE camera pause before display restore failed: %s",
+                 esp_err_to_name(ret));
+        xSemaphoreGive(display_mode_mutex);
+        esp_restart();
+    }
+
+    disp = bsp_display_resume_from_light_sleep();
+    if (disp == NULL) {
+        ESP_LOGE(TAG, "ACTIVE display restoration failed");
+        xSemaphoreGive(display_mode_mutex);
+        esp_restart();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(150));
+    launcher_touch_indev = bsp_display_get_input_dev();
+
+    ret = esp_lv_adapter_set_dummy_draw(disp, true);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ACTIVE dummy-draw restoration failed: %s",
+                 esp_err_to_name(ret));
+        xSemaphoreGive(display_mode_mutex);
+        esp_restart();
+    }
+
+    dummy_draw_enabled = true;
+    display_buffer_index = 0;
+    display_disable_lvgl_overlays();
+    last_face_count = 0;
+    no_face_frames = 0;
+
+    ret = app_video_stream_task_restart(video_cam_fd0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ACTIVE camera restart after display restore failed: %s",
+                 esp_err_to_name(ret));
+        xSemaphoreGive(display_mode_mutex);
+        esp_restart();
+    }
+
+    portENTER_CRITICAL(&idle_scan_state_lock);
+    display_suspended_for_idle_scan = false;
+    idle_scan_resume_task_pending = false;
+    portEXIT_CRITICAL(&idle_scan_state_lock);
+
+    /* The first complete frame turns the physical backlight on. */
+    display_backlight_enabled = false;
+    dummy_mode_delay_flag = false;
+
+    xSemaphoreGive(display_mode_mutex);
+    ESP_LOGI(TAG, "ACTIVE camera display restored at 360 MHz");
+    vTaskDelete(NULL);
+}
+
+/* Called only after cpu_power has restored the fixed 360 MHz policy. */
+static esp_err_t request_display_resume_from_idle_scan(void *user_data)
+{
+    (void)user_data;
+
+    if (!idle_scan_display_is_suspended()) {
+        return ESP_OK;
+    }
+
+    portENTER_CRITICAL(&idle_scan_state_lock);
+    if (idle_scan_resume_task_pending) {
+        portEXIT_CRITICAL(&idle_scan_state_lock);
+        return ESP_OK;
+    }
+    idle_scan_resume_task_pending = true;
+    portEXIT_CRITICAL(&idle_scan_state_lock);
+
+    BaseType_t created = xTaskCreate(
+        resume_display_from_idle_scan_task,
+        "idle_scan_resume",
+        6144,
+        NULL,
+        7,
+        NULL);
+
+    if (created != pdPASS) {
+        portENTER_CRITICAL(&idle_scan_state_lock);
+        idle_scan_resume_task_pending = false;
+        portEXIT_CRITICAL(&idle_scan_state_lock);
+        ESP_LOGE(TAG, "Could not create ACTIVE display-resume task");
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t suspend_application_for_light_sleep(void *user_data)
+{
+    (void)user_data;
+
+    if (video_cam_fd0 < 0 || display_mode_mutex == NULL) {
         ESP_LOGE(TAG, "Camera/display are not ready for Light-sleep suspend");
         return ESP_ERR_INVALID_STATE;
     }
@@ -710,7 +949,21 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
     }
 
     display_backlight_enabled = false;
-    ret = bsp_display_suspend_for_light_sleep();
+
+    if (idle_scan_display_is_suspended()) {
+        /* MIPI-DSI is already off; Light-sleep only had to stop the camera. */
+        ret = ESP_OK;
+        portENTER_CRITICAL(&idle_scan_state_lock);
+        display_suspended_for_idle_scan = false;
+        portEXIT_CRITICAL(&idle_scan_state_lock);
+        ESP_LOGI(TAG, "IDLE-SCAN display already suspended for Light-sleep");
+    } else {
+        if (disp == NULL) {
+            xSemaphoreGive(display_mode_mutex);
+            return ESP_ERR_INVALID_STATE;
+        }
+        ret = bsp_display_suspend_for_light_sleep();
+    }
 
     /* The adapter invalidates every LVGL display/input object on shutdown. */
     disp = NULL;
@@ -1080,6 +1333,21 @@ void app_main(void)
             "Light-sleep setup failed. Restart the device.");
     }
 
+    esp_err_t idle_callbacks_ret =
+        cpu_power_register_idle_scan_callbacks(
+            suspend_display_for_idle_scan,
+            request_display_resume_from_idle_scan,
+            NULL);
+
+    if (idle_callbacks_ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Failed to register adaptive IDLE-SCAN transitions: %s",
+            esp_err_to_name(idle_callbacks_ret));
+        app_ui_show_error(
+            "Adaptive CPU power setup failed. Restart the device.");
+    }
+
     /* The physical button works both on the launcher and in camera mode. */
     esp_err_t sleep_button_ret = app_sleep_start_button_monitor(
         prepare_application_for_sleep,
@@ -1129,8 +1397,10 @@ static void camera_video_frame_process(
     void *user_data)
 {
 
-    if (!dummy_draw_enabled ||
-        dummy_mode_delay_flag ||
+    const bool idle_scan_frame = idle_scan_display_is_suspended();
+
+    if ((!dummy_draw_enabled && !idle_scan_frame) ||
+        (dummy_mode_delay_flag && !idle_scan_frame) ||
         authentication_blocks_camera())
     {
         return;
@@ -1144,12 +1414,7 @@ static void camera_video_frame_process(
     (void)camera_buf_len;
     (void)user_data;
 
-    void *target_fb = display_buffer[display_buffer_index];
-    if (!target_fb)
-    {
-        ESP_LOGE(TAG, "display buffer is NULL");
-        return;
-    }
+    void *target_fb = NULL;
 
     const uint32_t display_width = BSP_LCD_H_RES;
     const uint32_t display_height = BSP_LCD_V_RES;
@@ -1160,16 +1425,23 @@ static void camera_video_frame_process(
         return;
     }
 
-    uint32_t in_offset_x = 0;
-    uint32_t in_offset_y = 0;
+    esp_err_t ret = ESP_OK;
 
-    uint32_t in_block_w = camera_buf_hes;
-    uint32_t in_block_h = camera_buf_ves;
+    if (!idle_scan_frame) {
+        target_fb = display_buffer[display_buffer_index];
+        if (!target_fb) {
+            ESP_LOGE(TAG, "display buffer is NULL");
+            return;
+        }
 
-    float scale_x = (float)display_width / (float)camera_buf_hes;
-    float scale_y = (float)display_height / (float)camera_buf_ves;
+        const uint32_t in_offset_x = 0;
+        const uint32_t in_offset_y = 0;
+        const uint32_t in_block_w = camera_buf_hes;
+        const uint32_t in_block_h = camera_buf_ves;
+        const float scale_x = (float)display_width / (float)camera_buf_hes;
+        const float scale_y = (float)display_height / (float)camera_buf_ves;
 
-    ppa_srm_oper_config_t srm_config = {
+        ppa_srm_oper_config_t srm_config = {
         .in.buffer = camera_buf,
         .in.pic_w = camera_buf_hes,
         .in.pic_h = camera_buf_ves,
@@ -1195,13 +1467,13 @@ static void camera_video_frame_process(
         .rgb_swap = 0,
         .byte_swap = 0,
         .mode = PPA_TRANS_MODE_BLOCKING,
-    };
+        };
 
-    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "PPA SRM failed: %d", ret);
-        return;
+        ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "PPA SRM failed: %d", ret);
+            return;
+        }
     }
 
     frame_count++;
@@ -1275,6 +1547,18 @@ static void camera_video_frame_process(
         ESP_LOGI(TAG, "Detection ran, face_count=%d", face_count);
         diagnostics_ai_detection_result(face_count);
         authentication_note_detection_result(face_count);
+
+        if (idle_scan_frame) {
+            if (face_count > 0) {
+                ESP_LOGI(
+                    TAG,
+                    "IDLE-SCAN face detected; restoring 360 MHz before display");
+                app_sleep_notify_face_detected();
+            }
+
+            /* Recognition and display work resume only after ACTIVE restore. */
+            return;
+        }
 
         if (face_count > 0) {
             /*
@@ -1427,6 +1711,10 @@ static void camera_video_frame_process(
                 memset(last_recognition_scores, 0, sizeof(last_recognition_scores));
             }
         }
+    }
+
+    if (idle_scan_frame) {
+        return;
     }
 
     #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
