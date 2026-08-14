@@ -16,6 +16,7 @@ void app_logging_init(void)
 
 #if APP_LOG_ENABLE_CPU_POWER
     ENABLE_INFO("PWR_CPU");
+    ENABLE_INFO("PWR_STATE");
 #endif
 
 #if APP_LOG_ENABLE_ESP_PM

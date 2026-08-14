@@ -46,6 +46,7 @@
 #define APP_INACTIVITY_POWER_TASK_STACK_SIZE 8192
 
 static const char *TAG = "app_sleep";
+static const char *POWER_TAG = "PWR_STATE";
 
 static portMUX_TYPE s_sleep_request_lock =
     portMUX_INITIALIZER_UNLOCKED;
@@ -276,10 +277,18 @@ static bool claim_light_sleep_window(uint32_t *remaining_ms)
 
 static void run_sleep_sequence(const char *reason)
 {
+    const char *sleep_reason =
+        reason != NULL ? reason : "unknown source";
+
+    ESP_LOGI(
+        POWER_TAG,
+        "event=DEEP_SLEEP_BEGIN reason=\"%s\"",
+        sleep_reason);
+
     ESP_LOGI(
         TAG,
         "Deep sleep requested by %s",
-        reason != NULL ? reason : "unknown source");
+        sleep_reason);
 
     ESP_LOGI("POWER_PROFILE", "STEP 0: all systems active");
     power_profile_stage_delay();
@@ -380,6 +389,10 @@ static void run_sleep_sequence(const char *reason)
     power_profile_stage_delay();
 
     ESP_LOGI("POWER_PROFILE", "STEP 7: entering ESP32-P4 deep sleep");
+    ESP_LOGI(
+        POWER_TAG,
+        "event=DEEP_SLEEP_COMMIT wake_gpio=%d wake_level=LOW",
+        APP_DEEP_SLEEP_BUTTON_GPIO);
     enter_deep_sleep();
 
     /* The following recovery path is reached only if Deep-sleep fails. */
@@ -420,6 +433,9 @@ static void run_sleep_sequence(const char *reason)
     }
 
     release_sleep_request();
+    ESP_LOGE(
+        POWER_TAG,
+        "event=DEEP_SLEEP_FAILED reason=ENTER_FUNCTION_RETURNED");
     ESP_LOGE(TAG, "Deep sleep request returned without entering sleep");
 }
 
@@ -505,6 +521,16 @@ static void inactivity_power_policy_task(void *arg)
     (void)arg;
 
     ESP_LOGI(
+        POWER_TAG,
+        "event=INACTIVITY_POLICY_STARTED idle_180_after_ms=%u "
+        "idle_90_after_ms=%u light_sleep_after_ms=%u "
+        "deep_sleep_after_ms=%u",
+        (unsigned)APP_CPU_IDLE_180_AFTER_MS,
+        (unsigned)APP_CPU_IDLE_90_AFTER_MS,
+        (unsigned)APP_LIGHT_SLEEP_TIMEOUT_MS,
+        (unsigned)APP_DEEP_SLEEP_TIMEOUT_MS);
+
+    ESP_LOGI(
         TAG,
         "Inactivity power policy armed: light=%d ms deep=%d ms",
         APP_LIGHT_SLEEP_TIMEOUT_MS,
@@ -517,9 +543,15 @@ static void inactivity_power_policy_task(void *arg)
          * Apply the staged active CPU policy and reduce AI duty cycle before
          * entering the coordinated Light-sleep window.
          */
-        cpu_power_update_inactivity(get_inactivity_ms());
+        const uint32_t inactive_ms = get_inactivity_ms();
+        cpu_power_update_inactivity(inactive_ms);
 
         if (claim_inactivity_sleep_request()) {
+            ESP_LOGI(
+                POWER_TAG,
+                "event=DEEP_SLEEP_DEADLINE_REACHED inactive_ms=%" PRIu32
+                " action=SHUTDOWN",
+                inactive_ms);
             ESP_LOGI(
                 TAG,
                 "No activity for %d ms; entering Deep-sleep",
@@ -535,6 +567,13 @@ static void inactivity_power_policy_task(void *arg)
         }
 
         ESP_LOGI(
+            POWER_TAG,
+            "event=LIGHT_SLEEP_BEGIN inactive_ms=%" PRIu32
+            " remaining_to_deep_ms=%" PRIu32,
+            inactive_ms,
+            remaining_ms);
+
+        ESP_LOGI(
             TAG,
             "No activity for %d ms; entering Light-sleep for up to %" PRIu32 " ms",
             APP_LIGHT_SLEEP_TIMEOUT_MS,
@@ -542,6 +581,10 @@ static void inactivity_power_policy_task(void *arg)
 
         if (s_light_suspend_callback == NULL ||
             s_light_resume_callback == NULL) {
+            ESP_LOGE(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_FAILED phase=CALLBACK_CHECK "
+                "error=NOT_REGISTERED action=RESTART");
             ESP_LOGE(
                 TAG,
                 "Light-sleep callbacks are not registered; restarting safely");
@@ -553,11 +596,21 @@ static void inactivity_power_policy_task(void *arg)
 
         if (suspend_ret != ESP_OK) {
             ESP_LOGE(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_FAILED phase=HARDWARE_SUSPEND "
+                "error=%s action=RESTART",
+                esp_err_to_name(suspend_ret));
+            ESP_LOGE(
                 TAG,
                 "Application Light-sleep suspend failed: %s; restarting safely",
                 esp_err_to_name(suspend_ret));
             esp_restart();
         }
+
+        ESP_LOGI(
+            POWER_TAG,
+            "event=LIGHT_SLEEP_HARDWARE_SUSPENDED "
+            "camera=OFF display=OFF");
 
         /*
          * Flush any coordinate that LVGL consumed immediately before the
@@ -568,6 +621,11 @@ static void inactivity_power_policy_task(void *arg)
             bsp_touch_poll_for_light_sleep(&stale_touch);
 
         if (touch_ret != ESP_OK) {
+            ESP_LOGE(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_FAILED phase=TOUCH_PREPARE "
+                "error=%s action=RESTART",
+                esp_err_to_name(touch_ret));
             ESP_LOGE(
                 TAG,
                 "Could not prepare GT911 polling: %s; restarting safely",
@@ -580,6 +638,12 @@ static void inactivity_power_policy_task(void *arg)
             "GT911 polling armed every %d ms until the %d ms Deep-sleep deadline",
             APP_LIGHT_SLEEP_TOUCH_POLL_MS,
             APP_DEEP_SLEEP_TIMEOUT_MS);
+        ESP_LOGI(
+            POWER_TAG,
+            "event=LIGHT_SLEEP_ENTER mode=TIMER_SLICED "
+            "poll_ms=%u remaining_to_deep_ms=%" PRIu32,
+            (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
+            remaining_ms);
 
         esp_err_t light_ret = ESP_OK;
         esp_sleep_wakeup_cause_t wake_cause =
@@ -604,6 +668,11 @@ static void inactivity_power_policy_task(void *arg)
 
             if (wake_cause != ESP_SLEEP_WAKEUP_TIMER) {
                 ESP_LOGE(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_FAILED phase=WAKE_CHECK "
+                    "wake_cause=%d action=RESTART",
+                    (int)wake_cause);
+                ESP_LOGE(
                     TAG,
                     "Unexpected Light-sleep wake cause %d; restarting safely",
                     (int)wake_cause);
@@ -616,6 +685,11 @@ static void inactivity_power_policy_task(void *arg)
                 &touchscreen_touched);
 
             if (touch_ret != ESP_OK) {
+                ESP_LOGE(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_FAILED phase=TOUCH_POLL "
+                    "error=%s action=RESTART",
+                    esp_err_to_name(touch_ret));
                 ESP_LOGE(
                     TAG,
                     "GT911 Light-sleep poll failed: %s; restarting safely",
@@ -631,6 +705,11 @@ static void inactivity_power_policy_task(void *arg)
 
         if (light_ret != ESP_OK) {
             ESP_LOGE(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_FAILED phase=SLEEP_CALL "
+                "error=%s action=RESTART",
+                esp_err_to_name(light_ret));
+            ESP_LOGE(
                 TAG,
                 "Light-sleep failed after hardware suspend: %s; restarting safely",
                 esp_err_to_name(light_ret));
@@ -638,10 +717,19 @@ static void inactivity_power_policy_task(void *arg)
         }
 
         if (user_activity) {
+            ESP_LOGI(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_EXIT reason=%s action=RESTORE_ACTIVE",
+                touchscreen_touched ? "TOUCHSCREEN" : "GPIO3");
             esp_err_t resume_ret =
                 s_light_resume_callback(s_light_transition_user_data);
 
             if (resume_ret != ESP_OK) {
+                ESP_LOGE(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_FAILED phase=HARDWARE_RESUME "
+                    "error=%s action=RESTART",
+                    esp_err_to_name(resume_ret));
                 ESP_LOGE(
                     TAG,
                     "Application Light-sleep resume failed: %s; restarting safely",
@@ -660,6 +748,11 @@ static void inactivity_power_policy_task(void *arg)
             }
         } else if (wake_cause == ESP_SLEEP_WAKEUP_TIMER &&
                    remaining_ms == 0) {
+            ESP_LOGI(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_DEADLINE_REACHED inactive_ms=%u "
+                "action=DEEP_SLEEP",
+                (unsigned)APP_DEEP_SLEEP_TIMEOUT_MS);
             ESP_LOGI(
                 TAG,
                 "GT911 polling reached the %d ms Deep-sleep inactivity deadline",
