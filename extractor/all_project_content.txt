@@ -1,5 +1,5 @@
 Complete project export
-Generated on: Wed Aug 12 11:38:41 PM CEST 2026
+Generated on: Fri Aug 14 11:15:49 AM CEST 2026
 Project: /home/hazbiu/Programming/Bachelor_Thesis_ESP
 Included: every file under src/main
 Included: every CMakeLists.txt and *.cmake file under src
@@ -1073,8 +1073,24 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
 
     ESP_LOGI(TAG, "Suspending camera and MIPI-DSI for Light-sleep");
 
-    /* Prevent the frame callback from beginning any new PPA/AI/LCD work. */
+    /*
+     * Establish an exclusive display barrier before asking the video task to
+     * exit. A frame callback already in progress is allowed to finish; after
+     * this mutex is acquired, every new callback fails its non-blocking mutex
+     * attempt and returns immediately. This removes the stop-vs-display race
+     * that previously caused the video-stop semaphore to time out.
+     */
+    if (xSemaphoreTake(
+            display_mode_mutex,
+            pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGE(
+            TAG,
+            "Timed out waiting for active frame callback before Light-sleep");
+        return ESP_ERR_TIMEOUT;
+    }
+
     dummy_mode_delay_flag = true;
+    ESP_LOGI(TAG, "Light-sleep display barrier acquired; stopping camera");
 
     esp_err_t ret = app_video_stream_task_stop(video_cam_fd0);
     if (ret != ESP_OK) {
@@ -1082,14 +1098,8 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
             TAG,
             "Camera stream did not stop for Light-sleep: %s",
             esp_err_to_name(ret));
+        xSemaphoreGive(display_mode_mutex);
         return ret;
-    }
-
-    if (xSemaphoreTake(
-            display_mode_mutex,
-            pdMS_TO_TICKS(2000)) != pdTRUE) {
-        ESP_LOGE(TAG, "Timed out waiting for display ownership before Light-sleep");
-        return ESP_ERR_TIMEOUT;
     }
 
     display_backlight_enabled = false;
@@ -1598,7 +1608,15 @@ static void camera_video_frame_process(
                 pcTaskGetName(NULL),
                 xTaskGetCoreID(xTaskGetCurrentTaskHandle()));
     }
-    if ((frame_count % APP_FACE_DETECT_INTERVAL_FRAMES) == 0) {
+    /*
+     * The interval grows as inactivity approaches Light-sleep. This reduces
+     * CPU/AI duty cycle while face detection remains available throughout the
+     * complete active window.
+     */
+    const uint32_t detect_interval_frames =
+        cpu_power_get_face_detect_interval_frames();
+
+    if ((frame_count % detect_interval_frames) == 0) {
         face_box_t boxes[APP_MAX_FACE_BOXES];
         diagnostics_ai_frame_sent_to_detector();
 
@@ -2198,6 +2216,7 @@ dependencies:
   espressif/esp-dl: ^3.3.5
   espressif/human_face_detect: ^0.4.2
   espressif/human_face_recognition: '*'
+  espressif/esp-nn: '*'
 
 
 ==================================================
@@ -2227,12 +2246,38 @@ FILE: src/main/include/config/app_config.h
 #define APP_FACE_BOX_THICKNESS              3
 #define APP_FACE_LABEL_FONT_SCALE           3
 
+/*
+ * Active-mode power stages.
+ *
+ * 0..5 s without activity (PERFORMANCE):
+ *   - CPU policy is 90..360 MHz
+ *   - normal detection interval
+ *   - AI explicitly requests 360 MHz during inference
+ *
+ * 5..10 s without activity (BALANCED):
+ *   - CPU remains in the safe 90..360 MHz DFS range
+ *   - the application no longer forces 360 MHz for no-face detection
+ *   - detection runs less often
+ *
+ * 10..15 s without activity (ECO):
+ *   - CPU remains in the safe 90..360 MHz DFS range
+ *   - the application AI maximum-frequency lock remains disabled
+ *   - detection is throttled further
+ *
+ * At 15 s app_sleep.c enters coordinated Light-sleep. At 30 s it enters
+ * Deep-sleep if no touchscreen, face, PIN or GPIO3 activity resets the timer.
+ */
+#define APP_CPU_BALANCED_AFTER_MS                5000
+#define APP_CPU_ECO_AFTER_MS                    10000
+#define APP_FACE_DETECT_BALANCED_INTERVAL_FRAMES    4
+#define APP_FACE_DETECT_ECO_INTERVAL_FRAMES         8
+
 /* Cache synchronization */
 #define APP_SYNC_CACHE_AROUND_OVERLAY       1
 
 /* Light-sleep configuration */
 #define APP_LIGHT_SLEEP_WAKE_GPIO           GPIO_NUM_3
-#define APP_LIGHT_SLEEP_TIMEOUT_MS          10000
+#define APP_LIGHT_SLEEP_TIMEOUT_MS          15000
 #define APP_LIGHT_SLEEP_TOUCH_POLL_MS       250
 #define APP_LIGHT_SLEEP_BUTTON_POLL_MS      5
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS  25
@@ -2244,6 +2289,20 @@ FILE: src/main/include/config/app_config.h
 #define APP_DEEP_SLEEP_BUTTON_POLL_MS       5
 #define APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS   25
 #define APP_DEEP_SLEEP_BUTTON_PRIORITY      8
+
+#if APP_CPU_BALANCED_AFTER_MS >= APP_CPU_ECO_AFTER_MS
+#error "Balanced CPU stage must begin before the ECO stage"
+#endif
+
+#if APP_CPU_ECO_AFTER_MS >= APP_LIGHT_SLEEP_TIMEOUT_MS
+#error "ECO CPU stage must begin before Light-sleep"
+#endif
+
+#if APP_FACE_DETECT_INTERVAL_FRAMES == 0 || \
+    APP_FACE_DETECT_BALANCED_INTERVAL_FRAMES == 0 || \
+    APP_FACE_DETECT_ECO_INTERVAL_FRAMES == 0
+#error "Every face-detection interval must be greater than zero"
+#endif
 
 
 ==================================================
@@ -2412,24 +2471,23 @@ uint32_t app_video_get_buf_size(void);
 esp_err_t app_video_stream_task_start(int video_fd, int core_id, void *user_data);
 
 /**
- * @brief Restart the video stream task.
+ * @brief Resume the persistent video stream task.
  *
- * This function stops the current video stream task and restarts it with the specified
- * video device file descriptor. It first sets the necessary buffers for the video stream,
- * then attempts to start the video stream task on the specified core.
+ * Restores the capture buffers, starts V4L2 streaming, and resumes the same
+ * FreeRTOS video task that was paused by app_video_stream_task_stop().
  *
  * @param video_fd File descriptor for the video device.
  * @return
- * - ESP_OK on successful restart of the video stream task.
- * - ESP_FAIL if there was an error while restarting the task.
+ * - ESP_OK on successful stream/task resume.
+ * - ESP_FAIL if buffers or streaming could not be restored.
  */
 esp_err_t app_video_stream_task_restart(int video_fd);
 
 /**
  * @brief Stop the video stream task.
  *
- * Deletes the video stream task if it is running and stops the video stream.
- * Ensures the task handle is reset to NULL after deletion.
+ * Stops V4L2 streaming and moves the persistent video task into a controlled
+ * suspended state. The task is resumed by app_video_stream_task_restart().
  *
  * @param video_fd File descriptor for the video device.
  * @return ESP_OK on success.
@@ -2577,6 +2635,8 @@ FILE: src/main/include/power_save/cpu_power.h
 ==================================================
 #pragma once
 
+#include <stdint.h>
+
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -2584,22 +2644,39 @@ extern "C" {
 #endif
 
 /**
- * Configure dynamic CPU-frequency scaling:
- * minimum = 40 MHz
- * maximum = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ (360 MHz in the current sdkconfig)
- * automatic Light-sleep disabled
+ * Initialize one verified, display-safe active DFS range:
+ *
+ * All active profiles: 90..CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ (360 MHz here)
+ * PERFORMANCE: application AI maximum-frequency lock enabled
+ * BALANCED/ECO: application AI maximum-frequency lock disabled
+ *
+ * Automatic Light-sleep remains disabled because app_sleep.c explicitly
+ * coordinates the camera, display, LVGL and GT911 before sleeping.
  */
 esp_err_t cpu_power_init(void);
 
 /**
- * Force the CPU to the configured maximum frequency.
+ * Request the configured 360 MHz maximum during AI inference only when the
+ * PERFORMANCE profile is active. This is a successful no-op in BALANCED/ECO,
+ * allowing DFS to select 90 MHz between work while preserving driver scaling.
  */
 esp_err_t cpu_power_ai_begin(void);
 
-/**
- * Release the maximum-frequency requirement.
- */
+/** Release the PERFORMANCE AI lock acquired by cpu_power_ai_begin(). */
 esp_err_t cpu_power_ai_end(void);
+
+/**
+ * Dynamically select PERFORMANCE, BALANCED or ECO from inactivity duration.
+ * BALANCED/ECO keep the safe 90..360 MHz DFS range, release the application's
+ * AI maximum-frequency request and progressively throttle face detection.
+ */
+void cpu_power_update_inactivity(uint32_t inactive_ms);
+
+/** Restore PERFORMANCE AI locking immediately after accepted activity. */
+void cpu_power_notify_activity(void);
+
+/** Return the face-detection interval for the current active power profile. */
+uint32_t cpu_power_get_face_detect_interval_frames(void);
 
 #ifdef __cplusplus
 }
@@ -2734,7 +2811,6 @@ static const char *TAG = "app_video";
 #define VIDEO_TASK_STACK_SIZE             (4 * 1024)
 #define VIDEO_TASK_PRIORITY               4
 #define VIDEO_STOP_TIMEOUT_MS             1500
-#define VIDEO_CLOSE_GRACE_TIMEOUT_MS      250
 #define VIDEO_NO_FRAME_RETRY_DELAY_MS     2
 #define VIDEO_ERROR_RETRY_DELAY_MS        10
 
@@ -2753,6 +2829,8 @@ typedef struct {
     TaskHandle_t video_stream_task_handle;
     uint8_t video_task_core_id;
     volatile bool video_task_delete;
+    volatile bool video_task_paused;
+    volatile bool video_stop_nudge_complete;
     volatile bool video_streaming;
     SemaphoreHandle_t video_stopped_sem;
 
@@ -2780,6 +2858,8 @@ static void reset_camera_runtime_state(void)
     app_camera_video.video_fd = -1;
     app_camera_video.video_streaming = false;
     app_camera_video.video_task_delete = false;
+    app_camera_video.video_task_paused = false;
+    app_camera_video.video_stop_nudge_complete = false;
     app_camera_video.video_stream_task_handle = NULL;
     app_camera_video.camera_buf_count = 0;
     app_camera_video.camera_buf_size = 0;
@@ -3202,92 +3282,125 @@ static void video_stream_task(void *arg)
         xPortGetCoreID(),
         pcTaskGetName(NULL));
 
-    while (!app_camera_video.video_task_delete) {
-        esp_err_t ret =
-            video_receive_video_frame(video_fd);
+    for (;;) {
+        while (!app_camera_video.video_task_delete) {
+            esp_err_t ret =
+                video_receive_video_frame(video_fd);
 
-        if (ret == ESP_ERR_NOT_FOUND) {
+            if (ret == ESP_ERR_NOT_FOUND) {
+                /*
+                 * No frame is ready yet. Yield briefly and then check the
+                 * shutdown flag again.
+                 */
+                vTaskDelay(
+                    pdMS_TO_TICKS(
+                        VIDEO_NO_FRAME_RETRY_DELAY_MS));
+                continue;
+            }
+
+            if (ret == ESP_ERR_INVALID_STATE) {
+                if (app_camera_video.video_task_delete) {
+                    break;
+                }
+
+                taskYIELD();
+                continue;
+            }
+
+            if (ret != ESP_OK) {
+                if (app_camera_video.video_task_delete) {
+                    break;
+                }
+
+                vTaskDelay(
+                    pdMS_TO_TICKS(
+                        VIDEO_ERROR_RETRY_DELAY_MS));
+                continue;
+            }
+
             /*
-             * No frame is ready yet. Yield briefly and then check the
-             * shutdown flag again.
+             * Once shutdown is requested, do not process or requeue another
+             * completed frame.
              */
-            vTaskDelay(
-                pdMS_TO_TICKS(
-                    VIDEO_NO_FRAME_RETRY_DELAY_MS));
-            continue;
-        }
-
-        if (ret == ESP_ERR_INVALID_STATE) {
             if (app_camera_video.video_task_delete) {
                 break;
             }
 
-            taskYIELD();
-            continue;
-        }
+            video_operation_video_frame();
 
-        if (ret != ESP_OK) {
             if (app_camera_video.video_task_delete) {
                 break;
             }
 
-            vTaskDelay(
-                pdMS_TO_TICKS(
-                    VIDEO_ERROR_RETRY_DELAY_MS));
-            continue;
+            ret = video_free_video_frame(video_fd);
+            if (ret != ESP_OK) {
+                if (!app_camera_video.video_task_delete) {
+                    ESP_LOGE(
+                        TAG,
+                        "Failed to return video frame to the driver");
+                }
+                break;
+            }
+        }
+
+        const bool requested_stop = app_camera_video.video_task_delete;
+
+        /*
+         * During a requested stop, app_video_stream_task_stop() already
+         * executes VIDIOC_STREAMOFF. If capture failed independently, this
+         * task remains responsible for stopping the device.
+         */
+        if (!requested_stop) {
+            esp_err_t stop_ret = video_stream_stop(video_fd);
+
+            if (stop_ret != ESP_OK) {
+                ESP_LOGW(TAG, "Video stream did not stop cleanly");
+            }
         }
 
         /*
-         * Once shutdown is requested, do not process or requeue another
-         * completed frame.
+         * The controller must finish its wake/abort calls before this task
+         * suspends itself; otherwise a late vTaskResume() could accidentally
+         * undo the intentional Light-sleep pause.
          */
-        if (app_camera_video.video_task_delete) {
-            break;
+        while (requested_stop &&
+               !app_camera_video.video_stop_nudge_complete) {
+            taskYIELD();
         }
 
-        video_operation_video_frame();
+        app_camera_video.video_task_delete = false;
+        app_camera_video.video_task_paused = true;
 
-        if (app_camera_video.video_task_delete) {
-            break;
+        if (app_camera_video.video_stopped_sem != NULL) {
+            xSemaphoreGive(app_camera_video.video_stopped_sem);
         }
 
-        ret = video_free_video_frame(video_fd);
-        if (ret != ESP_OK) {
-            if (!app_camera_video.video_task_delete) {
-                ESP_LOGE(
-                    TAG,
-                    "Failed to return video frame to the driver");
-            }
-            break;
-        }
+        ESP_LOGI(TAG, "VIDEO-STOP-V6: video task paused");
+        vTaskSuspend(NULL);
+
+        app_camera_video.video_task_paused = false;
+        ESP_LOGI(TAG, "VIDEO-STOP-V6: video task resumed");
     }
+}
+
+static void wake_video_task_for_stop(TaskHandle_t video_task)
+{
+    if (video_task == NULL) {
+        return;
+    }
+
+#if (INCLUDE_xTaskAbortDelay == 1)
+    if (xTaskAbortDelay(video_task) == pdPASS) {
+        ESP_LOGI(TAG, "VIDEO-STOP-V6: aborted blocked capture wait");
+    }
+#endif
 
     /*
-     * During a requested shutdown, app_video_stream_task_stop()
-     * already executes VIDIOC_STREAMOFF. Do not execute it again
-     * from this task, because two simultaneous STREAMOFF calls can
-     * race and produce EBUSY (errno 16).
-     *
-     * If the task exits independently because of a streaming error,
-     * it remains responsible for stopping the stream.
+     * Some ESP-Video 0.8 capture paths can report the task as Suspended after
+     * a restart. vTaskResume() is harmless for a Ready/Running/Blocked task and
+     * releases a genuinely suspended capture wait.
      */
-    if (!app_camera_video.video_task_delete) {
-        esp_err_t stop_ret = video_stream_stop(video_fd);
-
-        if (stop_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Video stream did not stop cleanly");
-        }
-    }
-    
-    app_camera_video.video_task_delete = false;
-    app_camera_video.video_stream_task_handle = NULL;
-
-    if (app_camera_video.video_stopped_sem != NULL) {
-        xSemaphoreGive(app_camera_video.video_stopped_sem);
-    }
-
-    ESP_LOGI(TAG, "Video stream task stopped");
-    vTaskDelete(NULL);
+    vTaskResume(video_task);
 }
 
 esp_err_t app_video_stream_task_start(
@@ -3322,6 +3435,8 @@ esp_err_t app_video_stream_task_start(
         app_camera_video.video_stopped_sem);
 
     app_camera_video.video_task_delete = false;
+    app_camera_video.video_task_paused = false;
+    app_camera_video.video_stop_nudge_complete = false;
     app_camera_video.video_task_core_id = core_id;
     app_camera_video.video_task_user_data = user_data;
     app_camera_video.video_fd = video_fd;
@@ -3364,10 +3479,11 @@ esp_err_t app_video_stream_task_restart(int video_fd)
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (app_camera_video.video_stream_task_handle != NULL) {
+    if (app_camera_video.video_stream_task_handle == NULL ||
+        !app_camera_video.video_task_paused) {
         ESP_LOGE(
             TAG,
-            "Cannot restart while video stream task is running");
+            "Cannot resume because video stream task is not paused");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -3381,17 +3497,21 @@ esp_err_t app_video_stream_task_restart(int video_fd)
         return ret;
     }
 
-    ret = app_video_stream_task_start(
-        video_fd,
-        app_camera_video.video_task_core_id,
-        app_camera_video.video_task_user_data);
+    app_camera_video.video_task_delete = false;
+    app_camera_video.video_stop_nudge_complete = false;
+
+    ret = video_stream_start(video_fd);
 
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
-            "Failed to restart video stream task");
+            "Failed to restart video stream");
         return ret;
     }
+
+    ESP_LOGI(TAG, "VIDEO-STOP-V6: resuming persistent video task");
+    app_camera_video.video_task_paused = false;
+    vTaskResume(app_camera_video.video_stream_task_handle);
 
     return ESP_OK;
 }
@@ -3403,6 +3523,10 @@ esp_err_t app_video_stream_task_stop(int video_fd)
     }
 
     if (app_camera_video.video_stream_task_handle == NULL) {
+        return ESP_OK;
+    }
+
+    if (app_camera_video.video_task_paused) {
         return ESP_OK;
     }
 
@@ -3429,6 +3553,7 @@ esp_err_t app_video_stream_task_stop(int video_fd)
      * the flag within a few milliseconds even if STREAMOFF does not wake the
      * driver immediately.
      */
+    app_camera_video.video_stop_nudge_complete = false;
     app_camera_video.video_task_delete = true;
 
     esp_err_t streamoff_ret =
@@ -3440,16 +3565,24 @@ esp_err_t app_video_stream_task_stop(int video_fd)
             "STREAMOFF failed while requesting task shutdown");
     }
 
+    /*
+     * STREAMOFF does not consistently release the capture task after a second
+     * Light-sleep cycle with ESP-Video 0.8. Wake either kind of RTOS wait, then
+     * allow the task to enter its controlled persistent pause.
+     */
+    wake_video_task_for_stop(app_camera_video.video_stream_task_handle);
+    app_camera_video.video_stop_nudge_complete = true;
+
     if (xSemaphoreTake(
             app_camera_video.video_stopped_sem,
             pdMS_TO_TICKS(VIDEO_STOP_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGE(
             TAG,
-            "Timed out while stopping video stream task");
+            "VIDEO-STOP-V6: timed out while pausing video stream task");
 
         /*
          * Keep video_task_delete asserted. app_video_shutdown() will close
-         * the file descriptor and perform one final bounded wait.
+         * the file descriptor before deleting the remaining task.
          */
         return ESP_ERR_TIMEOUT;
     }
@@ -3500,37 +3633,16 @@ esp_err_t app_video_shutdown(void)
     app_camera_video.video_streaming = false;
 
     /*
-     * Closing the descriptor should release a task that was still inside a
-     * driver operation. Give it one final bounded interval to signal exit.
+     * Light-sleep preserves the paused task, but Deep-sleep closes the camera
+     * permanently. Explicitly suspend before deletion so another core cannot
+     * be executing the task while its resources are released.
      */
-    if (app_camera_video.video_stream_task_handle != NULL &&
-        app_camera_video.video_stopped_sem != NULL) {
-        if (xSemaphoreTake(
-                app_camera_video.video_stopped_sem,
-                pdMS_TO_TICKS(
-                    VIDEO_CLOSE_GRACE_TIMEOUT_MS)) == pdTRUE) {
-            ESP_LOGW(
-                TAG,
-                "Video task exited after forced device close");
-        } else {
-            /*
-             * Deep sleep follows immediately and resets the complete CSI
-             * subsystem. Delete the application task so no task can access
-             * the now-closed descriptor during the remaining shutdown steps.
-             */
-            TaskHandle_t stuck_task =
-                app_camera_video.video_stream_task_handle;
+    TaskHandle_t video_task = app_camera_video.video_stream_task_handle;
+    app_camera_video.video_stream_task_handle = NULL;
 
-            app_camera_video.video_stream_task_handle = NULL;
-            app_camera_video.video_task_delete = false;
-
-            if (stuck_task != NULL) {
-                ESP_LOGW(
-                    TAG,
-                    "Force deleting video task after shutdown timeout");
-                vTaskDelete(stuck_task);
-            }
-        }
+    if (video_task != NULL) {
+        vTaskSuspend(video_task);
+        vTaskDelete(video_task);
     }
 
     reset_camera_runtime_state();
@@ -3607,6 +3719,7 @@ FILE: src/main/power/app_sleep.c
 #include "power_save/component_ethernet.h"
 #include "power_save/component_sdcard.h"
 #include "power_save/component_wifi.h"
+#include "power_save/cpu_power.h"
 
 #if APP_LIGHT_SLEEP_TIMEOUT_MS >= APP_DEEP_SLEEP_TIMEOUT_MS
 #error "APP_LIGHT_SLEEP_TIMEOUT_MS must be smaller than APP_DEEP_SLEEP_TIMEOUT_MS"
@@ -3727,15 +3840,37 @@ bool app_sleep_is_requested(void)
 void app_sleep_notify_face_detected(void)
 {
     const int64_t now_us = esp_timer_get_time();
+    bool activity_accepted = false;
 
     portENTER_CRITICAL(&s_sleep_request_lock);
 
     if (s_inactivity_monitor_started && !s_sleep_requested) {
         s_last_face_detected_us = now_us;
         s_light_sleep_failed_until_activity = false;
+        activity_accepted = true;
     }
 
     portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    if (activity_accepted) {
+        cpu_power_notify_activity();
+    }
+}
+
+static uint32_t get_inactivity_ms(void)
+{
+    const int64_t now_us = esp_timer_get_time();
+    int64_t inactive_us = 0;
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+
+    if (s_inactivity_monitor_started && now_us > s_last_face_detected_us) {
+        inactive_us = now_us - s_last_face_detected_us;
+    }
+
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    return (uint32_t)(inactive_us / 1000LL);
 }
 
 static bool button_event_is_reserved_for_light_sleep(void)
@@ -3766,6 +3901,7 @@ static void finish_light_sleep(
     bool user_activity)
 {
     const int64_t now_us = esp_timer_get_time();
+    bool restore_performance = false;
 
     portENTER_CRITICAL(&s_sleep_request_lock);
 
@@ -3789,10 +3925,15 @@ static void finish_light_sleep(
         if (!s_sleep_requested) {
             s_last_face_detected_us = now_us;
             s_light_sleep_failed_until_activity = false;
+            restore_performance = true;
         }
     }
 
     portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    if (restore_performance) {
+        cpu_power_notify_activity();
+    }
 }
 
 static bool claim_light_sleep_window(uint32_t *remaining_ms)
@@ -4067,6 +4208,12 @@ static void inactivity_power_policy_task(void *arg)
     while (!app_sleep_is_requested()) {
         vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_INACTIVITY_POLL_MS));
 
+        /*
+         * Apply the staged active CPU policy and reduce AI duty cycle before
+         * entering the coordinated Light-sleep window.
+         */
+        cpu_power_update_inactivity(get_inactivity_ms());
+
         if (claim_inactivity_sleep_request()) {
             ESP_LOGI(
                 TAG,
@@ -4276,6 +4423,8 @@ esp_err_t app_sleep_start_timeout(void)
     s_light_sleep_failed_until_activity = false;
 
     portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    cpu_power_notify_activity();
 
     BaseType_t created = xTaskCreate(
         inactivity_power_policy_task,
@@ -4953,33 +5102,187 @@ FILE: src/main/power/cpu_power.c
 ==================================================
 #include "power_save/cpu_power.h"
 
+#include <inttypes.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "sdkconfig.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_pm.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+#include "config/app_config.h"
 
 static const char *TAG = "cpu_power";
 
 /*
- * Dynamic-frequency-scaling limits while the application is awake.
+ * ESP32-P4 active CPU policy.
  *
- * The CPU is clock-gated during actual Light-sleep, so these values affect
- * only active execution before sleep and after wake-up. AI inference uses the
- * maximum-frequency lock below and therefore runs at the CPU frequency selected
- * by CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ. When no frequency lock is held, DFS may
- * reduce the CPU to 40 MHz.
+ * The complete active window keeps the display-safe 90..360 MHz DFS range.
+ * ESP-IDF may therefore raise the CPU/APB clock when the scheduler or a driver
+ * needs more bandwidth and return to the 90 MHz floor between work.
  *
- * ESP32-P4 validates the maximum against the frequency selected at build time.
- * Using a hard-coded 240 MHz with a 360 MHz sdkconfig caused esp_pm_configure()
- * to fail, which left every AI lock request in ESP_ERR_INVALID_STATE.
+ * PERFORMANCE explicitly acquires ESP_PM_CPU_FREQ_MAX during AI inference.
+ * BALANCED and ECO do not acquire that application lock and reduce the face
+ * detection duty cycle. This saves active power without imposing the unsafe
+ * 90 MHz hard maximum that caused MIPI-DSI underruns in the V3 test.
+ *
+ * Actual Light-sleep is still entered explicitly by app_sleep.c. During
+ * Light-sleep, the CPU clock is gated rather than merely reduced to 90 MHz.
  */
-#define CPU_MIN_FREQ_MHZ 40
-#define CPU_MAX_FREQ_MHZ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ
+#define CPU_ACTIVE_FLOOR_FREQ_MHZ 90
+#define CPU_PERFORMANCE_MAX_FREQ_MHZ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ
 
-static esp_pm_lock_handle_t s_ai_cpu_lock = NULL;
-static bool s_initialized = false;
+typedef enum {
+    CPU_POWER_PROFILE_PERFORMANCE = 0,
+    CPU_POWER_PROFILE_BALANCED,
+    CPU_POWER_PROFILE_ECO,
+} cpu_power_profile_t;
+
+static esp_pm_lock_handle_t s_ai_cpu_lock;
+static SemaphoreHandle_t s_policy_mutex;
+static bool s_initialized;
+static bool s_ai_session_holds_mutex;
+static cpu_power_profile_t s_profile = CPU_POWER_PROFILE_PERFORMANCE;
+static int s_applied_min_mhz;
+static int s_applied_max_mhz;
+
+/* Used only for short cross-task reads/writes of the profile/session flags. */
+static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static const char *profile_name(cpu_power_profile_t profile)
+{
+    switch (profile) {
+    case CPU_POWER_PROFILE_PERFORMANCE:
+        return "PERFORMANCE";
+    case CPU_POWER_PROFILE_BALANCED:
+        return "BALANCED";
+    case CPU_POWER_PROFILE_ECO:
+        return "ECO";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static uint32_t profile_detection_interval(cpu_power_profile_t profile)
+{
+    switch (profile) {
+    case CPU_POWER_PROFILE_BALANCED:
+        return APP_FACE_DETECT_BALANCED_INTERVAL_FRAMES;
+    case CPU_POWER_PROFILE_ECO:
+        return APP_FACE_DETECT_ECO_INTERVAL_FRAMES;
+    case CPU_POWER_PROFILE_PERFORMANCE:
+    default:
+        return APP_FACE_DETECT_INTERVAL_FRAMES;
+    }
+}
+
+/*
+ * Must be called while s_policy_mutex is held.
+ *
+ * esp_pm_get_configuration() verifies that ESP-IDF accepted exactly the
+ * requested range. The log therefore reports the applied policy, not only the
+ * requested one.
+ */
+static esp_err_t apply_active_dfs_policy_locked(void)
+{
+    const esp_pm_config_t requested = {
+        .max_freq_mhz = CPU_PERFORMANCE_MAX_FREQ_MHZ,
+        .min_freq_mhz = CPU_ACTIVE_FLOOR_FREQ_MHZ,
+        .light_sleep_enable = false,
+    };
+
+    esp_err_t ret = esp_pm_configure(&requested);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "ACTIVE-POWER-V6 esp_pm_configure rejected %d..%d MHz: %s",
+            CPU_ACTIVE_FLOOR_FREQ_MHZ,
+            CPU_PERFORMANCE_MAX_FREQ_MHZ,
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    esp_pm_config_t applied = {0};
+    ret = esp_pm_get_configuration(&applied);
+    if (ret != ESP_OK) {
+        s_applied_min_mhz = 0;
+        s_applied_max_mhz = 0;
+        ESP_LOGE(
+            TAG,
+            "ACTIVE-POWER-V6 could not verify PM configuration: %s",
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    s_applied_min_mhz = applied.min_freq_mhz;
+    s_applied_max_mhz = applied.max_freq_mhz;
+
+    if (applied.min_freq_mhz != CPU_ACTIVE_FLOOR_FREQ_MHZ ||
+        applied.max_freq_mhz != CPU_PERFORMANCE_MAX_FREQ_MHZ ||
+        applied.light_sleep_enable) {
+        ESP_LOGE(
+            TAG,
+            "ACTIVE-POWER-V6 PM verification mismatch: requested=%d..%d "
+            "applied=%d..%d MHz auto_light_sleep=%s",
+            CPU_ACTIVE_FLOOR_FREQ_MHZ,
+            CPU_PERFORMANCE_MAX_FREQ_MHZ,
+            applied.min_freq_mhz,
+            applied.max_freq_mhz,
+            applied.light_sleep_enable ? "on" : "off");
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static void log_profile(cpu_power_profile_t profile)
+{
+    const bool ai_max_lock_enabled =
+        profile == CPU_POWER_PROFILE_PERFORMANCE;
+
+    ESP_LOGI(
+        TAG,
+        "ACTIVE-POWER-V6 profile=%s active_DFS=%d..%d MHz "
+        "AI_max_lock=%s policy=verified detect_every=%" PRIu32 " frames",
+        profile_name(profile),
+        s_applied_min_mhz,
+        s_applied_max_mhz,
+        ai_max_lock_enabled ? "enabled" : "disabled",
+        profile_detection_interval(profile));
+}
+
+static void set_profile(cpu_power_profile_t new_profile)
+{
+    if (!s_initialized || s_policy_mutex == NULL) {
+        return;
+    }
+
+    if (xSemaphoreTake(s_policy_mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "ACTIVE-POWER-V6 failed to lock CPU policy mutex");
+        return;
+    }
+
+    cpu_power_profile_t old_profile;
+    portENTER_CRITICAL(&s_state_lock);
+    old_profile = s_profile;
+    portEXIT_CRITICAL(&s_state_lock);
+
+    if (old_profile == new_profile) {
+        xSemaphoreGive(s_policy_mutex);
+        return;
+    }
+
+    /* Only the AI-lock policy and detection interval change here. */
+    portENTER_CRITICAL(&s_state_lock);
+    s_profile = new_profile;
+    portEXIT_CRITICAL(&s_state_lock);
+
+    log_profile(new_profile);
+    xSemaphoreGive(s_policy_mutex);
+}
 
 esp_err_t cpu_power_init(void)
 {
@@ -4987,36 +5290,28 @@ esp_err_t cpu_power_init(void)
         return ESP_OK;
     }
 
-    /*
-     * Dynamic frequency scaling is enabled, but automatic Light-sleep
-     * remains disabled because the application uses the display,
-     * MIPI-CSI camera, touchscreen and LVGL.
-     *
-     * The application's existing inactivity policy enters Light-sleep
-     * explicitly through esp_light_sleep_start().
-     */
-    const esp_pm_config_t config = {
-        .max_freq_mhz = CPU_MAX_FREQ_MHZ,
-        .min_freq_mhz = CPU_MIN_FREQ_MHZ,
-        .light_sleep_enable = false,
-    };
+    s_policy_mutex = xSemaphoreCreateMutex();
+    if (s_policy_mutex == NULL) {
+        ESP_LOGE(TAG, "Creating CPU policy mutex failed");
+        return ESP_ERR_NO_MEM;
+    }
 
-    esp_err_t ret = esp_pm_configure(&config);
+    if (xSemaphoreTake(s_policy_mutex, portMAX_DELAY) != pdTRUE) {
+        vSemaphoreDelete(s_policy_mutex);
+        s_policy_mutex = NULL;
+        return ESP_FAIL;
+    }
+
+    esp_err_t ret = apply_active_dfs_policy_locked();
+
+    xSemaphoreGive(s_policy_mutex);
+
     if (ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "esp_pm_configure failed for min=%d MHz max=%d MHz: %s",
-            CPU_MIN_FREQ_MHZ,
-            CPU_MAX_FREQ_MHZ,
-            esp_err_to_name(ret));
+        vSemaphoreDelete(s_policy_mutex);
+        s_policy_mutex = NULL;
         return ret;
     }
 
-    /*
-     * Request the configured build-time maximum only while AI inference runs.
-     * Detection and recognition must release this lock on every successful
-     * acquisition so DFS can return to the 40 MHz minimum afterward.
-     */
     ret = esp_pm_lock_create(
         ESP_PM_CPU_FREQ_MAX,
         0,
@@ -5028,24 +5323,54 @@ esp_err_t cpu_power_init(void)
             TAG,
             "Creating AI CPU lock failed: %s",
             esp_err_to_name(ret));
+        vSemaphoreDelete(s_policy_mutex);
+        s_policy_mutex = NULL;
         return ret;
     }
 
+    portENTER_CRITICAL(&s_state_lock);
+    s_profile = CPU_POWER_PROFILE_PERFORMANCE;
+    s_ai_session_holds_mutex = false;
     s_initialized = true;
+    portEXIT_CRITICAL(&s_state_lock);
 
     ESP_LOGI(
         TAG,
-        "Dynamic CPU scaling configured: min=%d MHz, AI max=%d MHz",
-        CPU_MIN_FREQ_MHZ,
-        CPU_MAX_FREQ_MHZ);
+        "ACTIVE-POWER-V6 initialized: active_DFS=%d..%d MHz, "
+        "BALANCED/ECO release AI max lock, balanced=%d ms, eco=%d ms",
+        CPU_ACTIVE_FLOOR_FREQ_MHZ,
+        CPU_PERFORMANCE_MAX_FREQ_MHZ,
+        APP_CPU_BALANCED_AFTER_MS,
+        APP_CPU_ECO_AFTER_MS);
+    log_profile(CPU_POWER_PROFILE_PERFORMANCE);
 
     return ESP_OK;
 }
 
 esp_err_t cpu_power_ai_begin(void)
 {
-    if (!s_initialized || s_ai_cpu_lock == NULL) {
+    if (!s_initialized || s_ai_cpu_lock == NULL ||
+        s_policy_mutex == NULL) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+     * Hold the policy mutex until cpu_power_ai_end() in PERFORMANCE mode.
+     * This prevents the inactivity task from changing the logical profile
+     * while the same AI operation owns its maximum-frequency lock.
+     */
+    if (xSemaphoreTake(s_policy_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_FAIL;
+    }
+
+    cpu_power_profile_t profile;
+    portENTER_CRITICAL(&s_state_lock);
+    profile = s_profile;
+    portEXIT_CRITICAL(&s_state_lock);
+
+    if (profile != CPU_POWER_PROFILE_PERFORMANCE) {
+        xSemaphoreGive(s_policy_mutex);
+        return ESP_OK;
     }
 
     esp_err_t ret = esp_pm_lock_acquire(s_ai_cpu_lock);
@@ -5054,15 +5379,32 @@ esp_err_t cpu_power_ai_begin(void)
             TAG,
             "Acquiring AI CPU lock failed: %s",
             esp_err_to_name(ret));
+        xSemaphoreGive(s_policy_mutex);
+        return ret;
     }
 
-    return ret;
+    portENTER_CRITICAL(&s_state_lock);
+    s_ai_session_holds_mutex = true;
+    portEXIT_CRITICAL(&s_state_lock);
+
+    return ESP_OK;
 }
 
 esp_err_t cpu_power_ai_end(void)
 {
-    if (!s_initialized || s_ai_cpu_lock == NULL) {
+    if (!s_initialized || s_ai_cpu_lock == NULL ||
+        s_policy_mutex == NULL) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    bool release_required;
+    portENTER_CRITICAL(&s_state_lock);
+    release_required = s_ai_session_holds_mutex;
+    portEXIT_CRITICAL(&s_state_lock);
+
+    /* BALANCED/ECO cpu_power_ai_begin() is intentionally a successful no-op. */
+    if (!release_required) {
+        return ESP_OK;
     }
 
     esp_err_t ret = esp_pm_lock_release(s_ai_cpu_lock);
@@ -5073,7 +5415,49 @@ esp_err_t cpu_power_ai_end(void)
             esp_err_to_name(ret));
     }
 
+    portENTER_CRITICAL(&s_state_lock);
+    s_ai_session_holds_mutex = false;
+    portEXIT_CRITICAL(&s_state_lock);
+
+    /* Always release the mutex so a PM-lock error cannot deadlock the system. */
+    xSemaphoreGive(s_policy_mutex);
     return ret;
+}
+
+void cpu_power_update_inactivity(uint32_t inactive_ms)
+{
+    if (!s_initialized) {
+        return;
+    }
+
+    cpu_power_profile_t new_profile = CPU_POWER_PROFILE_PERFORMANCE;
+
+    if (inactive_ms >= APP_CPU_ECO_AFTER_MS) {
+        new_profile = CPU_POWER_PROFILE_ECO;
+    } else if (inactive_ms >= APP_CPU_BALANCED_AFTER_MS) {
+        new_profile = CPU_POWER_PROFILE_BALANCED;
+    }
+
+    set_profile(new_profile);
+}
+
+void cpu_power_notify_activity(void)
+{
+    if (s_initialized) {
+        set_profile(CPU_POWER_PROFILE_PERFORMANCE);
+    }
+}
+
+uint32_t cpu_power_get_face_detect_interval_frames(void)
+{
+    cpu_power_profile_t profile;
+
+    portENTER_CRITICAL(&s_state_lock);
+    profile = s_profile;
+    portEXIT_CRITICAL(&s_state_lock);
+
+    const uint32_t interval = profile_detection_interval(profile);
+    return interval > 0 ? interval : 1;
 }
 
 
