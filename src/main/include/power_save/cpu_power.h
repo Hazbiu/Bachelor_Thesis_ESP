@@ -14,7 +14,7 @@ typedef esp_err_t (*cpu_power_idle_transition_callback_t)(void *user_data);
 esp_err_t cpu_power_init(void);
 
 /*
- * Register application transitions used around the 180 MHz IDLE-SCAN policy.
+ * Register application transitions used around the staged IDLE-SCAN policy.
  * enter_idle_scan must suspend MIPI-DSI before the clock is reduced.
  * exit_idle_scan is invoked only after 360 MHz has been restored.
  */
@@ -27,13 +27,13 @@ esp_err_t cpu_power_register_idle_scan_callbacks(
 esp_err_t cpu_power_ai_begin(void);
 esp_err_t cpu_power_ai_end(void);
 
-/* Select ACTIVE or IDLE-SCAN from the measured inactivity duration. */
+/* Select ACTIVE, IDLE-SCAN-180 or IDLE-SCAN-90 from inactivity duration. */
 void cpu_power_update_inactivity(uint32_t inactive_ms);
 
 /* Restore 360 MHz and request display restoration after accepted activity. */
 void cpu_power_notify_activity(void);
 
-/* Return 2 frames in ACTIVE and 8 frames in IDLE-SCAN. */
+/* Return 2, 8 or 16 frames for ACTIVE, 180 MHz or 90 MHz scanning. */
 uint32_t cpu_power_get_face_detect_interval_frames(void);
 
 bool cpu_power_is_idle_scan_active(void);

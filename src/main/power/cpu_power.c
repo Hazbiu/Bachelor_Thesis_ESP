@@ -13,18 +13,20 @@
 
 #include "config/app_config.h"
 
-static const char *TAG = "cpu_power";
+static const char *TAG = "PWR_CPU";
 
 typedef enum {
     CPU_POWER_STATE_ACTIVE = 0,
     CPU_POWER_STATE_ENTERING_IDLE_SCAN,
-    CPU_POWER_STATE_IDLE_SCAN,
+    CPU_POWER_STATE_IDLE_SCAN_180,
+    CPU_POWER_STATE_IDLE_SCAN_90,
 } cpu_power_state_t;
 
 static esp_pm_lock_handle_t s_ai_cpu_lock;
 static SemaphoreHandle_t s_policy_mutex;
 static bool s_initialized;
 static bool s_ai_session_active;
+static bool s_idle_90_rejected_this_window;
 static cpu_power_state_t s_state = CPU_POWER_STATE_ACTIVE;
 
 static cpu_power_idle_transition_callback_t s_enter_idle_scan;
@@ -35,13 +37,28 @@ static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static const char *state_name(cpu_power_state_t state)
 {
-    if (state == CPU_POWER_STATE_IDLE_SCAN) {
-        return "IDLE-SCAN";
+    if (state == CPU_POWER_STATE_IDLE_SCAN_180) {
+        return "IDLE-SCAN-180";
+    }
+    if (state == CPU_POWER_STATE_IDLE_SCAN_90) {
+        return "IDLE-SCAN-90";
     }
     if (state == CPU_POWER_STATE_ENTERING_IDLE_SCAN) {
         return "ENTERING-IDLE-SCAN";
     }
     return "ACTIVE";
+}
+
+static uint32_t detection_interval_for_state(cpu_power_state_t state)
+{
+    if (state == CPU_POWER_STATE_IDLE_SCAN_90) {
+        return APP_FACE_DETECT_IDLE_90_INTERVAL_FRAMES;
+    }
+    if (state == CPU_POWER_STATE_IDLE_SCAN_180 ||
+        state == CPU_POWER_STATE_ENTERING_IDLE_SCAN) {
+        return APP_FACE_DETECT_IDLE_180_INTERVAL_FRAMES;
+    }
+    return APP_FACE_DETECT_INTERVAL_FRAMES;
 }
 
 /* Must be called while s_policy_mutex is held. */
@@ -60,7 +77,7 @@ static esp_err_t apply_fixed_frequency_locked(
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
-            "ADAPTIVE-POWER rejected state=%s requested=%d MHz: %s",
+            "event=CPU_CLOCK_REJECTED state=%s requested_mhz=%d error=%s",
             state_name(state),
             frequency_mhz,
             esp_err_to_name(ret));
@@ -70,7 +87,7 @@ static esp_err_t apply_fixed_frequency_locked(
     esp_pm_config_t applied = {0};
     ret = esp_pm_get_configuration(&applied);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "ADAPTIVE-POWER verification read failed: %s",
+        ESP_LOGE(TAG, "event=CPU_CLOCK_VERIFY_READ_FAILED error=%s",
                  esp_err_to_name(ret));
         return ret;
     }
@@ -80,8 +97,8 @@ static esp_err_t apply_fixed_frequency_locked(
         applied.light_sleep_enable) {
         ESP_LOGE(
             TAG,
-            "ADAPTIVE-POWER verification mismatch: state=%s requested=%d "
-            "applied=%d..%d MHz auto_light_sleep=%s",
+            "event=CPU_CLOCK_VERIFY_MISMATCH state=%s requested_mhz=%d "
+            "applied_min_mhz=%d applied_max_mhz=%d auto_light_sleep=%s",
             state_name(state),
             frequency_mhz,
             applied.min_freq_mhz,
@@ -90,16 +107,14 @@ static esp_err_t apply_fixed_frequency_locked(
         return ESP_FAIL;
     }
 
-    ESP_LOGW(
+    ESP_LOGI(
         TAG,
-        "ADAPTIVE-POWER APPLIED state=%s inactive=%" PRIu32
-        " ms fixed_clock=%d MHz detect_every=%" PRIu32 " frames",
+        "event=CPU_CLOCK_APPLIED state=%s inactive_ms=%" PRIu32
+        " cpu_mhz=%d detect_every_frames=%" PRIu32,
         state_name(state),
         inactive_ms,
         frequency_mhz,
-        state == CPU_POWER_STATE_IDLE_SCAN
-            ? (uint32_t)APP_FACE_DETECT_IDLE_INTERVAL_FRAMES
-            : (uint32_t)APP_FACE_DETECT_INTERVAL_FRAMES);
+        detection_interval_for_state(state));
 
     return ESP_OK;
 }
@@ -113,7 +128,7 @@ esp_err_t cpu_power_init(void)
     if (CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ != APP_CPU_ACTIVE_FREQ_MHZ) {
         ESP_LOGE(
             TAG,
-            "Expected sdkconfig CPU frequency %d MHz, found %d MHz",
+            "event=CPU_DEFAULT_MISMATCH expected_mhz=%d configured_mhz=%d",
             APP_CPU_ACTIVE_FREQ_MHZ,
             CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
         return ESP_ERR_INVALID_STATE;
@@ -158,16 +173,19 @@ esp_err_t cpu_power_init(void)
     portENTER_CRITICAL(&s_state_lock);
     s_state = CPU_POWER_STATE_ACTIVE;
     s_ai_session_active = false;
+    s_idle_90_rejected_this_window = false;
     s_initialized = true;
     portEXIT_CRITICAL(&s_state_lock);
 
-    ESP_LOGW(
+    ESP_LOGI(
         TAG,
-        "ADAPTIVE-POWER initialized: ACTIVE=%d MHz IDLE-SCAN=%d MHz "
-        "idle_after=%u ms",
+        "event=CPU_POLICY active_mhz=%d idle_180_mhz=%d "
+        "idle_180_after_ms=%u idle_90_mhz=%d idle_90_after_ms=%u",
         APP_CPU_ACTIVE_FREQ_MHZ,
-        APP_CPU_IDLE_SCAN_FREQ_MHZ,
-        (unsigned)APP_CPU_IDLE_SCAN_AFTER_MS);
+        APP_CPU_IDLE_180_FREQ_MHZ,
+        (unsigned)APP_CPU_IDLE_180_AFTER_MS,
+        APP_CPU_IDLE_90_FREQ_MHZ,
+        (unsigned)APP_CPU_IDLE_90_AFTER_MS);
 
     return ESP_OK;
 }
@@ -257,7 +275,7 @@ static void enter_idle_scan(uint32_t inactive_ms)
     }
 
     if (s_enter_idle_scan == NULL || s_exit_idle_scan == NULL) {
-        ESP_LOGW(TAG, "IDLE-SCAN callbacks are not registered");
+        ESP_LOGW(TAG, "event=IDLE_CALLBACKS_MISSING");
         xSemaphoreGive(s_policy_mutex);
         return;
     }
@@ -275,7 +293,7 @@ static void enter_idle_scan(uint32_t inactive_ms)
     /* The application removes MIPI-DSI while the CPU is still at 360 MHz. */
     esp_err_t ret = s_enter_idle_scan(s_transition_user_data);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "IDLE-SCAN display suspend failed: %s",
+        ESP_LOGE(TAG, "event=IDLE_DISPLAY_SUSPEND_FAILED error=%s",
                  esp_err_to_name(ret));
 
         if (xSemaphoreTake(s_policy_mutex, portMAX_DELAY) == pdTRUE) {
@@ -300,12 +318,12 @@ static void enter_idle_scan(uint32_t inactive_ms)
     }
 
     ret = apply_fixed_frequency_locked(
-        APP_CPU_IDLE_SCAN_FREQ_MHZ,
-        CPU_POWER_STATE_IDLE_SCAN,
+        APP_CPU_IDLE_180_FREQ_MHZ,
+        CPU_POWER_STATE_IDLE_SCAN_180,
         inactive_ms);
 
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "IDLE-SCAN frequency failed; restoring ACTIVE display");
+        ESP_LOGE(TAG, "event=IDLE_180_FAILED action=RESTORE_ACTIVE");
         (void)apply_fixed_frequency_locked(
             APP_CPU_ACTIVE_FREQ_MHZ,
             CPU_POWER_STATE_ACTIVE,
@@ -319,7 +337,57 @@ static void enter_idle_scan(uint32_t inactive_ms)
     }
 
     portENTER_CRITICAL(&s_state_lock);
-    s_state = CPU_POWER_STATE_IDLE_SCAN;
+    s_state = CPU_POWER_STATE_IDLE_SCAN_180;
+    portEXIT_CRITICAL(&s_state_lock);
+    s_idle_90_rejected_this_window = false;
+
+    xSemaphoreGive(s_policy_mutex);
+}
+
+static void enter_idle_scan_90(uint32_t inactive_ms)
+{
+    if (xSemaphoreTake(s_policy_mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+
+    if (s_state == CPU_POWER_STATE_IDLE_SCAN_90 ||
+        s_idle_90_rejected_this_window) {
+        xSemaphoreGive(s_policy_mutex);
+        return;
+    }
+
+    /*
+     * The 90 MHz stage is legal only after the display has been removed and
+     * the first 180 MHz stage is active. If 90 MHz is rejected, explicitly
+     * reapply 180 MHz and continue scanning instead of failing the system.
+     */
+    if (s_state != CPU_POWER_STATE_IDLE_SCAN_180) {
+        xSemaphoreGive(s_policy_mutex);
+        return;
+    }
+
+    esp_err_t ret = apply_fixed_frequency_locked(
+        APP_CPU_IDLE_90_FREQ_MHZ,
+        CPU_POWER_STATE_IDLE_SCAN_90,
+        inactive_ms);
+
+    if (ret != ESP_OK) {
+        s_idle_90_rejected_this_window = true;
+        ESP_LOGW(
+            TAG,
+            "event=CPU_CLOCK_FALLBACK failed_mhz=%d fallback_mhz=%d",
+            APP_CPU_IDLE_90_FREQ_MHZ,
+            APP_CPU_IDLE_180_FREQ_MHZ);
+        (void)apply_fixed_frequency_locked(
+            APP_CPU_IDLE_180_FREQ_MHZ,
+            CPU_POWER_STATE_IDLE_SCAN_180,
+            inactive_ms);
+        xSemaphoreGive(s_policy_mutex);
+        return;
+    }
+
+    portENTER_CRITICAL(&s_state_lock);
+    s_state = CPU_POWER_STATE_IDLE_SCAN_90;
     portEXIT_CRITICAL(&s_state_lock);
 
     xSemaphoreGive(s_policy_mutex);
@@ -340,7 +408,8 @@ static void restore_active(void)
 
     esp_err_t ret = ESP_OK;
 
-    if (previous_state == CPU_POWER_STATE_IDLE_SCAN) {
+    if (previous_state == CPU_POWER_STATE_IDLE_SCAN_180 ||
+        previous_state == CPU_POWER_STATE_IDLE_SCAN_90) {
         /* Restore 360 MHz before asking the application to start MIPI-DSI. */
         ret = apply_fixed_frequency_locked(
             APP_CPU_ACTIVE_FREQ_MHZ,
@@ -349,7 +418,7 @@ static void restore_active(void)
     }
 
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Cannot leave IDLE-SCAN because 360 MHz restore failed");
+        ESP_LOGE(TAG, "event=ACTIVE_RESTORE_FAILED requested_mhz=360");
         xSemaphoreGive(s_policy_mutex);
         return;
     }
@@ -357,12 +426,13 @@ static void restore_active(void)
     portENTER_CRITICAL(&s_state_lock);
     s_state = CPU_POWER_STATE_ACTIVE;
     portEXIT_CRITICAL(&s_state_lock);
+    s_idle_90_rejected_this_window = false;
 
     /* This callback only schedules display restoration; it must not block. */
     if (s_exit_idle_scan != NULL) {
         ret = s_exit_idle_scan(s_transition_user_data);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "ACTIVE display restore request failed: %s",
+            ESP_LOGE(TAG, "event=ACTIVE_DISPLAY_RESTORE_FAILED error=%s",
                      esp_err_to_name(ret));
         }
     }
@@ -376,7 +446,10 @@ void cpu_power_update_inactivity(uint32_t inactive_ms)
         return;
     }
 
-    if (inactive_ms >= APP_CPU_IDLE_SCAN_AFTER_MS) {
+    if (inactive_ms >= APP_CPU_IDLE_90_AFTER_MS) {
+        enter_idle_scan(inactive_ms);
+        enter_idle_scan_90(inactive_ms);
+    } else if (inactive_ms >= APP_CPU_IDLE_180_AFTER_MS) {
         enter_idle_scan(inactive_ms);
     } else {
         restore_active();
@@ -392,9 +465,11 @@ void cpu_power_notify_activity(void)
 
 uint32_t cpu_power_get_face_detect_interval_frames(void)
 {
-    return cpu_power_is_idle_scan_active()
-        ? APP_FACE_DETECT_IDLE_INTERVAL_FRAMES
-        : APP_FACE_DETECT_INTERVAL_FRAMES;
+    cpu_power_state_t state;
+    portENTER_CRITICAL(&s_state_lock);
+    state = s_state;
+    portEXIT_CRITICAL(&s_state_lock);
+    return detection_interval_for_state(state);
 }
 
 bool cpu_power_is_idle_scan_active(void)

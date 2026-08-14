@@ -8,7 +8,8 @@
 
 /* Face-processing configuration */
 #define APP_FACE_DETECT_INTERVAL_FRAMES             2U
-#define APP_FACE_DETECT_IDLE_INTERVAL_FRAMES        8U
+#define APP_FACE_DETECT_IDLE_180_INTERVAL_FRAMES    8U
+#define APP_FACE_DETECT_IDLE_90_INTERVAL_FRAMES     16U
 #define APP_FACE_RECOG_INTERVAL_FRAMES              10U
 #define APP_MAX_FACE_BOXES                          5
 #define APP_FACE_BOX_HOLD_MISSES                    5
@@ -24,20 +25,28 @@
  *   - CPU is fixed at 360 MHz;
  *   - detection runs every 2 camera frames.
  *
- * IDLE-SCAN (5..15 seconds without a face):
+ * IDLE-SCAN-180 (5..10 seconds without a face):
  *   - LVGL, backlight and MIPI-DSI are suspended first;
  *   - the camera remains active;
  *   - CPU is then fixed at 180 MHz;
  *   - detection runs every 8 camera frames;
  *   - recognition is not run until ACTIVE mode has been restored.
  *
+ * IDLE-SCAN-90 (10..15 seconds without a face):
+ *   - the display remains suspended and the camera remains active;
+ *   - CPU is fixed at 90 MHz;
+ *   - detection runs every 16 camera frames;
+ *   - if 90 MHz is rejected, the system safely stays at 180 MHz.
+ *
  * A face or accepted touchscreen event restores 360 MHz before the display is
  * reinitialized. At 15 seconds the existing coordinated Light-sleep path stops
  * the camera. At 30 seconds the system enters Deep-sleep.
  */
 #define APP_CPU_ACTIVE_FREQ_MHZ                     360
-#define APP_CPU_IDLE_SCAN_FREQ_MHZ                  180
-#define APP_CPU_IDLE_SCAN_AFTER_MS                  5000U
+#define APP_CPU_IDLE_180_FREQ_MHZ                   180
+#define APP_CPU_IDLE_180_AFTER_MS                   5000U
+#define APP_CPU_IDLE_90_FREQ_MHZ                    90
+#define APP_CPU_IDLE_90_AFTER_MS                    10000U
 
 /* Cache synchronization */
 #define APP_SYNC_CACHE_AROUND_OVERLAY               1
@@ -57,14 +66,18 @@
 #define APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS           25U
 #define APP_DEEP_SLEEP_BUTTON_PRIORITY              8
 
-#if APP_CPU_IDLE_SCAN_AFTER_MS >= APP_LIGHT_SLEEP_TIMEOUT_MS
-#error "Idle-scan must begin before Light-sleep"
+#if APP_CPU_IDLE_180_AFTER_MS >= APP_CPU_IDLE_90_AFTER_MS
+#error "The 180 MHz stage must begin before the 90 MHz stage"
+#endif
+#if APP_CPU_IDLE_90_AFTER_MS >= APP_LIGHT_SLEEP_TIMEOUT_MS
+#error "The 90 MHz stage must begin before Light-sleep"
 #endif
 #if APP_LIGHT_SLEEP_TIMEOUT_MS >= APP_DEEP_SLEEP_TIMEOUT_MS
 #error "Light-sleep must begin before Deep-sleep"
 #endif
 
 #if APP_FACE_DETECT_INTERVAL_FRAMES == 0 || \
-    APP_FACE_DETECT_IDLE_INTERVAL_FRAMES == 0
+    APP_FACE_DETECT_IDLE_180_INTERVAL_FRAMES == 0 || \
+    APP_FACE_DETECT_IDLE_90_INTERVAL_FRAMES == 0
 #error "Every face-detection interval must be greater than zero"
 #endif

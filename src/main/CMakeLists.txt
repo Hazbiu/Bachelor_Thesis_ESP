@@ -27,6 +27,7 @@ idf_component_register(
         "power/component_audio.c"
 
         # Diagnostics
+        "diagnostics/app_logging.c"
         "diagnostics/cpu_stats.c"
         "diagnostics/ai_pipeline_status.c"
 

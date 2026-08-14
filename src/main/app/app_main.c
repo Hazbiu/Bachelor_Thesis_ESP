@@ -17,6 +17,7 @@
 #include "services/vision/face_detector.h"
 #include "services/vision/face_recognizer.h"
 #include "diagnostics/core_trace.h"
+#include "diagnostics/app_logging.h"
 #include "diagnostics/cpu_stats.h"
 #include "diagnostics/ai_pipeline_status.h"
 #include "app/app_boot.h"
@@ -35,6 +36,7 @@
 #include "freertos/task.h"
 #include "power_save/cpu_power.h"
 #include "config/app_config.h"
+#include "config/log_config.h"
 #include "app_sleep.h"
 
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
@@ -712,8 +714,9 @@ static void idle_scan_touch_poll_task(void *arg)
 }
 
 /*
- * Called by cpu_power before it applies 180 MHz. The camera task remains
- * active, but no future callback is allowed to submit a display buffer.
+ * Called by cpu_power before it applies the first 180 MHz idle stage. The
+ * camera task remains active, but no future callback is allowed to submit a
+ * display buffer. The later 90 MHz stage reuses this suspended display.
  */
 static esp_err_t suspend_display_for_idle_scan(void *user_data)
 {
@@ -1082,7 +1085,9 @@ static void camera_application_start_task(void *arg)
      */
     app_boot_initialize_services();
 
+#if APP_DIAGNOSTICS_AI_PIPELINE_ENABLED
     diagnostics_start_ai_pipeline_monitor();
+#endif
 
     ret = esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size);
     if (ret != ESP_OK) {
@@ -1260,6 +1265,8 @@ static void launcher_start_requested(void *user_data)
 
 void app_main(void)
 {
+    app_logging_init();
+
     report_wake_reason();
     core_trace(TAG, "APP_MAIN_START");
 
@@ -1271,7 +1278,9 @@ void app_main(void)
             esp_err_to_name(cpu_power_ret));
     }
 
+#if APP_DIAGNOSTICS_CPU_STATS_ENABLED
     diagnostics_start_cpu_stats_monitor();
+#endif
 
     /*
      * Phase 1: normal LVGL rendering. The user sees a proper launcher and the
