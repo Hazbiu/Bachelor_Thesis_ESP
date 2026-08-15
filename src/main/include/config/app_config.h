@@ -22,30 +22,33 @@
  *
  * ACTIVE (0..5 seconds without a face):
  *   - camera and MIPI-DSI display are active;
- *   - CPU is fixed at 360 MHz;
+ *   - CPU normally runs at the 180 MHz baseline;
+ *   - a positive face detection requests the 360 MHz maximum;
+ *   - the 360 MHz request is held through recognition and the PIN transition;
+ *   - once the PIN screen is visible, the request is released and the CPU
+ *     returns to the 180 MHz baseline;
  *   - detection runs every 2 camera frames.
  *
- * IDLE-SCAN-180 (5..10 seconds without a face):
- *   - LVGL, backlight and MIPI-DSI are suspended first;
- *   - the camera remains active;
- *   - CPU is then fixed at 180 MHz;
+ * ECO-SCAN-8 (5..10 seconds without a face):
+ *   - camera, ISP, LVGL and MIPI-DSI remain initialized;
+ *   - the unlocked CPU baseline remains 180 MHz;
  *   - detection runs every 8 camera frames;
- *   - recognition is not run until ACTIVE mode has been restored.
+ *   - no shared camera/display hardware is deleted while CSI is active.
  *
- * IDLE-SCAN-90 (10..15 seconds without a face):
- *   - the display remains suspended and the camera remains active;
- *   - CPU is fixed at 90 MHz;
+ * ECO-SCAN-16 (10..15 seconds without a face):
+ *   - camera, ISP and display remain initialized;
+ *   - the unlocked CPU baseline remains 180 MHz;
  *   - detection runs every 16 camera frames;
- *   - if 90 MHz is rejected, the system safely stays at 180 MHz.
+ *   - the CPU is not reduced to 90 MHz while the CSI/ISP pipeline is active.
  *
- * A face or accepted touchscreen event restores 360 MHz before the display is
- * reinitialized. At 15 seconds the existing coordinated Light-sleep path stops
- * the camera. At 30 seconds the system enters Deep-sleep.
+ * A face detected during either ECO-SCAN stage requests 360 MHz and restores
+ * the normal detection interval. At 15 seconds the existing coordinated
+ * Light-sleep path stops the camera before suspending the display. At 30
+ * seconds the system enters Deep-sleep.
  */
-#define APP_CPU_ACTIVE_FREQ_MHZ                     360
-#define APP_CPU_IDLE_180_FREQ_MHZ                   180
+#define APP_CPU_MAX_FREQ_MHZ                        360
+#define APP_CPU_ACTIVE_FREQ_MHZ                     180
 #define APP_CPU_IDLE_180_AFTER_MS                   5000U
-#define APP_CPU_IDLE_90_FREQ_MHZ                    90
 #define APP_CPU_IDLE_90_AFTER_MS                    10000U
 
 /* Cache synchronization */
@@ -71,6 +74,9 @@
 #endif
 #if APP_CPU_IDLE_90_AFTER_MS >= APP_LIGHT_SLEEP_TIMEOUT_MS
 #error "The 90 MHz stage must begin before Light-sleep"
+#endif
+#if APP_CPU_ACTIVE_FREQ_MHZ > APP_CPU_MAX_FREQ_MHZ
+#error "The active CPU baseline cannot exceed the maximum CPU frequency"
 #endif
 #if APP_LIGHT_SLEEP_TIMEOUT_MS >= APP_DEEP_SLEEP_TIMEOUT_MS
 #error "Light-sleep must begin before Deep-sleep"

@@ -400,6 +400,24 @@ static bool pin_rearm_required;
 static int pin_rearm_no_face_passes;
 static char pending_identity[FACE_RECOG_MAX_NAME_LEN];
 
+static esp_err_t face_boost_release(const char *reason)
+{
+    if (!cpu_power_is_face_boost_active()) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = cpu_power_face_boost_end();
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not release face CPU boost (%s): %s",
+            reason ? reason : "unspecified",
+            esp_err_to_name(ret));
+    }
+
+    return ret;
+}
+
 static bool authentication_blocks_camera(void)
 {
     bool blocked;
@@ -444,6 +462,8 @@ static void authentication_mark_transition_failed(void)
     pin_transition_pending = false;
     pin_screen_active = false;
     portEXIT_CRITICAL(&authentication_state_lock);
+
+    face_boost_release("PIN transition failed");
 }
 
 static void camera_resume_task(void *arg)
@@ -576,17 +596,24 @@ static void pin_screen_transition_task(void *arg)
     pin_screen_active = true;
     portEXIT_CRITICAL(&authentication_state_lock);
 
+    /* The requested high-performance window ends once the PIN UI is visible. */
+    const esp_err_t boost_release_ret =
+        face_boost_release("PIN screen visible");
+
     xSemaphoreGive(display_mode_mutex);
-    ESP_LOGI(TAG, "Camera paused; PIN screen is active");
+    ESP_LOGI(
+        TAG,
+        "Camera paused; PIN screen is active; CPU baseline release=%s",
+        esp_err_to_name(boost_release_ret));
     vTaskDelete(NULL);
 }
 
-static void authentication_request_pin(const char *recognized_name)
+static bool authentication_request_pin(const char *recognized_name)
 {
     if (!recognized_name || recognized_name[0] == '\0' ||
         strcmp(recognized_name, "unknown") == 0 ||
         app_sleep_is_requested()) {
-        return;
+        return false;
     }
 
     bool reserved = false;
@@ -605,7 +632,7 @@ static void authentication_request_pin(const char *recognized_name)
     portEXIT_CRITICAL(&authentication_state_lock);
 
     if (!reserved) {
-        return;
+        return false;
     }
 
     const size_t identity_length = strnlen(
@@ -626,7 +653,10 @@ static void authentication_request_pin(const char *recognized_name)
     if (created != pdPASS) {
         ESP_LOGE(TAG, "Failed to create PIN-screen transition task");
         authentication_mark_transition_failed();
+        return false;
     }
+
+    return true;
 }
 
 /*
@@ -666,6 +696,7 @@ static void prepare_application_for_sleep(void *user_data)
      * recognition or LCD operations during shutdown.
      */
     dummy_mode_delay_flag = true;
+    face_boost_release("application sleep requested");
 
     /*
      * app_sleep.c switches the physical backlight off. Keep this
@@ -714,7 +745,7 @@ static void idle_scan_touch_poll_task(void *arg)
 }
 
 /*
- * Called by cpu_power before it applies the first 180 MHz idle stage. The
+ * Called by cpu_power before it applies the first 180 MHz idle baseline. The
  * camera task remains active, but no future callback is allowed to submit a
  * display buffer. The later 90 MHz stage reuses this suspended display.
  */
@@ -810,7 +841,9 @@ static void resume_display_from_idle_scan_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "ACTIVE 360 MHz confirmed; restoring MIPI-DSI and LVGL");
+    ESP_LOGI(
+        TAG,
+        "ACTIVE CPU policy restored; restoring MIPI-DSI and LVGL");
 
     dummy_mode_delay_flag = true;
 
@@ -871,11 +904,15 @@ static void resume_display_from_idle_scan_task(void *arg)
     dummy_mode_delay_flag = false;
 
     xSemaphoreGive(display_mode_mutex);
-    ESP_LOGI(TAG, "ACTIVE camera display restored at 360 MHz");
+    ESP_LOGI(
+        TAG,
+        "ACTIVE camera display restored; baseline=%d MHz boost=%s",
+        APP_CPU_ACTIVE_FREQ_MHZ,
+        cpu_power_is_face_boost_active() ? "on" : "off");
     vTaskDelete(NULL);
 }
 
-/* Called only after cpu_power has restored the fixed 360 MHz policy. */
+/* Called after cpu_power has restored the ACTIVE baseline/max DFS policy. */
 static esp_err_t request_display_resume_from_idle_scan(void *user_data)
 {
     (void)user_data;
@@ -919,6 +956,8 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
         ESP_LOGE(TAG, "Camera/display are not ready for Light-sleep suspend");
         return ESP_ERR_INVALID_STATE;
     }
+
+    face_boost_release("Light-sleep suspend");
 
     ESP_LOGI(TAG, "Suspending camera and MIPI-DSI for Light-sleep");
 
@@ -1515,16 +1554,7 @@ static void camera_video_frame_process(
          */
         const bool run_recognition = ((frame_count % APP_FACE_RECOG_INTERVAL_FRAMES) == 0);
 
-    esp_err_t detect_power_ret = cpu_power_ai_begin();
-
-    if (detect_power_ret != ESP_OK) {
-        ESP_LOGW(
-            TAG,
-            "Could not request maximum CPU frequency for detection: %s",
-            esp_err_to_name(detect_power_ret));
-    }
-
-    #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+#if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
         int face_count = face_detect_run_rgb565(
             camera_buf,
             camera_buf_hes,
@@ -1532,7 +1562,7 @@ static void camera_video_frame_process(
             boxes,
             APP_MAX_FACE_BOXES
         );
-    #else
+#else
         int face_count = face_detect_run_rgb888(
             camera_buf,
             camera_buf_hes,
@@ -1540,28 +1570,33 @@ static void camera_video_frame_process(
             boxes,
             APP_MAX_FACE_BOXES
         );
-    #endif
-
-    if (detect_power_ret == ESP_OK) {
-        esp_err_t release_ret = cpu_power_ai_end();
-
-        if (release_ret != ESP_OK) {
-            ESP_LOGW(
-                TAG,
-                "Could not release detection CPU lock: %s",
-                esp_err_to_name(release_ret));
-        }
-    }
+#endif
 
         ESP_LOGI(TAG, "Detection ran, face_count=%d", face_count);
         diagnostics_ai_detection_result(face_count);
         authentication_note_detection_result(face_count);
 
+        /*
+         * Detection itself runs at the low baseline because a face is not yet
+         * known to be present. The first positive result starts one persistent
+         * 360 MHz window for recognition and the PIN-screen transition.
+         */
+        if (face_count > 0) {
+            esp_err_t boost_ret = cpu_power_face_boost_begin();
+            if (boost_ret != ESP_OK) {
+                ESP_LOGW(
+                    TAG,
+                    "Could not request face CPU boost: %s",
+                    esp_err_to_name(boost_ret));
+            }
+        }
+
         if (idle_scan_frame) {
             if (face_count > 0) {
                 ESP_LOGI(
                     TAG,
-                    "IDLE-SCAN face detected; restoring 360 MHz before display");
+                    "IDLE-SCAN face detected; 360 MHz boost requested before "
+                    "display restore");
                 app_sleep_notify_face_detected();
             }
 
@@ -1586,6 +1621,7 @@ static void camera_video_frame_process(
             char updated_names[APP_MAX_FACE_BOXES][FACE_RECOG_MAX_NAME_LEN] = {{0}};
             float updated_recognition_scores[APP_MAX_FACE_BOXES] = {0};
             bool previous_box_used[APP_MAX_FACE_BOXES] = {false};
+            bool pin_transition_requested = false;
 
             for (int i = 0; i < update_count; i++) {
                 int matched_previous = -1;
@@ -1634,15 +1670,6 @@ static void camera_video_frame_process(
                     char name[FACE_RECOG_MAX_NAME_LEN];
                     float recog_score = 0.0f;
 
-                    esp_err_t recognition_power_ret = cpu_power_ai_begin();
-
-                    if (recognition_power_ret != ESP_OK) {
-                        ESP_LOGW(
-                            TAG,
-                            "Could not request maximum CPU frequency for recognition: %s",
-                            esp_err_to_name(recognition_power_ret));
-                    }
-
                     esp_err_t recog_ret = face_recognition_recognize(
                         camera_buf,
                         camera_buf_hes,
@@ -1652,17 +1679,6 @@ static void camera_video_frame_process(
                         sizeof(name),
                         &recog_score
                     );
-
-                    if (recognition_power_ret == ESP_OK) {
-                        esp_err_t release_ret = cpu_power_ai_end();
-
-                        if (release_ret != ESP_OK) {
-                            ESP_LOGW(
-                                TAG,
-                                "Could not release recognition CPU lock: %s",
-                                esp_err_to_name(release_ret));
-                        }
-                    }
 
                     diagnostics_ai_recognition_result(recog_ret, name, recog_score);
 
@@ -1679,7 +1695,9 @@ static void camera_video_frame_process(
                          * A known face is the first factor. Only a successful
                          * recognition may open the second-factor PIN screen.
                          */
-                        authentication_request_pin(updated_names[i]);
+                        if (authentication_request_pin(updated_names[i])) {
+                            pin_transition_requested = true;
+                        }
                     } else {
                         snprintf(
                             updated_names[i],
@@ -1701,6 +1719,15 @@ static void camera_video_frame_process(
                 }
             }
 
+            /*
+             * A scheduled recognition pass is the decision point. If no PIN
+             * transition was started (unknown/weak/rearm-blocked face), there
+             * is no valid reason to keep the maximum-frequency lock held.
+             */
+            if (run_recognition && !pin_transition_requested) {
+                face_boost_release("recognition completed without PIN transition");
+            }
+
             memcpy(last_boxes, updated_boxes, sizeof(updated_boxes));
             memcpy(last_face_names, updated_names, sizeof(updated_names));
             memcpy(
@@ -1718,6 +1745,7 @@ static void camera_video_frame_process(
                 last_face_count = 0;
                 memset(last_face_names, 0, sizeof(last_face_names));
                 memset(last_recognition_scores, 0, sizeof(last_recognition_scores));
+                face_boost_release("face left camera");
             }
         }
     }
