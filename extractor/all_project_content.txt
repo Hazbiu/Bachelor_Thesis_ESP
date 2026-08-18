@@ -1,11 +1,11 @@
 Complete project export
-Generated on: Fri Aug 14 11:15:49 AM CEST 2026
-Project: /home/hazbiu/Programming/Bachelor_Thesis_ESP
+Generated on: Tue Aug 18 07:58:38 PM CEST 2026
+Project: /home/admin/Programming/Bachelor_Thesis_ESP
 Included: every file under src/main
 Included: every CMakeLists.txt and *.cmake file under src
 Excluded from CMake search: src/managed_components
 Excluded from CMake search: src/build
-Unique files: 52
+Unique files: 58
 ==================================================
 
 FILE MANIFEST
@@ -18,20 +18,25 @@ src/components/espressif__esp_cam_sensor/test_apps/detect/main/CMakeLists.txt
 src/components/espressif__esp_cam_sensor/test_apps/xclk_generator/CMakeLists.txt
 src/components/espressif__esp_cam_sensor/test_apps/xclk_generator/main/CMakeLists.txt
 src/components/waveshare__esp32_p4_platform/CMakeLists.txt
+src/deep_sleep_fix/main/CMakeLists.txt
 src/main/app/app_boot.c
 src/main/app/app_main.c
 src/main/CMakeLists.txt
 src/main/diagnostics/ai_pipeline_status.c
+src/main/diagnostics/app_logging.c
 src/main/diagnostics/cpu_stats.c
 src/main/idf_component.yml
 src/main/include/app/app_boot.h
 src/main/include/config/app_config.h
 src/main/include/config/app_features.h
+src/main/include/config/log_config.h
 src/main/include/diagnostics/ai_pipeline_status.h
+src/main/include/diagnostics/app_logging.h
 src/main/include/diagnostics/core_trace.h
 src/main/include/diagnostics/cpu_stats.h
 src/main/include/platform/camera/video_capture.h
 src/main/include/power_save/component_audio.h
+src/main/include/power_save/component_display.h
 src/main/include/power_save/component_ethernet.h
 src/main/include/power_save/component_sdcard.h
 src/main/include/power_save/component_wifi.h
@@ -46,6 +51,7 @@ src/main/platform/storage/spiffs_storage.c
 src/main/power/app_sleep.c
 src/main/power/app_sleep.h
 src/main/power/component_audio.c
+src/main/power/component_display.c
 src/main/power/component_ethernet.c
 src/main/power/component_sdcard.c
 src/main/power/component_wifi.c
@@ -320,6 +326,50 @@ idf_component_register(
 
 
 ==================================================
+FILE: src/deep_sleep_fix/main/CMakeLists.txt
+==================================================
+idf_component_register(
+    SRCS
+        # Application orchestration
+        "app/app_main.c"
+        "app/app_boot.c"
+
+        # User interface
+        "ui/app_ui.c"
+        "ui/pin_screen.c"
+
+        # Camera platform
+        "platform/camera/video_capture.c"
+
+        # Vision services
+        "services/vision/face_detection/face_detector.cpp"
+        "services/vision/face_recognition/face_recognizer.cpp"
+
+        # Power management and sleep modes
+        "power/app_sleep.c"
+        "power/light_sleep.c"
+        "power/deep_sleep.c"
+        "power/wake_up.c"
+        "power/cpu_power.c"
+        "power/component_wifi.c"
+        "power/component_ethernet.c"
+        "power/component_sdcard.c"
+        "power/component_audio.c"
+        "power/component_display.c"
+
+        # Diagnostics
+        "diagnostics/app_logging.c"
+        "diagnostics/cpu_stats.c"
+        "diagnostics/ai_pipeline_status.c"
+
+    INCLUDE_DIRS
+        "include"
+        "ui"
+        "power"
+)
+
+
+==================================================
 FILE: src/main/app/app_boot.c
 ==================================================
 #include <stdio.h>
@@ -404,11 +454,13 @@ FILE: src/main/app/app_main.c
 #include "esp_heap_caps.h"
 #include "esp_private/esp_cache_private.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "driver/ppa.h"
 #include "platform/camera/video_capture.h"
 #include "services/vision/face_detector.h"
 #include "services/vision/face_recognizer.h"
 #include "diagnostics/core_trace.h"
+#include "diagnostics/app_logging.h"
 #include "diagnostics/cpu_stats.h"
 #include "diagnostics/ai_pipeline_status.h"
 #include "app/app_boot.h"
@@ -427,6 +479,7 @@ FILE: src/main/app/app_main.c
 #include "freertos/task.h"
 #include "power_save/cpu_power.h"
 #include "config/app_config.h"
+#include "config/log_config.h"
 #include "app_sleep.h"
 
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
@@ -451,7 +504,6 @@ static int smooth_coord(int old_value, int new_value)
 {
     return (old_value * 3 + new_value) / 4;
 }
-
 static void draw_rect_rgb565(
     uint16_t *fb,
     uint32_t fb_w,
@@ -758,6 +810,9 @@ static lv_display_t *disp;
 static lv_indev_t *launcher_touch_indev = NULL;
 static int video_cam_fd0 = -1;
 static bool display_suspended_for_light_sleep = false;
+static volatile bool display_suspended_for_idle_scan = false;
+static bool idle_scan_resume_task_pending = false;
+static portMUX_TYPE idle_scan_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static uint32_t frame_count = 0;
 
@@ -787,6 +842,24 @@ static bool pin_screen_active;
 static bool pin_rearm_required;
 static int pin_rearm_no_face_passes;
 static char pending_identity[FACE_RECOG_MAX_NAME_LEN];
+
+static esp_err_t face_boost_release(const char *reason)
+{
+    if (!cpu_power_is_face_boost_active()) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = cpu_power_face_boost_end();
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not release face CPU boost (%s): %s",
+            reason ? reason : "unspecified",
+            esp_err_to_name(ret));
+    }
+
+    return ret;
+}
 
 static bool authentication_blocks_camera(void)
 {
@@ -832,6 +905,8 @@ static void authentication_mark_transition_failed(void)
     pin_transition_pending = false;
     pin_screen_active = false;
     portEXIT_CRITICAL(&authentication_state_lock);
+
+    face_boost_release("PIN transition failed");
 }
 
 static void camera_resume_task(void *arg)
@@ -964,17 +1039,24 @@ static void pin_screen_transition_task(void *arg)
     pin_screen_active = true;
     portEXIT_CRITICAL(&authentication_state_lock);
 
+    /* The requested high-performance window ends once the PIN UI is visible. */
+    const esp_err_t boost_release_ret =
+        face_boost_release("PIN screen visible");
+
     xSemaphoreGive(display_mode_mutex);
-    ESP_LOGI(TAG, "Camera paused; PIN screen is active");
+    ESP_LOGI(
+        TAG,
+        "Camera paused; PIN screen is active; CPU baseline release=%s",
+        esp_err_to_name(boost_release_ret));
     vTaskDelete(NULL);
 }
 
-static void authentication_request_pin(const char *recognized_name)
+static bool authentication_request_pin(const char *recognized_name)
 {
     if (!recognized_name || recognized_name[0] == '\0' ||
         strcmp(recognized_name, "unknown") == 0 ||
         app_sleep_is_requested()) {
-        return;
+        return false;
     }
 
     bool reserved = false;
@@ -993,7 +1075,7 @@ static void authentication_request_pin(const char *recognized_name)
     portEXIT_CRITICAL(&authentication_state_lock);
 
     if (!reserved) {
-        return;
+        return false;
     }
 
     const size_t identity_length = strnlen(
@@ -1014,7 +1096,10 @@ static void authentication_request_pin(const char *recognized_name)
     if (created != pdPASS) {
         ESP_LOGE(TAG, "Failed to create PIN-screen transition task");
         authentication_mark_transition_failed();
+        return false;
     }
+
+    return true;
 }
 
 /*
@@ -1054,6 +1139,7 @@ static void prepare_application_for_sleep(void *user_data)
      * recognition or LCD operations during shutdown.
      */
     dummy_mode_delay_flag = true;
+    face_boost_release("application sleep requested");
 
     /*
      * app_sleep.c switches the physical backlight off. Keep this
@@ -1062,14 +1148,259 @@ static void prepare_application_for_sleep(void *user_data)
     display_backlight_enabled = false;
 }
 
-static esp_err_t suspend_application_for_light_sleep(void *user_data)
+static bool idle_scan_display_is_suspended(void)
+{
+    bool suspended;
+    portENTER_CRITICAL(&idle_scan_state_lock);
+    suspended = display_suspended_for_idle_scan;
+    portEXIT_CRITICAL(&idle_scan_state_lock);
+    return suspended;
+}
+
+static void idle_scan_touch_poll_task(void *arg)
+{
+    (void)arg;
+
+    /* Discard a coordinate consumed immediately before LVGL was stopped. */
+    bool touched = false;
+    (void)bsp_touch_poll_for_light_sleep(&touched);
+
+    while (idle_scan_display_is_suspended() &&
+           !display_suspended_for_light_sleep &&
+           !app_sleep_is_requested()) {
+        vTaskDelay(pdMS_TO_TICKS(APP_LIGHT_SLEEP_TOUCH_POLL_MS));
+
+        esp_err_t ret = bsp_touch_poll_for_light_sleep(&touched);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "IDLE-SCAN touch polling failed: %s",
+                     esp_err_to_name(ret));
+            break;
+        }
+
+        if (touched) {
+            ESP_LOGI(TAG, "IDLE-SCAN touchscreen activity detected");
+            app_sleep_notify_face_detected();
+            break;
+        }
+    }
+
+    vTaskDelete(NULL);
+}
+
+/*
+ * Called by cpu_power before it applies the first 180 MHz idle baseline. The
+ * camera task remains active, but no future callback is allowed to submit a
+ * display buffer. The later 90 MHz stage reuses this suspended display.
+ */
+static esp_err_t suspend_display_for_idle_scan(void *user_data)
 {
     (void)user_data;
 
     if (video_cam_fd0 < 0 || display_mode_mutex == NULL || disp == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(display_mode_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGE(TAG, "IDLE-SCAN timed out waiting for frame callback");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (idle_scan_display_is_suspended()) {
+        xSemaphoreGive(display_mode_mutex);
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "IDLE-SCAN suspending LVGL and MIPI-DSI; camera stays active");
+
+    dummy_mode_delay_flag = true;
+    bsp_display_backlight_off();
+    display_backlight_enabled = false;
+
+    esp_err_t ret = bsp_display_suspend_for_light_sleep();
+    if (ret != ESP_OK) {
+        xSemaphoreGive(display_mode_mutex);
+        ESP_LOGE(TAG, "IDLE-SCAN display suspend failed: %s",
+                 esp_err_to_name(ret));
+        esp_restart();
+        return ret;
+    }
+
+    /* The BSP invalidates all LVGL display and input handles. */
+    disp = NULL;
+    launcher_touch_indev = NULL;
+    dummy_draw_enabled = false;
+
+    portENTER_CRITICAL(&idle_scan_state_lock);
+    display_suspended_for_idle_scan = true;
+    portEXIT_CRITICAL(&idle_scan_state_lock);
+
+    /* Permit camera-only callbacks now that no DSI object can be accessed. */
+    dummy_mode_delay_flag = false;
+
+    portENTER_CRITICAL(&authentication_state_lock);
+    pin_transition_pending = false;
+    pin_screen_active = false;
+    pin_rearm_required = false;
+    pin_rearm_no_face_passes = 0;
+    pending_identity[0] = '\0';
+    portEXIT_CRITICAL(&authentication_state_lock);
+
+    xSemaphoreGive(display_mode_mutex);
+
+    BaseType_t created = xTaskCreate(
+        idle_scan_touch_poll_task,
+        "idle_scan_touch",
+        3072,
+        NULL,
+        4,
+        NULL);
+
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Could not create IDLE-SCAN touch polling task");
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "IDLE-SCAN display is off; camera-only scan is ready");
+    return ESP_OK;
+}
+
+static void resume_display_from_idle_scan_task(void *arg)
+{
+    (void)arg;
+
+    if (xSemaphoreTake(display_mode_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGE(TAG, "ACTIVE restore timed out waiting for frame callback");
+        esp_restart();
+    }
+
+    if (!idle_scan_display_is_suspended() ||
+        display_suspended_for_light_sleep ||
+        app_sleep_is_requested()) {
+        portENTER_CRITICAL(&idle_scan_state_lock);
+        idle_scan_resume_task_pending = false;
+        portEXIT_CRITICAL(&idle_scan_state_lock);
+        xSemaphoreGive(display_mode_mutex);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "ACTIVE CPU policy restored; restoring MIPI-DSI and LVGL");
+
+    dummy_mode_delay_flag = true;
+
+    /*
+     * The ESP32-P4 camera CSI and LCD DSI paths share DMA infrastructure.
+     * Recreating MIPI-DSI while CSI is streaming can hand the LCD driver an
+     * invalid GDMA device and cause a Store access fault. Pause CSI first,
+     * restore the complete display stack, then restart the same camera task.
+     */
+    ESP_LOGI(TAG, "ACTIVE pausing camera DMA before MIPI-DSI restoration");
+    esp_err_t ret = app_video_stream_task_stop(video_cam_fd0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ACTIVE camera pause before display restore failed: %s",
+                 esp_err_to_name(ret));
+        xSemaphoreGive(display_mode_mutex);
+        esp_restart();
+    }
+
+    disp = bsp_display_resume_from_light_sleep();
+    if (disp == NULL) {
+        ESP_LOGE(TAG, "ACTIVE display restoration failed");
+        xSemaphoreGive(display_mode_mutex);
+        esp_restart();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(150));
+    launcher_touch_indev = bsp_display_get_input_dev();
+
+    ret = esp_lv_adapter_set_dummy_draw(disp, true);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ACTIVE dummy-draw restoration failed: %s",
+                 esp_err_to_name(ret));
+        xSemaphoreGive(display_mode_mutex);
+        esp_restart();
+    }
+
+    dummy_draw_enabled = true;
+    display_buffer_index = 0;
+    display_disable_lvgl_overlays();
+    last_face_count = 0;
+    no_face_frames = 0;
+
+    ret = app_video_stream_task_restart(video_cam_fd0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ACTIVE camera restart after display restore failed: %s",
+                 esp_err_to_name(ret));
+        xSemaphoreGive(display_mode_mutex);
+        esp_restart();
+    }
+
+    portENTER_CRITICAL(&idle_scan_state_lock);
+    display_suspended_for_idle_scan = false;
+    idle_scan_resume_task_pending = false;
+    portEXIT_CRITICAL(&idle_scan_state_lock);
+
+    /* The first complete frame turns the physical backlight on. */
+    display_backlight_enabled = false;
+    dummy_mode_delay_flag = false;
+
+    xSemaphoreGive(display_mode_mutex);
+    ESP_LOGI(
+        TAG,
+        "ACTIVE camera display restored; baseline=%d MHz boost=%s",
+        APP_CPU_ACTIVE_FREQ_MHZ,
+        cpu_power_is_face_boost_active() ? "on" : "off");
+    vTaskDelete(NULL);
+}
+
+/* Called after cpu_power has restored the ACTIVE baseline/max DFS policy. */
+static esp_err_t request_display_resume_from_idle_scan(void *user_data)
+{
+    (void)user_data;
+
+    if (!idle_scan_display_is_suspended()) {
+        return ESP_OK;
+    }
+
+    portENTER_CRITICAL(&idle_scan_state_lock);
+    if (idle_scan_resume_task_pending) {
+        portEXIT_CRITICAL(&idle_scan_state_lock);
+        return ESP_OK;
+    }
+    idle_scan_resume_task_pending = true;
+    portEXIT_CRITICAL(&idle_scan_state_lock);
+
+    BaseType_t created = xTaskCreate(
+        resume_display_from_idle_scan_task,
+        "idle_scan_resume",
+        6144,
+        NULL,
+        7,
+        NULL);
+
+    if (created != pdPASS) {
+        portENTER_CRITICAL(&idle_scan_state_lock);
+        idle_scan_resume_task_pending = false;
+        portEXIT_CRITICAL(&idle_scan_state_lock);
+        ESP_LOGE(TAG, "Could not create ACTIVE display-resume task");
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t suspend_application_for_light_sleep(void *user_data)
+{
+    (void)user_data;
+
+    if (video_cam_fd0 < 0 || display_mode_mutex == NULL) {
         ESP_LOGE(TAG, "Camera/display are not ready for Light-sleep suspend");
         return ESP_ERR_INVALID_STATE;
     }
+
+    face_boost_release("Light-sleep suspend");
 
     ESP_LOGI(TAG, "Suspending camera and MIPI-DSI for Light-sleep");
 
@@ -1103,7 +1434,21 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
     }
 
     display_backlight_enabled = false;
-    ret = bsp_display_suspend_for_light_sleep();
+
+    if (idle_scan_display_is_suspended()) {
+        /* MIPI-DSI is already off; Light-sleep only had to stop the camera. */
+        ret = ESP_OK;
+        portENTER_CRITICAL(&idle_scan_state_lock);
+        display_suspended_for_idle_scan = false;
+        portEXIT_CRITICAL(&idle_scan_state_lock);
+        ESP_LOGI(TAG, "IDLE-SCAN display already suspended for Light-sleep");
+    } else {
+        if (disp == NULL) {
+            xSemaphoreGive(display_mode_mutex);
+            return ESP_ERR_INVALID_STATE;
+        }
+        ret = bsp_display_suspend_for_light_sleep();
+    }
 
     /* The adapter invalidates every LVGL display/input object on shutdown. */
     disp = NULL;
@@ -1222,7 +1567,9 @@ static void camera_application_start_task(void *arg)
      */
     app_boot_initialize_services();
 
+#if APP_DIAGNOSTICS_AI_PIPELINE_ENABLED
     diagnostics_start_ai_pipeline_monitor();
+#endif
 
     ret = esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size);
     if (ret != ESP_OK) {
@@ -1400,6 +1747,8 @@ static void launcher_start_requested(void *user_data)
 
 void app_main(void)
 {
+    app_logging_init();
+
     report_wake_reason();
     core_trace(TAG, "APP_MAIN_START");
 
@@ -1411,7 +1760,9 @@ void app_main(void)
             esp_err_to_name(cpu_power_ret));
     }
 
+#if APP_DIAGNOSTICS_CPU_STATS_ENABLED
     diagnostics_start_cpu_stats_monitor();
+#endif
 
     /*
      * Phase 1: normal LVGL rendering. The user sees a proper launcher and the
@@ -1473,6 +1824,21 @@ void app_main(void)
             "Light-sleep setup failed. Restart the device.");
     }
 
+    esp_err_t idle_callbacks_ret =
+        cpu_power_register_idle_scan_callbacks(
+            suspend_display_for_idle_scan,
+            request_display_resume_from_idle_scan,
+            NULL);
+
+    if (idle_callbacks_ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Failed to register adaptive IDLE-SCAN transitions: %s",
+            esp_err_to_name(idle_callbacks_ret));
+        app_ui_show_error(
+            "Adaptive CPU power setup failed. Restart the device.");
+    }
+
     /* The physical button works both on the launcher and in camera mode. */
     esp_err_t sleep_button_ret = app_sleep_start_button_monitor(
         prepare_application_for_sleep,
@@ -1522,8 +1888,10 @@ static void camera_video_frame_process(
     void *user_data)
 {
 
-    if (!dummy_draw_enabled ||
-        dummy_mode_delay_flag ||
+    const bool idle_scan_frame = idle_scan_display_is_suspended();
+
+    if ((!dummy_draw_enabled && !idle_scan_frame) ||
+        (dummy_mode_delay_flag && !idle_scan_frame) ||
         authentication_blocks_camera())
     {
         return;
@@ -1537,12 +1905,7 @@ static void camera_video_frame_process(
     (void)camera_buf_len;
     (void)user_data;
 
-    void *target_fb = display_buffer[display_buffer_index];
-    if (!target_fb)
-    {
-        ESP_LOGE(TAG, "display buffer is NULL");
-        return;
-    }
+    void *target_fb = NULL;
 
     const uint32_t display_width = BSP_LCD_H_RES;
     const uint32_t display_height = BSP_LCD_V_RES;
@@ -1553,16 +1916,23 @@ static void camera_video_frame_process(
         return;
     }
 
-    uint32_t in_offset_x = 0;
-    uint32_t in_offset_y = 0;
+    esp_err_t ret = ESP_OK;
 
-    uint32_t in_block_w = camera_buf_hes;
-    uint32_t in_block_h = camera_buf_ves;
+    if (!idle_scan_frame) {
+        target_fb = display_buffer[display_buffer_index];
+        if (!target_fb) {
+            ESP_LOGE(TAG, "display buffer is NULL");
+            return;
+        }
 
-    float scale_x = (float)display_width / (float)camera_buf_hes;
-    float scale_y = (float)display_height / (float)camera_buf_ves;
+        const uint32_t in_offset_x = 0;
+        const uint32_t in_offset_y = 0;
+        const uint32_t in_block_w = camera_buf_hes;
+        const uint32_t in_block_h = camera_buf_ves;
+        const float scale_x = (float)display_width / (float)camera_buf_hes;
+        const float scale_y = (float)display_height / (float)camera_buf_ves;
 
-    ppa_srm_oper_config_t srm_config = {
+        ppa_srm_oper_config_t srm_config = {
         .in.buffer = camera_buf,
         .in.pic_w = camera_buf_hes,
         .in.pic_h = camera_buf_ves,
@@ -1588,13 +1958,13 @@ static void camera_video_frame_process(
         .rgb_swap = 0,
         .byte_swap = 0,
         .mode = PPA_TRANS_MODE_BLOCKING,
-    };
+        };
 
-    esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "PPA SRM failed: %d", ret);
-        return;
+        ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "PPA SRM failed: %d", ret);
+            return;
+        }
     }
 
     frame_count++;
@@ -1627,16 +1997,7 @@ static void camera_video_frame_process(
          */
         const bool run_recognition = ((frame_count % APP_FACE_RECOG_INTERVAL_FRAMES) == 0);
 
-    esp_err_t detect_power_ret = cpu_power_ai_begin();
-
-    if (detect_power_ret != ESP_OK) {
-        ESP_LOGW(
-            TAG,
-            "Could not request maximum CPU frequency for detection: %s",
-            esp_err_to_name(detect_power_ret));
-    }
-
-    #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+#if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
         int face_count = face_detect_run_rgb565(
             camera_buf,
             camera_buf_hes,
@@ -1644,7 +2005,7 @@ static void camera_video_frame_process(
             boxes,
             APP_MAX_FACE_BOXES
         );
-    #else
+#else
         int face_count = face_detect_run_rgb888(
             camera_buf,
             camera_buf_hes,
@@ -1652,22 +2013,39 @@ static void camera_video_frame_process(
             boxes,
             APP_MAX_FACE_BOXES
         );
-    #endif
-
-    if (detect_power_ret == ESP_OK) {
-        esp_err_t release_ret = cpu_power_ai_end();
-
-        if (release_ret != ESP_OK) {
-            ESP_LOGW(
-                TAG,
-                "Could not release detection CPU lock: %s",
-                esp_err_to_name(release_ret));
-        }
-    }
+#endif
 
         ESP_LOGI(TAG, "Detection ran, face_count=%d", face_count);
         diagnostics_ai_detection_result(face_count);
         authentication_note_detection_result(face_count);
+
+        /*
+         * Detection itself runs at the low baseline because a face is not yet
+         * known to be present. The first positive result starts one persistent
+         * 360 MHz window for recognition and the PIN-screen transition.
+         */
+        if (face_count > 0) {
+            esp_err_t boost_ret = cpu_power_face_boost_begin();
+            if (boost_ret != ESP_OK) {
+                ESP_LOGW(
+                    TAG,
+                    "Could not request face CPU boost: %s",
+                    esp_err_to_name(boost_ret));
+            }
+        }
+
+        if (idle_scan_frame) {
+            if (face_count > 0) {
+                ESP_LOGI(
+                    TAG,
+                    "IDLE-SCAN face detected; 360 MHz boost requested before "
+                    "display restore");
+                app_sleep_notify_face_detected();
+            }
+
+            /* Recognition and display work resume only after ACTIVE restore. */
+            return;
+        }
 
         if (face_count > 0) {
             /*
@@ -1686,6 +2064,7 @@ static void camera_video_frame_process(
             char updated_names[APP_MAX_FACE_BOXES][FACE_RECOG_MAX_NAME_LEN] = {{0}};
             float updated_recognition_scores[APP_MAX_FACE_BOXES] = {0};
             bool previous_box_used[APP_MAX_FACE_BOXES] = {false};
+            bool pin_transition_requested = false;
 
             for (int i = 0; i < update_count; i++) {
                 int matched_previous = -1;
@@ -1734,15 +2113,6 @@ static void camera_video_frame_process(
                     char name[FACE_RECOG_MAX_NAME_LEN];
                     float recog_score = 0.0f;
 
-                    esp_err_t recognition_power_ret = cpu_power_ai_begin();
-
-                    if (recognition_power_ret != ESP_OK) {
-                        ESP_LOGW(
-                            TAG,
-                            "Could not request maximum CPU frequency for recognition: %s",
-                            esp_err_to_name(recognition_power_ret));
-                    }
-
                     esp_err_t recog_ret = face_recognition_recognize(
                         camera_buf,
                         camera_buf_hes,
@@ -1752,17 +2122,6 @@ static void camera_video_frame_process(
                         sizeof(name),
                         &recog_score
                     );
-
-                    if (recognition_power_ret == ESP_OK) {
-                        esp_err_t release_ret = cpu_power_ai_end();
-
-                        if (release_ret != ESP_OK) {
-                            ESP_LOGW(
-                                TAG,
-                                "Could not release recognition CPU lock: %s",
-                                esp_err_to_name(release_ret));
-                        }
-                    }
 
                     diagnostics_ai_recognition_result(recog_ret, name, recog_score);
 
@@ -1779,7 +2138,9 @@ static void camera_video_frame_process(
                          * A known face is the first factor. Only a successful
                          * recognition may open the second-factor PIN screen.
                          */
-                        authentication_request_pin(updated_names[i]);
+                        if (authentication_request_pin(updated_names[i])) {
+                            pin_transition_requested = true;
+                        }
                     } else {
                         snprintf(
                             updated_names[i],
@@ -1801,6 +2162,15 @@ static void camera_video_frame_process(
                 }
             }
 
+            /*
+             * A scheduled recognition pass is the decision point. If no PIN
+             * transition was started (unknown/weak/rearm-blocked face), there
+             * is no valid reason to keep the maximum-frequency lock held.
+             */
+            if (run_recognition && !pin_transition_requested) {
+                face_boost_release("recognition completed without PIN transition");
+            }
+
             memcpy(last_boxes, updated_boxes, sizeof(updated_boxes));
             memcpy(last_face_names, updated_names, sizeof(updated_names));
             memcpy(
@@ -1818,8 +2188,13 @@ static void camera_video_frame_process(
                 last_face_count = 0;
                 memset(last_face_names, 0, sizeof(last_face_names));
                 memset(last_recognition_scores, 0, sizeof(last_recognition_scores));
+                face_boost_release("face left camera");
             }
         }
+    }
+
+    if (idle_scan_frame) {
+        return;
     }
 
     #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
@@ -1932,8 +2307,10 @@ idf_component_register(
         "power/component_ethernet.c"
         "power/component_sdcard.c"
         "power/component_audio.c"
+        "power/component_display.c"
 
         # Diagnostics
+        "diagnostics/app_logging.c"
         "diagnostics/cpu_stats.c"
         "diagnostics/ai_pipeline_status.c"
 
@@ -2029,6 +2406,88 @@ void diagnostics_start_ai_pipeline_monitor(void)
         tskNO_AFFINITY
     );
 }
+
+==================================================
+FILE: src/main/diagnostics/app_logging.c
+==================================================
+#include "diagnostics/app_logging.h"
+
+#include "esp_log.h"
+
+#include "config/log_config.h"
+
+#define ENABLE_INFO(tag) esp_log_level_set((tag), ESP_LOG_INFO)
+
+void app_logging_init(void)
+{
+#if APP_LOG_KEEP_UNSELECTED_ERRORS
+    esp_log_level_set("*", ESP_LOG_ERROR);
+#else
+    esp_log_level_set("*", ESP_LOG_NONE);
+#endif
+
+#if APP_LOG_ENABLE_CPU_POWER
+    ENABLE_INFO("PWR_CPU");
+    ENABLE_INFO("PWR_STATE");
+#endif
+
+#if APP_LOG_ENABLE_ESP_PM
+    ENABLE_INFO("pm");
+#endif
+
+#if APP_LOG_ENABLE_POWER_SLEEP
+    ENABLE_INFO("app_sleep");
+    ENABLE_INFO("light_sleep");
+    ENABLE_INFO("deep_sleep");
+    ENABLE_INFO("wake_up");
+    ENABLE_INFO("component_audio");
+    ENABLE_INFO("component_display");
+    ENABLE_INFO("component_ethernet");
+    ENABLE_INFO("component_sdcard");
+    ENABLE_INFO("component_wifi");
+    ENABLE_INFO("POWER_PROFILE");
+    /*
+     * Pre-Deep-sleep rail audit. Without this line the whole audit table is
+     * swallowed by the esp_log_level_set("*", ESP_LOG_NONE) default above.
+     */
+    ENABLE_INFO("PWR_AUDIT");
+#endif
+
+#if APP_LOG_ENABLE_APPLICATION
+    ENABLE_INFO("app_main");
+#endif
+
+#if APP_LOG_ENABLE_CAMERA
+    ENABLE_INFO("app_video");
+    ENABLE_INFO("ov5647");
+    ENABLE_INFO("esp_video");
+#endif
+
+#if APP_LOG_ENABLE_DISPLAY
+    ENABLE_INFO("ESP32_P4_PLATFORM");
+    ENABLE_INFO("esp_lvgl:adapter");
+    ENABLE_INFO("esp_lvgl:bridge");
+    ENABLE_INFO("esp_lvgl:bridge_v9");
+    ENABLE_INFO("esp_lvgl:touch");
+    ENABLE_INFO("jd9365");
+    ENABLE_INFO("GT911");
+#endif
+
+#if APP_LOG_ENABLE_AI
+    ENABLE_INFO("face_detect_wrapper");
+    ENABLE_INFO("face_recognition_wrapper");
+    ENABLE_INFO("FbsLoader");
+    ENABLE_INFO("dl::Model");
+#endif
+
+#if APP_LOG_ENABLE_UI
+    ENABLE_INFO("app_ui");
+    ENABLE_INFO("pin_screen");
+#endif
+}
+
+#undef ENABLE_INFO
+
 
 ==================================================
 FILE: src/main/diagnostics/cpu_stats.c
@@ -2238,69 +2697,262 @@ FILE: src/main/include/config/app_config.h
 #define APP_DISPLAY_BUFFER_COUNT            2
 
 /* Face-processing configuration */
-#define APP_FACE_DETECT_INTERVAL_FRAMES     2
-#define APP_FACE_RECOG_INTERVAL_FRAMES      10
-#define APP_MAX_FACE_BOXES                  5
-#define APP_FACE_BOX_HOLD_MISSES            5
-#define APP_FACE_RECOG_MIN_SCORE            0.70f
-#define APP_FACE_BOX_THICKNESS              3
-#define APP_FACE_LABEL_FONT_SCALE           3
+#define APP_FACE_DETECT_INTERVAL_FRAMES             2U
+#define APP_FACE_DETECT_IDLE_180_INTERVAL_FRAMES    8U
+#define APP_FACE_DETECT_IDLE_90_INTERVAL_FRAMES     16U
+#define APP_FACE_RECOG_INTERVAL_FRAMES              10U
+#define APP_MAX_FACE_BOXES                          5
+#define APP_FACE_BOX_HOLD_MISSES                    5
+#define APP_FACE_RECOG_MIN_SCORE                    0.70f
+#define APP_FACE_BOX_THICKNESS                      3
+#define APP_FACE_LABEL_FONT_SCALE                   3
 
 /*
- * Active-mode power stages.
+ * Adaptive active-power policy.
  *
- * 0..5 s without activity (PERFORMANCE):
- *   - CPU policy is 90..360 MHz
- *   - normal detection interval
- *   - AI explicitly requests 360 MHz during inference
+ * ACTIVE (0..5 seconds without a face):
+ *   - camera and MIPI-DSI display are active;
+ *   - CPU normally runs at the 180 MHz baseline;
+ *   - a positive face detection requests the 360 MHz maximum;
+ *   - the 360 MHz request is held through recognition and the PIN transition;
+ *   - once the PIN screen is visible, the request is released and the CPU
+ *     returns to the 180 MHz baseline;
+ *   - detection runs every 2 camera frames.
  *
- * 5..10 s without activity (BALANCED):
- *   - CPU remains in the safe 90..360 MHz DFS range
- *   - the application no longer forces 360 MHz for no-face detection
- *   - detection runs less often
+ * ECO-SCAN-8 (5..10 seconds without a face):
+ *   - camera, ISP, LVGL and MIPI-DSI remain initialized;
+ *   - the unlocked CPU baseline remains 180 MHz;
+ *   - detection runs every 8 camera frames;
+ *   - no shared camera/display hardware is deleted while CSI is active.
  *
- * 10..15 s without activity (ECO):
- *   - CPU remains in the safe 90..360 MHz DFS range
- *   - the application AI maximum-frequency lock remains disabled
- *   - detection is throttled further
+ * ECO-SCAN-16 (10..15 seconds without a face):
+ *   - camera, ISP and display remain initialized;
+ *   - the unlocked CPU baseline remains 180 MHz;
+ *   - detection runs every 16 camera frames;
+ *   - the CPU is not reduced to 90 MHz while the CSI/ISP pipeline is active.
  *
- * At 15 s app_sleep.c enters coordinated Light-sleep. At 30 s it enters
- * Deep-sleep if no touchscreen, face, PIN or GPIO3 activity resets the timer.
+ * A face detected during either ECO-SCAN stage requests 360 MHz and restores
+ * the normal detection interval. At 15 seconds the existing coordinated
+ * Light-sleep path stops the camera before suspending the display. At 30
+ * seconds the system enters Deep-sleep.
  */
-#define APP_CPU_BALANCED_AFTER_MS                5000
-#define APP_CPU_ECO_AFTER_MS                    10000
-#define APP_FACE_DETECT_BALANCED_INTERVAL_FRAMES    4
-#define APP_FACE_DETECT_ECO_INTERVAL_FRAMES         8
+#define APP_CPU_MAX_FREQ_MHZ                        360
+#define APP_CPU_ACTIVE_FREQ_MHZ                     180
+#define APP_CPU_IDLE_180_AFTER_MS                   5000U
+#define APP_CPU_IDLE_90_AFTER_MS                    10000U
 
 /* Cache synchronization */
-#define APP_SYNC_CACHE_AROUND_OVERLAY       1
+#define APP_SYNC_CACHE_AROUND_OVERLAY               1
 
 /* Light-sleep configuration */
-#define APP_LIGHT_SLEEP_WAKE_GPIO           GPIO_NUM_3
-#define APP_LIGHT_SLEEP_TIMEOUT_MS          15000
-#define APP_LIGHT_SLEEP_TOUCH_POLL_MS       250
-#define APP_LIGHT_SLEEP_BUTTON_POLL_MS      5
-#define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS  25
+#define APP_LIGHT_SLEEP_WAKE_GPIO                   GPIO_NUM_3
+#define APP_LIGHT_SLEEP_TIMEOUT_MS                  15000U
+#define APP_LIGHT_SLEEP_TOUCH_POLL_MS               250U
+#define APP_LIGHT_SLEEP_BUTTON_POLL_MS              5U
+#define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
 
-/* Deep-sleep configuration (short 30-second deadline for testing) */
-#define APP_DEEP_SLEEP_TIMEOUT_MS           30000
-#define APP_DEEP_SLEEP_INACTIVITY_POLL_MS   100
-#define APP_DEEP_SLEEP_BUTTON_GPIO          GPIO_NUM_3
-#define APP_DEEP_SLEEP_BUTTON_POLL_MS       5
-#define APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS   25
-#define APP_DEEP_SLEEP_BUTTON_PRIORITY      8
+/* Deep-sleep configuration */
+#define APP_DEEP_SLEEP_TIMEOUT_MS                   30000U
+#define APP_DEEP_SLEEP_INACTIVITY_POLL_MS           100U
+#define APP_DEEP_SLEEP_BUTTON_GPIO                  GPIO_NUM_3
+#define APP_DEEP_SLEEP_BUTTON_POLL_MS               5U
+#define APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS           25U
+#define APP_DEEP_SLEEP_BUTTON_PRIORITY              8
 
-#if APP_CPU_BALANCED_AFTER_MS >= APP_CPU_ECO_AFTER_MS
-#error "Balanced CPU stage must begin before the ECO stage"
+/*
+ * =====================================================================
+ * Deep-sleep peripheral power control
+ * =====================================================================
+ *
+ * Single source of truth for every board pin that the Deep-sleep shutdown
+ * sequence drives. The individual power_save/component_*.c modules and the
+ * pre-sleep rail audit in power/deep_sleep.c both read these definitions, so
+ * a pin can never be held in one place and audited in another.
+ *
+ * Waveshare ESP32-P4-NANO board mapping:
+ *
+ *   GPIO54 -> ESP32-C6 CHIP_PU      LOW  = coprocessor held in reset
+ *   GPIO51 -> IP101GRI PHY RESET    LOW  = PHY held in reset
+ *   GPIO53 -> audio amplifier EN    LOW  = amplifier disabled
+ *   GPIO45 -> Q1 (AO3401) gate      HIGH = SD1_VDD disconnected
+ *   GPIO7  -> ESP_I2C_SDA           external 2.2K pull-up (R50)
+ *   GPIO8  -> ESP_I2C_SCL           external 2.2K pull-up (R48)
+ */
+#define APP_PWR_WIFI_C6_CHIP_PU_GPIO                GPIO_NUM_54
+#define APP_PWR_WIFI_C6_DISABLED_LEVEL              0
+#define APP_PWR_WIFI_C6_ENABLED_LEVEL               1
+
+#define APP_PWR_ETHERNET_PHY_RESET_GPIO             GPIO_NUM_51
+#define APP_PWR_ETHERNET_RESET_ACTIVE_LEVEL         0
+#define APP_PWR_ETHERNET_RESET_RELEASED_LEVEL       1
+
+#define APP_PWR_AUDIO_AMP_GPIO                      GPIO_NUM_53
+#define APP_PWR_AUDIO_AMP_DISABLED_LEVEL            0
+#define APP_PWR_AUDIO_AMP_ENABLED_LEVEL             1
+
+#define APP_PWR_SDCARD_POWER_GPIO                   GPIO_NUM_45
+#define APP_PWR_SDCARD_POWER_ON_LEVEL               0
+#define APP_PWR_SDCARD_POWER_OFF_LEVEL              1
+#define APP_PWR_SDCARD_POWER_SETTLE_MS              20
+
+#define APP_PWR_SHARED_I2C_SDA_GPIO                 GPIO_NUM_7
+#define APP_PWR_SHARED_I2C_SCL_GPIO                 GPIO_NUM_8
+
+/*
+ * Read-back settle window.
+ *
+ * A pad does not necessarily reflect its new level on the very next
+ * instruction after gpio_hold_en(). Measured on the ESP32-P4-NANO: GPIO54
+ * (ESP32-C6 CHIP_PU) still reads HIGH immediately after the hold is applied,
+ * and reads LOW a few tens of milliseconds later - the pre-sleep rail audit
+ * confirms it. Verifying with zero delay therefore produced a false
+ * "coprocessor is still powered" error on a pin that was in fact held
+ * correctly.
+ *
+ * Each component now polls the pad until it matches, up to this timeout,
+ * before deciding the hold failed.
+ */
+#define APP_PWR_HOLD_VERIFY_TIMEOUT_MS              150
+#define APP_PWR_HOLD_VERIFY_POLL_MS                 5
+
+/*
+ * ---------------------------------------------------------------------
+ * Display / touch Deep-sleep configuration
+ * ---------------------------------------------------------------------
+ *
+ * The GT911 touch controller keeps actively scanning (roughly 5..10 mA)
+ * unless it is explicitly told to sleep over I2C. The command must be sent
+ * AFTER the BSP has released its own touch handle and BEFORE the shared I2C
+ * pins are isolated in enter_deep_sleep().
+ *
+ * ---------------------------------------------------------------------
+ * READ THIS BEFORE SETTING APP_PWR_GT911_SLEEP_ENABLED BACK TO 1
+ * ---------------------------------------------------------------------
+ *
+ * The GT911 sleep command is NOT cleared by an ESP32-P4 reset. The touch
+ * controller is powered from the display module's own always-on 3.3 V rail,
+ * so it stays asleep across a Deep-sleep wake, an EN-pin reset and a reflash.
+ * Its I2C interface is off while it sleeps, so the next boot fails in
+ *
+ *     bsp_display_indev_init -> bsp_touch_new() -> ESP_ERR_NOT_FOUND
+ *
+ * which the Waveshare BSP wraps in ESP_ERROR_CHECK, aborting into a reboot
+ * loop that only a full power cycle clears.
+ *
+ * The controller can only be woken by hardware: an INT pulse held HIGH for
+ * more than ~2 ms, or a RESET toggle. Sleeping it without owning one of those
+ * pins is therefore a one-way trip, which is why this defaults to 0 and why
+ * the build now refuses the combination outright (see the #error below).
+ *
+ * To recover the ~5..10 mA saving:
+ *   1. find the GT911 INT pin, or better its RESET pin, in the Waveshare
+ *      schematic for your display and set it below;
+ *   2. set APP_PWR_GT911_SLEEP_ENABLED back to 1.
+ * component_display.c then wakes the controller automatically on every boot,
+ * before the BSP probes it.
+ *
+ *   -1 disables the corresponding step.
+ */
+#define APP_PWR_GT911_SLEEP_ENABLED                 0
+#define APP_PWR_GT911_PRIMARY_ADDRESS               0x5D
+#define APP_PWR_GT911_SECONDARY_ADDRESS             0x14
+
+/* GT911 timings used by the boot-time wake sequence. */
+#define APP_PWR_GT911_RESET_ASSERT_MS               20
+#define APP_PWR_GT911_INT_PULSE_MS                  5
+#define APP_PWR_GT911_BOOT_MS                       60
+
+/* Set to the real backlight-enable pin, e.g. GPIO_NUM_23. -1 = skip. */
+#define APP_PWR_DISPLAY_BACKLIGHT_GPIO              (-1)
+#define APP_PWR_DISPLAY_BACKLIGHT_OFF_LEVEL         0
+
+/* Set to the real GT911 INT pin. -1 = skip. Driving it LOW keeps the */
+/* controller from waking itself out of the sleep state.              */
+#define APP_PWR_TOUCH_INT_GPIO                      (-1)
+
+/* Set to the real GT911 RESET pin. -1 = skip. Holding reset asserted */
+/* is even lower than the sleep command when the pin is available.    */
+#define APP_PWR_TOUCH_RESET_GPIO                    (-1)
+#define APP_PWR_TOUCH_RESET_ACTIVE_LEVEL            0
+
+/*
+ * ---------------------------------------------------------------------
+ * Optional extra Deep-sleep measures
+ * ---------------------------------------------------------------------
+ */
+
+/*
+ * Ask ESP-IDF to power the SPI flash rail (VDD_SPI) down during Deep-sleep.
+ *
+ * On this board the request is REJECTED with ESP_ERR_INVALID_STATE, and that
+ * is expected rather than a fault: the boot log shows
+ *
+ *     mmu_psram: .rodata xip on psram
+ *     mmu_psram: .text   xip on psram
+ *
+ * so application code and constants are executed in place from the 32 MB PSRAM
+ * that shares the VDD_SPI rail with the flash. IDF will not let that rail be
+ * switched off. The rejection is handled and logged as information, not as a
+ * warning, and Deep-sleep continues normally.
+ *
+ * Leave this enabled: it costs nothing, it is self-documenting in the log, and
+ * it starts working automatically if XIP-from-PSRAM is ever disabled. The
+ * saving would be a few tens of microamps - far below this board's floor.
+ */
+#define APP_PWR_DEEP_SLEEP_POWER_DOWN_FLASH         1
+
+/*
+ * Print the level of every controlled rail immediately before entering
+ * Deep-sleep. Each line reports measured vs expected, so a released hold is
+ * visible in the serial log instead of only on a multimeter.
+ */
+#define APP_PWR_DEEP_SLEEP_AUDIT_ENABLED            1
+
+/*
+ * After SD1_VDD is switched off, the SDMMC signals can still back-power the
+ * card through its ESD structures if the ESP32-P4 keeps driving them or if
+ * their pull-ups sit on the always-on 3V3 rail. Enable this and list the real
+ * SDMMC pins for your board to float those pads at the Deep-sleep boundary.
+ *
+ * Leave disabled until the pin numbers have been confirmed in the schematic:
+ * isolating a wrong pin can disturb an unrelated peripheral.
+ */
+#define APP_PWR_ISOLATE_SDMMC_PINS                  0
+#define APP_PWR_SDMMC_PIN_LIST                      { 39, 40, 41, 42, 43, 44 }
+
+/*
+ * Per-stage delay used only while recording per-subsystem current plateaus
+ * with a bench supply. Normal firmware must use 0; any non-zero value keeps
+ * the board fully awake for seven extra stages on every Deep-sleep entry.
+ */
+#define APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS      0
+
+/*
+ * Refuse to build a firmware that puts the GT911 to sleep with no way to wake
+ * it again. Without an INT or RESET pin the controller stays asleep across the
+ * next reset and bsp_touch_new() aborts the application at boot.
+ */
+#if APP_PWR_GT911_SLEEP_ENABLED && \
+    (APP_PWR_TOUCH_INT_GPIO < 0) && (APP_PWR_TOUCH_RESET_GPIO < 0)
+#error "APP_PWR_GT911_SLEEP_ENABLED needs APP_PWR_TOUCH_INT_GPIO or APP_PWR_TOUCH_RESET_GPIO: the touch controller could not be woken and the next boot would abort in bsp_touch_new()"
 #endif
 
-#if APP_CPU_ECO_AFTER_MS >= APP_LIGHT_SLEEP_TIMEOUT_MS
-#error "ECO CPU stage must begin before Light-sleep"
+#if APP_CPU_IDLE_180_AFTER_MS >= APP_CPU_IDLE_90_AFTER_MS
+#error "The 180 MHz stage must begin before the 90 MHz stage"
+#endif
+#if APP_CPU_IDLE_90_AFTER_MS >= APP_LIGHT_SLEEP_TIMEOUT_MS
+#error "The 90 MHz stage must begin before Light-sleep"
+#endif
+#if APP_CPU_ACTIVE_FREQ_MHZ > APP_CPU_MAX_FREQ_MHZ
+#error "The active CPU baseline cannot exceed the maximum CPU frequency"
+#endif
+#if APP_LIGHT_SLEEP_TIMEOUT_MS >= APP_DEEP_SLEEP_TIMEOUT_MS
+#error "Light-sleep must begin before Deep-sleep"
 #endif
 
 #if APP_FACE_DETECT_INTERVAL_FRAMES == 0 || \
-    APP_FACE_DETECT_BALANCED_INTERVAL_FRAMES == 0 || \
-    APP_FACE_DETECT_ECO_INTERVAL_FRAMES == 0
+    APP_FACE_DETECT_IDLE_180_INTERVAL_FRAMES == 0 || \
+    APP_FACE_DETECT_IDLE_90_INTERVAL_FRAMES == 0
 #error "Every face-detection interval must be greater than zero"
 #endif
 
@@ -2309,6 +2961,40 @@ FILE: src/main/include/config/app_config.h
 FILE: src/main/include/config/app_features.h
 ==================================================
 [Empty file]
+
+
+==================================================
+FILE: src/main/include/config/log_config.h
+==================================================
+#pragma once
+
+/*
+ * Central application log switches.
+ *
+ * Set a component to 1 to enable its normal informational output. Set it to
+ * 0 to silence that component. CPU clock and power-state logging is the
+ * default configuration.
+ * ESP-ROM and bootloader output occurs before app_logging_init() and is not
+ * controlled by these runtime switches.
+ */
+#define APP_LOG_ENABLE_CPU_POWER             1
+#define APP_LOG_ENABLE_ESP_PM                0
+#define APP_LOG_ENABLE_POWER_SLEEP 1
+#define APP_LOG_ENABLE_APPLICATION           0
+#define APP_LOG_ENABLE_CAMERA                0
+#define APP_LOG_ENABLE_DISPLAY               0
+#define APP_LOG_ENABLE_AI                    0
+#define APP_LOG_ENABLE_UI                    0
+
+/*
+ * When enabled, unselected components may still print ESP_LOGE messages.
+ * Keep this at 0 for strict CPU-only output; set it to 1 for safer debugging.
+ */
+#define APP_LOG_KEEP_UNSELECTED_ERRORS       0
+
+/* These monitors use printf(), so ESP-IDF tag filtering cannot silence them. */
+#define APP_DIAGNOSTICS_CPU_STATS_ENABLED    0
+#define APP_DIAGNOSTICS_AI_PIPELINE_ENABLED  0
 
 
 ==================================================
@@ -2323,6 +3009,24 @@ void diagnostics_start_ai_pipeline_monitor(void);
 void diagnostics_ai_frame_sent_to_detector(void);
 void diagnostics_ai_detection_result(int face_count);
 void diagnostics_ai_recognition_result(esp_err_t ret, const char *name, float similarity);
+
+==================================================
+FILE: src/main/include/diagnostics/app_logging.h
+==================================================
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Apply the component switches from config/log_config.h. */
+void app_logging_init(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+
 
 ==================================================
 FILE: src/main/include/diagnostics/core_trace.h
@@ -2549,6 +3253,86 @@ esp_err_t component_audio_restore_after_failed_sleep(void);
 
 
 ==================================================
+FILE: src/main/include/power_save/component_display.h
+==================================================
+#pragma once
+
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Put the display side-channels into their lowest state before ESP32-P4
+ * Deep-sleep.
+ *
+ * The BSP call bsp_display_shutdown_for_deep_sleep() removes LVGL, the MIPI
+ * DSI panel and the touch driver, but it does not tell the GT911 controller
+ * itself to stop scanning, and it does not guarantee that the backlight-enable
+ * pad keeps its off level once the digital domain is powered down.
+ *
+ * This function therefore performs the remaining work:
+ *
+ *   1. drives and holds the backlight-enable pin at its off level;
+ *   2. sends the GT911 sleep command (0x05 -> register 0x8040) over the
+ *      shared I2C bus;
+ *   3. drives and holds the GT911 INT pin LOW so the controller cannot wake
+ *      itself, and optionally asserts and holds the GT911 RESET pin.
+ *
+ * Call ordering is important:
+ *
+ *   bsp_display_shutdown_for_deep_sleep()   <- BSP releases its touch handle
+ *   component_display_disable_for_deep_sleep()
+ *   ... remaining shutdown stages ...
+ *   enter_deep_sleep()                      <- isolates the shared I2C pins
+ *
+ * Running before the BSP shutdown risks the BSP's own touch teardown waking
+ * the controller again; running after the I2C isolation makes the I2C write
+ * impossible.
+ *
+ * A missing I2C bus or an unresponsive controller is reported but never fatal:
+ * failing to sleep the touch panel must not prevent the system from sleeping.
+ */
+esp_err_t component_display_disable_for_deep_sleep(void);
+
+/**
+ * Release the display side-channel holds only when entering Deep-sleep
+ * unexpectedly fails.
+ */
+esp_err_t component_display_restore_after_failed_sleep(void);
+
+/**
+ * Bring the GT911 out of sleep after an ESP32-P4 reset.
+ *
+ * The touch controller runs from the display module's always-on 3.3 V rail,
+ * so the sleep command written before Deep-sleep survives a Deep-sleep wake,
+ * an EN-pin reset and a reflash. Its I2C interface is off while it sleeps, so
+ * an unwoken controller makes the BSP abort at boot:
+ *
+ *     bsp_display_indev_init -> bsp_touch_new() -> ESP_ERR_NOT_FOUND
+ *
+ * This routine performs the hardware wake - a RESET toggle when that pin is
+ * known, otherwise an INT pulse - and must therefore run BEFORE
+ * bsp_display_start().
+ *
+ * It is registered as a constructor in component_display.c so it runs ahead of
+ * app_main() without any edit to app_main.c, and it is exported here so it can
+ * be called explicitly instead if you prefer that to be visible in app_main().
+ * Calling it twice is harmless.
+ *
+ * With no touch pin configured the whole thing compiles to nothing: sleeping
+ * the GT911 is refused at build time in that case, so there is never anything
+ * to wake.
+ */
+esp_err_t component_display_wake_touch_after_reset(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+==================================================
 FILE: src/main/include/power_save/component_ethernet.h
 ==================================================
 #pragma once
@@ -2635,6 +3419,7 @@ FILE: src/main/include/power_save/cpu_power.h
 ==================================================
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -2642,41 +3427,40 @@ FILE: src/main/include/power_save/cpu_power.h
 #ifdef __cplusplus
 extern "C" {
 #endif
+typedef esp_err_t (*cpu_power_idle_transition_callback_t)(void *user_data);
 
-/**
- * Initialize one verified, display-safe active DFS range:
- *
- * All active profiles: 90..CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ (360 MHz here)
- * PERFORMANCE: application AI maximum-frequency lock enabled
- * BALANCED/ECO: application AI maximum-frequency lock disabled
- *
- * Automatic Light-sleep remains disabled because app_sleep.c explicitly
- * coordinates the camera, display, LVGL and GT911 before sleeping.
- */
+/* Initialize the verified 180..360 MHz ACTIVE DFS policy. */
 esp_err_t cpu_power_init(void);
 
-/**
- * Request the configured 360 MHz maximum during AI inference only when the
- * PERFORMANCE profile is active. This is a successful no-op in BALANCED/ECO,
- * allowing DFS to select 90 MHz between work while preserving driver scaling.
+/*
+ * Compatibility registration for the former display-off IDLE-SCAN policy.
+ * The callbacks are intentionally not invoked while CSI/ISP is active because
+ * deleting the shared display/DPHY resources can fault the camera ISP ISR.
  */
-esp_err_t cpu_power_ai_begin(void);
+esp_err_t cpu_power_register_idle_scan_callbacks(
+    cpu_power_idle_transition_callback_t enter_idle_scan,
+    cpu_power_idle_transition_callback_t exit_idle_scan,
+    void *user_data);
 
-/** Release the PERFORMANCE AI lock acquired by cpu_power_ai_begin(). */
-esp_err_t cpu_power_ai_end(void);
-
-/**
- * Dynamically select PERFORMANCE, BALANCED or ECO from inactivity duration.
- * BALANCED/ECO keep the safe 90..360 MHz DFS range, release the application's
- * AI maximum-frequency request and progressively throttle face detection.
+/*
+ * Hold the ESP_PM_CPU_FREQ_MAX lock across the complete face-authentication
+ * burst. Both calls are idempotent: duplicate begin/end calls are harmless.
  */
+esp_err_t cpu_power_face_boost_begin(void);
+esp_err_t cpu_power_face_boost_end(void);
+bool cpu_power_is_face_boost_active(void);
+
+/* Select ACTIVE, ECO-SCAN-8 or ECO-SCAN-16 detection duty cycle. */
 void cpu_power_update_inactivity(uint32_t inactive_ms);
 
-/** Restore PERFORMANCE AI locking immediately after accepted activity. */
+/* Restore the ACTIVE baseline policy and request display restoration. */
 void cpu_power_notify_activity(void);
 
-/** Return the face-detection interval for the current active power profile. */
+/* Return 2, 8 or 16 frames for ACTIVE, ECO-SCAN-8 or ECO-SCAN-16. */
 uint32_t cpu_power_get_face_detect_interval_frames(void);
+
+/* Physical display-off idle scan is disabled while the camera is running. */
+bool cpu_power_is_idle_scan_active(void);
 
 #ifdef __cplusplus
 }
@@ -3716,6 +4500,7 @@ FILE: src/main/power/app_sleep.c
 #include "light_sleep.h"
 #include "platform/camera/video_capture.h"
 #include "power_save/component_audio.h"
+#include "power_save/component_display.h"
 #include "power_save/component_ethernet.h"
 #include "power_save/component_sdcard.h"
 #include "power_save/component_wifi.h"
@@ -3730,9 +4515,10 @@ FILE: src/main/power/app_sleep.c
 #endif
 
 /*
- * Set this to 5000 only when deliberately recording per-subsystem current
- * plateaus. Normal firmware must proceed directly through the shutdown stages;
- * otherwise the old profiling delays keep the board awake for 35 seconds.
+ * Defined in config/app_config.h. Set it to 5000 only when deliberately
+ * recording per-subsystem current plateaus with a bench supply; the default of
+ * 0 is mandatory for normal firmware, because a non-zero value keeps the board
+ * fully awake for one extra delay per shutdown stage on every Deep-sleep entry.
  */
 #ifndef APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS
 #define APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS 0
@@ -3741,6 +4527,7 @@ FILE: src/main/power/app_sleep.c
 #define APP_INACTIVITY_POWER_TASK_STACK_SIZE 8192
 
 static const char *TAG = "app_sleep";
+static const char *POWER_TAG = "PWR_STATE";
 
 static portMUX_TYPE s_sleep_request_lock =
     portMUX_INITIALIZER_UNLOCKED;
@@ -3971,10 +4758,18 @@ static bool claim_light_sleep_window(uint32_t *remaining_ms)
 
 static void run_sleep_sequence(const char *reason)
 {
+    const char *sleep_reason =
+        reason != NULL ? reason : "unknown source";
+
+    ESP_LOGI(
+        POWER_TAG,
+        "event=DEEP_SLEEP_BEGIN reason=\"%s\"",
+        sleep_reason);
+
     ESP_LOGI(
         TAG,
         "Deep sleep requested by %s",
-        reason != NULL ? reason : "unknown source");
+        sleep_reason);
 
     ESP_LOGI("POWER_PROFILE", "STEP 0: all systems active");
     power_profile_stage_delay();
@@ -4015,7 +4810,31 @@ static void run_sleep_sequence(const char *reason)
 
     power_profile_stage_delay();
 
-    ESP_LOGI("POWER_PROFILE", "STEP 3: disabling audio amplifier");
+    /*
+     * STEP 3 runs after the BSP has released its own touch handle and while
+     * the shared I2C bus is still alive. Without it the GT911 keeps scanning
+     * the capacitive matrix at roughly 5..10 mA for the whole Deep-sleep
+     * interval, which is typically the largest remaining "stuck" consumer on
+     * this board once the camera and MIPI-DSI are down.
+     */
+    ESP_LOGI(
+        "POWER_PROFILE",
+        "STEP 3: sleeping GT911 touch controller and pinning display pads");
+
+    esp_err_t touch_ret = component_display_disable_for_deep_sleep();
+
+    if (touch_ret == ESP_OK) {
+        ESP_LOGI(TAG, "Touch controller and display pads prepared for sleep");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "Display side-channel shutdown completed with errors: %s",
+            esp_err_to_name(touch_ret));
+    }
+
+    power_profile_stage_delay();
+
+    ESP_LOGI("POWER_PROFILE", "STEP 4: disabling audio amplifier");
     esp_err_t audio_ret = component_audio_disable_for_deep_sleep();
 
     if (audio_ret == ESP_OK) {
@@ -4029,7 +4848,7 @@ static void run_sleep_sequence(const char *reason)
 
     power_profile_stage_delay();
 
-    ESP_LOGI("POWER_PROFILE", "STEP 4: disabling microSD");
+    ESP_LOGI("POWER_PROFILE", "STEP 5: disabling microSD");
     esp_err_t sdcard_ret = component_sdcard_disable_for_deep_sleep();
 
     if (sdcard_ret == ESP_OK) {
@@ -4043,7 +4862,7 @@ static void run_sleep_sequence(const char *reason)
 
     power_profile_stage_delay();
 
-    ESP_LOGI("POWER_PROFILE", "STEP 5: disabling ESP32-C6");
+    ESP_LOGI("POWER_PROFILE", "STEP 6: disabling ESP32-C6");
     esp_err_t wifi_ret = component_wifi_disable_for_deep_sleep();
 
     if (wifi_ret == ESP_OK) {
@@ -4059,7 +4878,7 @@ static void run_sleep_sequence(const char *reason)
 
     ESP_LOGI(
         "POWER_PROFILE",
-        "STEP 6: disabling IP101GRI Ethernet PHY");
+        "STEP 7: disabling IP101GRI Ethernet PHY");
 
     esp_err_t ethernet_ret = component_ethernet_disable_for_deep_sleep();
 
@@ -4074,7 +4893,11 @@ static void run_sleep_sequence(const char *reason)
 
     power_profile_stage_delay();
 
-    ESP_LOGI("POWER_PROFILE", "STEP 7: entering ESP32-P4 deep sleep");
+    ESP_LOGI("POWER_PROFILE", "STEP 8: entering ESP32-P4 deep sleep");
+    ESP_LOGI(
+        POWER_TAG,
+        "event=DEEP_SLEEP_COMMIT wake_gpio=%d wake_level=LOW",
+        APP_DEEP_SLEEP_BUTTON_GPIO);
     enter_deep_sleep();
 
     /* The following recovery path is reached only if Deep-sleep fails. */
@@ -4114,7 +4937,19 @@ static void run_sleep_sequence(const char *reason)
             esp_err_to_name(wifi_restore_ret));
     }
 
+    esp_err_t display_restore_ret =
+        component_display_restore_after_failed_sleep();
+    if (display_restore_ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Could not release display side-channel holds: %s",
+            esp_err_to_name(display_restore_ret));
+    }
+
     release_sleep_request();
+    ESP_LOGE(
+        POWER_TAG,
+        "event=DEEP_SLEEP_FAILED reason=ENTER_FUNCTION_RETURNED");
     ESP_LOGE(TAG, "Deep sleep request returned without entering sleep");
 }
 
@@ -4134,6 +4969,10 @@ static void deep_sleep_button_task(void *arg)
     gpio_config_t button_config = {
         .pin_bit_mask = 1ULL << APP_DEEP_SLEEP_BUTTON_GPIO,
         .mode = GPIO_MODE_INPUT,
+        /*
+         * GPIO3 is biased by the external pull-up fitted between GPIO3 and
+         * ESP_3V3. Do not enable the internal pull-up in parallel.
+         */
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
@@ -4200,6 +5039,16 @@ static void inactivity_power_policy_task(void *arg)
     (void)arg;
 
     ESP_LOGI(
+        POWER_TAG,
+        "event=INACTIVITY_POLICY_STARTED idle_180_after_ms=%u "
+        "idle_90_after_ms=%u light_sleep_after_ms=%u "
+        "deep_sleep_after_ms=%u",
+        (unsigned)APP_CPU_IDLE_180_AFTER_MS,
+        (unsigned)APP_CPU_IDLE_90_AFTER_MS,
+        (unsigned)APP_LIGHT_SLEEP_TIMEOUT_MS,
+        (unsigned)APP_DEEP_SLEEP_TIMEOUT_MS);
+
+    ESP_LOGI(
         TAG,
         "Inactivity power policy armed: light=%d ms deep=%d ms",
         APP_LIGHT_SLEEP_TIMEOUT_MS,
@@ -4212,9 +5061,15 @@ static void inactivity_power_policy_task(void *arg)
          * Apply the staged active CPU policy and reduce AI duty cycle before
          * entering the coordinated Light-sleep window.
          */
-        cpu_power_update_inactivity(get_inactivity_ms());
+        const uint32_t inactive_ms = get_inactivity_ms();
+        cpu_power_update_inactivity(inactive_ms);
 
         if (claim_inactivity_sleep_request()) {
+            ESP_LOGI(
+                POWER_TAG,
+                "event=DEEP_SLEEP_DEADLINE_REACHED inactive_ms=%" PRIu32
+                " action=SHUTDOWN",
+                inactive_ms);
             ESP_LOGI(
                 TAG,
                 "No activity for %d ms; entering Deep-sleep",
@@ -4230,6 +5085,13 @@ static void inactivity_power_policy_task(void *arg)
         }
 
         ESP_LOGI(
+            POWER_TAG,
+            "event=LIGHT_SLEEP_BEGIN inactive_ms=%" PRIu32
+            " remaining_to_deep_ms=%" PRIu32,
+            inactive_ms,
+            remaining_ms);
+
+        ESP_LOGI(
             TAG,
             "No activity for %d ms; entering Light-sleep for up to %" PRIu32 " ms",
             APP_LIGHT_SLEEP_TIMEOUT_MS,
@@ -4237,6 +5099,10 @@ static void inactivity_power_policy_task(void *arg)
 
         if (s_light_suspend_callback == NULL ||
             s_light_resume_callback == NULL) {
+            ESP_LOGE(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_FAILED phase=CALLBACK_CHECK "
+                "error=NOT_REGISTERED action=RESTART");
             ESP_LOGE(
                 TAG,
                 "Light-sleep callbacks are not registered; restarting safely");
@@ -4248,11 +5114,21 @@ static void inactivity_power_policy_task(void *arg)
 
         if (suspend_ret != ESP_OK) {
             ESP_LOGE(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_FAILED phase=HARDWARE_SUSPEND "
+                "error=%s action=RESTART",
+                esp_err_to_name(suspend_ret));
+            ESP_LOGE(
                 TAG,
                 "Application Light-sleep suspend failed: %s; restarting safely",
                 esp_err_to_name(suspend_ret));
             esp_restart();
         }
+
+        ESP_LOGI(
+            POWER_TAG,
+            "event=LIGHT_SLEEP_HARDWARE_SUSPENDED "
+            "camera=OFF display=OFF");
 
         /*
          * Flush any coordinate that LVGL consumed immediately before the
@@ -4263,6 +5139,11 @@ static void inactivity_power_policy_task(void *arg)
             bsp_touch_poll_for_light_sleep(&stale_touch);
 
         if (touch_ret != ESP_OK) {
+            ESP_LOGE(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_FAILED phase=TOUCH_PREPARE "
+                "error=%s action=RESTART",
+                esp_err_to_name(touch_ret));
             ESP_LOGE(
                 TAG,
                 "Could not prepare GT911 polling: %s; restarting safely",
@@ -4275,11 +5156,18 @@ static void inactivity_power_policy_task(void *arg)
             "GT911 polling armed every %d ms until the %d ms Deep-sleep deadline",
             APP_LIGHT_SLEEP_TOUCH_POLL_MS,
             APP_DEEP_SLEEP_TIMEOUT_MS);
+        ESP_LOGI(
+            POWER_TAG,
+            "event=LIGHT_SLEEP_ENTER mode=TIMER_SLICED "
+            "poll_ms=%u remaining_to_deep_ms=%" PRIu32,
+            (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
+            remaining_ms);
 
         esp_err_t light_ret = ESP_OK;
         esp_sleep_wakeup_cause_t wake_cause =
             ESP_SLEEP_WAKEUP_UNDEFINED;
         bool touchscreen_touched = false;
+        uint32_t short_slice_count = 0;
 
         while (remaining_ms > 0 && !touchscreen_touched) {
             uint32_t poll_slice_ms = APP_LIGHT_SLEEP_TOUCH_POLL_MS;
@@ -4287,10 +5175,15 @@ static void inactivity_power_policy_task(void *arg)
                 poll_slice_ms = remaining_ms;
             }
 
+            const int64_t slice_start_us = esp_timer_get_time();
+
             light_ret = enter_light_sleep_poll_slice(
                 poll_slice_ms,
                 true);
             wake_cause = light_sleep_get_last_wakeup_cause();
+
+            const int64_t slice_elapsed_us =
+                esp_timer_get_time() - slice_start_us;
 
             if (light_ret != ESP_OK ||
                 wake_cause == ESP_SLEEP_WAKEUP_GPIO) {
@@ -4299,10 +5192,59 @@ static void inactivity_power_policy_task(void *arg)
 
             if (wake_cause != ESP_SLEEP_WAKEUP_TIMER) {
                 ESP_LOGE(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_FAILED phase=WAKE_CHECK "
+                    "wake_cause=%d action=RESTART",
+                    (int)wake_cause);
+                ESP_LOGE(
                     TAG,
                     "Unexpected Light-sleep wake cause %d; restarting safely",
                     (int)wake_cause);
                 esp_restart();
+            }
+
+            /*
+             * The RTC does not always sleep for the whole requested slice: a
+             * call can return in a couple of milliseconds and still report a
+             * TIMER wake. Charging the inactivity budget with the REQUESTED
+             * slice in that case makes the countdown run far faster than real
+             * time - observed on this board as the whole ~15 s Light-sleep
+             * window being consumed in ~96 ms of wall clock, dropping the
+             * system into Deep-sleep roughly 15 s early.
+             *
+             * Spend the remainder of the slice in a blocked delay so one loop
+             * iteration always costs one slice of real time. The touch poll
+             * cadence stays at APP_LIGHT_SLEEP_TOUCH_POLL_MS either way.
+             */
+            const int64_t requested_us = (int64_t)poll_slice_ms * 1000LL;
+
+            if (slice_elapsed_us < requested_us) {
+                const uint32_t shortfall_ms =
+                    (uint32_t)((requested_us - slice_elapsed_us) / 1000LL);
+
+                short_slice_count++;
+
+                if (short_slice_count == 1) {
+                    ESP_LOGW(
+                        POWER_TAG,
+                        "event=LIGHT_SLEEP_SLICE_TOO_SHORT "
+                        "requested_ms=%" PRIu32 " actual_us=%" PRId64
+                        " action=PAD_WITH_DELAY",
+                        poll_slice_ms,
+                        slice_elapsed_us);
+                    ESP_LOGW(
+                        TAG,
+                        "Light-sleep returned after %" PRId64 " us instead of "
+                        "%" PRIu32 " ms; the RTC is not actually sleeping, so "
+                        "this window saves no power. Padding with a blocked "
+                        "delay to keep the inactivity timer honest.",
+                        slice_elapsed_us,
+                        poll_slice_ms);
+                }
+
+                if (shortfall_ms > 0) {
+                    vTaskDelay(pdMS_TO_TICKS(shortfall_ms));
+                }
             }
 
             remaining_ms -= poll_slice_ms;
@@ -4311,6 +5253,11 @@ static void inactivity_power_policy_task(void *arg)
                 &touchscreen_touched);
 
             if (touch_ret != ESP_OK) {
+                ESP_LOGE(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_FAILED phase=TOUCH_POLL "
+                    "error=%s action=RESTART",
+                    esp_err_to_name(touch_ret));
                 ESP_LOGE(
                     TAG,
                     "GT911 Light-sleep poll failed: %s; restarting safely",
@@ -4326,6 +5273,11 @@ static void inactivity_power_policy_task(void *arg)
 
         if (light_ret != ESP_OK) {
             ESP_LOGE(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_FAILED phase=SLEEP_CALL "
+                "error=%s action=RESTART",
+                esp_err_to_name(light_ret));
+            ESP_LOGE(
                 TAG,
                 "Light-sleep failed after hardware suspend: %s; restarting safely",
                 esp_err_to_name(light_ret));
@@ -4333,10 +5285,19 @@ static void inactivity_power_policy_task(void *arg)
         }
 
         if (user_activity) {
+            ESP_LOGI(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_EXIT reason=%s action=RESTORE_ACTIVE",
+                touchscreen_touched ? "TOUCHSCREEN" : "GPIO3");
             esp_err_t resume_ret =
                 s_light_resume_callback(s_light_transition_user_data);
 
             if (resume_ret != ESP_OK) {
+                ESP_LOGE(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_FAILED phase=HARDWARE_RESUME "
+                    "error=%s action=RESTART",
+                    esp_err_to_name(resume_ret));
                 ESP_LOGE(
                     TAG,
                     "Application Light-sleep resume failed: %s; restarting safely",
@@ -4355,6 +5316,11 @@ static void inactivity_power_policy_task(void *arg)
             }
         } else if (wake_cause == ESP_SLEEP_WAKEUP_TIMER &&
                    remaining_ms == 0) {
+            ESP_LOGI(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_DEADLINE_REACHED inactive_ms=%u "
+                "action=DEEP_SLEEP",
+                (unsigned)APP_DEEP_SLEEP_TIMEOUT_MS);
             ESP_LOGI(
                 TAG,
                 "GT911 polling reached the %d ms Deep-sleep inactivity deadline",
@@ -4538,25 +5504,51 @@ FILE: src/main/power/component_audio.c
 ==================================================
 #include "power_save/component_audio.h"
 
+#include <inttypes.h>
 #include <stdbool.h>
+#include <stdint.h>
 
+#include "config/app_config.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
-#define AUDIO_POWER_AMP_GPIO GPIO_NUM_53
-#define AUDIO_AMP_ENABLED    1
-#define AUDIO_AMP_DISABLED   0
+#define AUDIO_POWER_AMP_GPIO APP_PWR_AUDIO_AMP_GPIO
+#define AUDIO_AMP_ENABLED    APP_PWR_AUDIO_AMP_ENABLED_LEVEL
+#define AUDIO_AMP_DISABLED   APP_PWR_AUDIO_AMP_DISABLED_LEVEL
 
 static const char *TAG = "component_audio";
 
 static bool s_audio_amp_disabled;
 
+/* See component_wifi.c: a held pad may need time before it reads back. */
+static int wait_for_pad_level(gpio_num_t gpio_num, int expected_level,
+                              uint32_t *settle_ms_out)
+{
+    uint32_t waited_ms = 0;
+    int level = gpio_get_level(gpio_num);
+
+    while (level != expected_level && waited_ms < APP_PWR_HOLD_VERIFY_TIMEOUT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(APP_PWR_HOLD_VERIFY_POLL_MS));
+        waited_ms += APP_PWR_HOLD_VERIFY_POLL_MS;
+        level = gpio_get_level(gpio_num);
+    }
+
+    if (settle_ms_out != NULL) {
+        *settle_ms_out = waited_ms;
+    }
+
+    return level;
+}
+
 esp_err_t component_audio_disable_for_deep_sleep(void)
 {
     gpio_config_t io_config = {
         .pin_bit_mask = 1ULL << AUDIO_POWER_AMP_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
+        /* INPUT_OUTPUT so the pre-sleep rail audit can read the pad back. */
+        .mode = GPIO_MODE_INPUT_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
@@ -4586,6 +5578,18 @@ esp_err_t component_audio_disable_for_deep_sleep(void)
         return ret;
     }
 
+    /* Keep the active OUTPUT-LOW configuration across the sleep boundary. */
+    ret = gpio_sleep_sel_dis(AUDIO_POWER_AMP_GPIO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not disable sleep switching for GPIO%d: %s",
+            AUDIO_POWER_AMP_GPIO,
+            esp_err_to_name(ret));
+
+        return ret;
+    }
+
     ret = gpio_hold_en(AUDIO_POWER_AMP_GPIO);
     if (ret != ESP_OK) {
         ESP_LOGE(
@@ -4599,10 +5603,30 @@ esp_err_t component_audio_disable_for_deep_sleep(void)
 
     s_audio_amp_disabled = true;
 
+    uint32_t settle_ms = 0;
+    const int level_after_hold = wait_for_pad_level(
+        AUDIO_POWER_AMP_GPIO,
+        AUDIO_AMP_DISABLED,
+        &settle_ms);
+
+    if (level_after_hold != AUDIO_AMP_DISABLED) {
+        ESP_LOGE(
+            TAG,
+            "Audio amplifier EN still reads %d after holding for %" PRIu32
+            " ms (expected %d)",
+            level_after_hold,
+            settle_ms,
+            AUDIO_AMP_DISABLED);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     ESP_LOGI(
         TAG,
-        "Audio amplifier disabled: GPIO%d held LOW",
-        AUDIO_POWER_AMP_GPIO);
+        "Audio amplifier disabled: GPIO%d held LOW "
+        "(read-back=%d after %" PRIu32 " ms)",
+        AUDIO_POWER_AMP_GPIO,
+        level_after_hold,
+        settle_ms);
 
     return ESP_OK;
 }
@@ -4651,25 +5675,496 @@ esp_err_t component_audio_restore_after_failed_sleep(void)
 
 
 ==================================================
+FILE: src/main/power/component_display.c
+==================================================
+#include "power_save/component_display.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "bsp/esp-bsp.h"
+#include "config/app_config.h"
+#include "driver/gpio.h"
+#include "driver/i2c_master.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+static const char *TAG = "component_display";
+
+/*
+ * GT911 command register. Writing 0x05 places the controller in sleep mode,
+ * where it stops scanning the capacitive matrix. The controller leaves sleep
+ * when its INT line is driven HIGH for more than ~2 ms, which is why the INT
+ * pin is pinned LOW below when its number is known.
+ */
+#define GT911_COMMAND_REGISTER      0x8040
+#define GT911_COMMAND_SLEEP         0x05
+#define GT911_I2C_CLOCK_HZ          400000
+#define GT911_I2C_TIMEOUT_MS        100
+#define GT911_PROBE_TIMEOUT_MS      50
+
+static bool s_backlight_held;
+static bool s_touch_int_held;
+static bool s_touch_reset_held;
+
+/*
+ * __attribute__((unused)) keeps the build clean when every optional pin below
+ * is left at -1, which is the default until the schematic pin numbers are
+ * filled in.
+ */
+__attribute__((unused))
+static esp_err_t drive_and_hold(gpio_num_t gpio_num, int level, const char *name)
+{
+    gpio_config_t io_config = {
+        .pin_bit_mask = 1ULL << gpio_num,
+        /*
+         * INPUT_OUTPUT keeps the input path alive so the pre-sleep rail audit
+         * in deep_sleep.c can read the pad back and prove the hold took.
+         */
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    esp_err_t ret = gpio_config(&io_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "%s GPIO%d configuration failed: %s",
+                 name, (int)gpio_num, esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = gpio_set_level(gpio_num, level);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not drive %s GPIO%d to %d: %s",
+                 name, (int)gpio_num, level, esp_err_to_name(ret));
+        return ret;
+    }
+
+    /*
+     * Prevent ESP-IDF from switching this pad to its sleep configuration; the
+     * active level must survive into Deep-sleep unchanged.
+     */
+    ret = gpio_sleep_sel_dis(gpio_num);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Could not disable sleep switching for %s GPIO%d: %s",
+                 name, (int)gpio_num, esp_err_to_name(ret));
+    }
+
+    ret = gpio_hold_en(gpio_num);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not hold %s GPIO%d: %s",
+                 name, (int)gpio_num, esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "%s GPIO%d driven to %d and held",
+             name, (int)gpio_num, level);
+    return ESP_OK;
+}
+
+__attribute__((unused))
+static esp_err_t release_hold(gpio_num_t gpio_num, const char *name)
+{
+    esp_err_t ret = gpio_hold_dis(gpio_num);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not release %s GPIO%d hold: %s",
+                 name, (int)gpio_num, esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+#if APP_PWR_GT911_SLEEP_ENABLED
+static esp_err_t gt911_write_sleep_command(
+    i2c_master_bus_handle_t bus,
+    uint8_t address)
+{
+    i2c_device_config_t device_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = address,
+        .scl_speed_hz = GT911_I2C_CLOCK_HZ,
+    };
+
+    i2c_master_dev_handle_t device = NULL;
+    esp_err_t ret = i2c_master_bus_add_device(bus, &device_config, &device);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Could not attach GT911 at 0x%02X: %s",
+                 address, esp_err_to_name(ret));
+        return ret;
+    }
+
+    const uint8_t payload[3] = {
+        (uint8_t)(GT911_COMMAND_REGISTER >> 8),
+        (uint8_t)(GT911_COMMAND_REGISTER & 0xFF),
+        GT911_COMMAND_SLEEP,
+    };
+
+    ret = i2c_master_transmit(
+        device,
+        payload,
+        sizeof(payload),
+        GT911_I2C_TIMEOUT_MS);
+
+    (void)i2c_master_bus_rm_device(device);
+    return ret;
+}
+
+static esp_err_t gt911_enter_sleep(void)
+{
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+
+    if (bus == NULL) {
+        ESP_LOGW(TAG,
+                 "Shared I2C bus is already released; GT911 keeps scanning. "
+                 "Move this call before bsp_display_shutdown_for_deep_sleep() "
+                 "if the BSP deinitializes I2C.");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    static const uint8_t addresses[] = {
+        APP_PWR_GT911_PRIMARY_ADDRESS,
+        APP_PWR_GT911_SECONDARY_ADDRESS,
+    };
+
+    for (size_t i = 0; i < sizeof(addresses) / sizeof(addresses[0]); i++) {
+        const uint8_t address = addresses[i];
+
+        if (i2c_master_probe(bus, address, GT911_PROBE_TIMEOUT_MS) != ESP_OK) {
+            continue;
+        }
+
+        esp_err_t ret = gt911_write_sleep_command(bus, address);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "GT911 at 0x%02X entered sleep mode", address);
+            /* Give the controller time to act before the bus is isolated. */
+            vTaskDelay(pdMS_TO_TICKS(10));
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG, "GT911 at 0x%02X rejected the sleep command: %s",
+                 address, esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGW(TAG,
+             "No GT911 answered at 0x%02X or 0x%02X; touch controller may "
+             "keep scanning during Deep-sleep",
+             APP_PWR_GT911_PRIMARY_ADDRESS,
+             APP_PWR_GT911_SECONDARY_ADDRESS);
+
+    return ESP_ERR_NOT_FOUND;
+}
+#endif /* APP_PWR_GT911_SLEEP_ENABLED */
+
+#if APP_PWR_TOUCH_RESET_GPIO >= 0 || APP_PWR_TOUCH_INT_GPIO >= 0
+/* Drive a pin as a plain push-pull output, releasing any Deep-sleep hold. */
+static esp_err_t drive_pin(gpio_num_t gpio_num, int level)
+{
+    (void)gpio_hold_dis(gpio_num);
+
+    gpio_config_t io_config = {
+        .pin_bit_mask = 1ULL << gpio_num,
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    esp_err_t ret = gpio_config(&io_config);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    return gpio_set_level(gpio_num, level);
+}
+
+/* Return a pin to a high-impedance input so the board's own bias decides it. */
+static esp_err_t float_pin(gpio_num_t gpio_num)
+{
+    (void)gpio_hold_dis(gpio_num);
+
+    gpio_config_t io_config = {
+        .pin_bit_mask = 1ULL << gpio_num,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    return gpio_config(&io_config);
+}
+#endif
+
+esp_err_t component_display_wake_touch_after_reset(void)
+{
+#if APP_PWR_TOUCH_RESET_GPIO >= 0
+    /*
+     * RESET is the reliable wake: it restores the controller from sleep and
+     * from any confused state.
+     *
+     * The GT911 latches its I2C address from the INT level while RESET is
+     * released - INT low selects 0x5D, INT high selects 0x14. This board
+     * answers at 0x5D, so INT is held LOW across the release when that pin is
+     * also known, and only afterwards returned to a floating input. Getting
+     * this backwards would move the controller to 0x14 and the BSP probe would
+     * still fail.
+     */
+#if APP_PWR_TOUCH_INT_GPIO >= 0
+    (void)drive_pin((gpio_num_t)APP_PWR_TOUCH_INT_GPIO, 0);
+#endif
+
+    esp_err_t ret = drive_pin(
+        (gpio_num_t)APP_PWR_TOUCH_RESET_GPIO,
+        APP_PWR_TOUCH_RESET_ACTIVE_LEVEL);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not assert GT911 RESET: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(APP_PWR_GT911_RESET_ASSERT_MS));
+
+    ret = drive_pin(
+        (gpio_num_t)APP_PWR_TOUCH_RESET_GPIO,
+        !APP_PWR_TOUCH_RESET_ACTIVE_LEVEL);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not release GT911 RESET: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+#if APP_PWR_TOUCH_INT_GPIO >= 0
+    /* Hold the address selection valid, then hand INT back to the driver. */
+    vTaskDelay(pdMS_TO_TICKS(APP_PWR_GT911_INT_PULSE_MS));
+    (void)float_pin((gpio_num_t)APP_PWR_TOUCH_INT_GPIO);
+#endif
+
+    vTaskDelay(pdMS_TO_TICKS(APP_PWR_GT911_BOOT_MS));
+    ESP_LOGI(TAG, "GT911 reset toggled; controller is awake for the BSP probe");
+    return ESP_OK;
+
+#elif APP_PWR_TOUCH_INT_GPIO >= 0
+    /*
+     * No RESET pin available. The documented alternative is an INT pulse held
+     * HIGH for more than ~2 ms, after which the pin must be released so the
+     * controller can drive it as its own interrupt output again.
+     */
+    esp_err_t ret = drive_pin((gpio_num_t)APP_PWR_TOUCH_INT_GPIO, 1);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not pulse GT911 INT: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(APP_PWR_GT911_INT_PULSE_MS));
+    (void)float_pin((gpio_num_t)APP_PWR_TOUCH_INT_GPIO);
+    vTaskDelay(pdMS_TO_TICKS(APP_PWR_GT911_BOOT_MS));
+
+    ESP_LOGI(TAG, "GT911 INT pulsed; controller is awake for the BSP probe");
+    return ESP_OK;
+
+#else
+    /*
+     * No touch pin is configured, so APP_PWR_GT911_SLEEP_ENABLED is refused at
+     * build time and the controller is never put to sleep. Nothing to wake.
+     */
+    return ESP_OK;
+#endif
+}
+
+#if APP_PWR_TOUCH_RESET_GPIO >= 0 || APP_PWR_TOUCH_INT_GPIO >= 0
+/*
+ * ESP-IDF runs global constructors from main_task, after the scheduler is
+ * started and before app_main(). That is exactly the window this wake needs:
+ * after vTaskDelay() is usable, before bsp_display_start() probes the GT911.
+ *
+ * Doing it here rather than in app_main() means enabling the touch sleep can
+ * never be half-applied - there is no second edit to forget, and no ordering
+ * for a future change to get wrong.
+ */
+static void __attribute__((constructor)) component_display_early_touch_wake(void)
+{
+    (void)component_display_wake_touch_after_reset();
+}
+#endif
+
+esp_err_t component_display_disable_for_deep_sleep(void)
+{
+    esp_err_t first_error = ESP_OK;
+    esp_err_t ret = ESP_OK;
+
+    /*
+     * 1. Backlight first. The panel driver may still hold charge; removing the
+     *    backlight enable is the single largest display-side saving.
+     */
+#if APP_PWR_DISPLAY_BACKLIGHT_GPIO >= 0
+    ret = drive_and_hold(
+        (gpio_num_t)APP_PWR_DISPLAY_BACKLIGHT_GPIO,
+        APP_PWR_DISPLAY_BACKLIGHT_OFF_LEVEL,
+        "backlight enable");
+
+    if (ret == ESP_OK) {
+        s_backlight_held = true;
+    } else if (first_error == ESP_OK) {
+        first_error = ret;
+    }
+#else
+    ESP_LOGW(TAG,
+             "APP_PWR_DISPLAY_BACKLIGHT_GPIO is unset; the backlight-enable "
+             "pad is left floating during Deep-sleep. Fill it in from the "
+             "Waveshare schematic.");
+#endif
+
+    /*
+     * 2. Ask the GT911 to stop scanning while the I2C bus is still alive.
+     */
+#if APP_PWR_GT911_SLEEP_ENABLED
+    ret = gt911_enter_sleep();
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        /*
+         * Deliberately not fatal. A touch controller that refuses to sleep
+         * costs current, but must never block the shutdown sequence.
+         */
+        ESP_LOGW(TAG, "Continuing Deep-sleep shutdown without GT911 sleep");
+    }
+#endif
+
+    /*
+     * 3. Pin INT LOW so the controller cannot wake itself out of sleep, then
+     *    optionally assert RESET, which is lower still.
+     */
+#if APP_PWR_TOUCH_INT_GPIO >= 0
+    ret = drive_and_hold((gpio_num_t)APP_PWR_TOUCH_INT_GPIO, 0, "GT911 INT");
+    if (ret == ESP_OK) {
+        s_touch_int_held = true;
+    } else if (first_error == ESP_OK) {
+        first_error = ret;
+    }
+#endif
+
+#if APP_PWR_TOUCH_RESET_GPIO >= 0
+    ret = drive_and_hold(
+        (gpio_num_t)APP_PWR_TOUCH_RESET_GPIO,
+        APP_PWR_TOUCH_RESET_ACTIVE_LEVEL,
+        "GT911 RESET");
+
+    if (ret == ESP_OK) {
+        s_touch_reset_held = true;
+    } else if (first_error == ESP_OK) {
+        first_error = ret;
+    }
+#endif
+
+    (void)ret;
+
+    ESP_LOGI(TAG,
+             "Display side-channels prepared for Deep-sleep: "
+             "backlight_held=%s touch_int_held=%s touch_reset_held=%s",
+             s_backlight_held ? "yes" : "no",
+             s_touch_int_held ? "yes" : "no",
+             s_touch_reset_held ? "yes" : "no");
+
+    return first_error;
+}
+
+esp_err_t component_display_restore_after_failed_sleep(void)
+{
+    esp_err_t first_error = ESP_OK;
+    esp_err_t ret = ESP_OK;
+
+    (void)ret;
+
+#if APP_PWR_TOUCH_RESET_GPIO >= 0
+    if (s_touch_reset_held) {
+        ret = release_hold((gpio_num_t)APP_PWR_TOUCH_RESET_GPIO, "GT911 RESET");
+        if (ret != ESP_OK && first_error == ESP_OK) {
+            first_error = ret;
+        }
+        s_touch_reset_held = false;
+    }
+#endif
+
+#if APP_PWR_TOUCH_INT_GPIO >= 0
+    if (s_touch_int_held) {
+        ret = release_hold((gpio_num_t)APP_PWR_TOUCH_INT_GPIO, "GT911 INT");
+        if (ret != ESP_OK && first_error == ESP_OK) {
+            first_error = ret;
+        }
+        s_touch_int_held = false;
+    }
+#endif
+
+#if APP_PWR_DISPLAY_BACKLIGHT_GPIO >= 0
+    if (s_backlight_held) {
+        ret = release_hold(
+            (gpio_num_t)APP_PWR_DISPLAY_BACKLIGHT_GPIO,
+            "backlight enable");
+        if (ret != ESP_OK && first_error == ESP_OK) {
+            first_error = ret;
+        }
+        s_backlight_held = false;
+    }
+#endif
+
+    if (first_error == ESP_OK) {
+        ESP_LOGW(TAG, "Deep sleep failed; display side-channel holds released");
+    }
+
+    return first_error;
+}
+
+
+==================================================
 FILE: src/main/power/component_ethernet.c
 ==================================================
 #include "power_save/component_ethernet.h"
 
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "config/app_config.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
-#define ETHERNET_PHY_RESET_GPIO GPIO_NUM_51
-#define ETHERNET_PHY_RESET_ACTIVE 0
-#define ETHERNET_PHY_RESET_RELEASED 1
+#define ETHERNET_PHY_RESET_GPIO     APP_PWR_ETHERNET_PHY_RESET_GPIO
+#define ETHERNET_PHY_RESET_ACTIVE   APP_PWR_ETHERNET_RESET_ACTIVE_LEVEL
+#define ETHERNET_PHY_RESET_RELEASED APP_PWR_ETHERNET_RESET_RELEASED_LEVEL
 
 static const char *TAG = "component_ethernet";
+
+static bool s_phy_held_in_reset;
+
+/* See component_wifi.c: a held pad may need time before it reads back. */
+static int wait_for_pad_level(gpio_num_t gpio_num, int expected_level,
+                              uint32_t *settle_ms_out)
+{
+    uint32_t waited_ms = 0;
+    int level = gpio_get_level(gpio_num);
+
+    while (level != expected_level && waited_ms < APP_PWR_HOLD_VERIFY_TIMEOUT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(APP_PWR_HOLD_VERIFY_POLL_MS));
+        waited_ms += APP_PWR_HOLD_VERIFY_POLL_MS;
+        level = gpio_get_level(gpio_num);
+    }
+
+    if (settle_ms_out != NULL) {
+        *settle_ms_out = waited_ms;
+    }
+
+    return level;
+}
 
 esp_err_t component_ethernet_disable_for_deep_sleep(void)
 {
     gpio_config_t io_config = {
         .pin_bit_mask = 1ULL << ETHERNET_PHY_RESET_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
+        /* INPUT_OUTPUT so the pre-sleep rail audit can read the pad back. */
+        .mode = GPIO_MODE_INPUT_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
@@ -4699,6 +6194,23 @@ esp_err_t component_ethernet_disable_for_deep_sleep(void)
         return ret;
     }
 
+    /*
+     * The IP101GRI RESET line is externally pulled up. Without this call
+     * ESP-IDF may swap the pad to its sleep configuration, the pull-up wins,
+     * the PHY leaves reset and starts auto-negotiating at 20-40 mA. The same
+     * fix was already necessary for the ESP32-C6 CHIP_PU pin.
+     */
+    ret = gpio_sleep_sel_dis(ETHERNET_PHY_RESET_GPIO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not disable sleep switching for GPIO%d: %s",
+            ETHERNET_PHY_RESET_GPIO,
+            esp_err_to_name(ret));
+
+        return ret;
+    }
+
     ret = gpio_hold_en(ETHERNET_PHY_RESET_GPIO);
     if (ret != ESP_OK) {
         ESP_LOGE(
@@ -4710,16 +6222,42 @@ esp_err_t component_ethernet_disable_for_deep_sleep(void)
         return ret;
     }
 
+    s_phy_held_in_reset = true;
+
+    uint32_t settle_ms = 0;
+    const int level_after_hold = wait_for_pad_level(
+        ETHERNET_PHY_RESET_GPIO,
+        ETHERNET_PHY_RESET_ACTIVE,
+        &settle_ms);
+
+    if (level_after_hold != ETHERNET_PHY_RESET_ACTIVE) {
+        ESP_LOGE(
+            TAG,
+            "PHY RESET still reads %d after holding for %" PRIu32
+            " ms (expected %d); the IP101GRI is still running",
+            level_after_hold,
+            settle_ms,
+            ETHERNET_PHY_RESET_ACTIVE);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     ESP_LOGI(
         TAG,
-        "IP101GRI Ethernet PHY held in reset: GPIO%d LOW",
-        ETHERNET_PHY_RESET_GPIO);
+        "IP101GRI Ethernet PHY held in reset: GPIO%d LOW "
+        "(read-back=%d after %" PRIu32 " ms)",
+        ETHERNET_PHY_RESET_GPIO,
+        level_after_hold,
+        settle_ms);
 
     return ESP_OK;
 }
 
 esp_err_t component_ethernet_restore_after_failed_sleep(void)
 {
+    if (!s_phy_held_in_reset) {
+        return ESP_OK;
+    }
+
     esp_err_t ret = gpio_hold_dis(ETHERNET_PHY_RESET_GPIO);
     if (ret != ESP_OK) {
         ESP_LOGE(
@@ -4744,6 +6282,8 @@ esp_err_t component_ethernet_restore_after_failed_sleep(void)
         return ret;
     }
 
+    s_phy_held_in_reset = false;
+
     ESP_LOGW(
         TAG,
         "Deep sleep failed; IP101GRI Ethernet PHY released");
@@ -4757,9 +6297,12 @@ FILE: src/main/power/component_sdcard.c
 ==================================================
 #include "power_save/component_sdcard.h"
 
+#include <inttypes.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "bsp/esp-bsp.h"
+#include "config/app_config.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -4775,21 +6318,42 @@ FILE: src/main/power/component_sdcard.c
  *     GPIO45 LOW  = microSD power ON
  *     GPIO45 HIGH = microSD power OFF
  */
-#define SDCARD_POWER_GPIO       GPIO_NUM_45
-#define SDCARD_POWER_ON_LEVEL   0
-#define SDCARD_POWER_OFF_LEVEL  1
-#define SDCARD_POWER_SETTLE_MS  20
+#define SDCARD_POWER_GPIO       APP_PWR_SDCARD_POWER_GPIO
+#define SDCARD_POWER_ON_LEVEL   APP_PWR_SDCARD_POWER_ON_LEVEL
+#define SDCARD_POWER_OFF_LEVEL  APP_PWR_SDCARD_POWER_OFF_LEVEL
+#define SDCARD_POWER_SETTLE_MS  APP_PWR_SDCARD_POWER_SETTLE_MS
 
 static const char *TAG = "component_sdcard";
 
 static bool s_was_mounted;
 static bool s_power_disabled;
 
+/* See component_wifi.c: a held pad may need time before it reads back. */
+static int wait_for_pad_level(gpio_num_t gpio_num, int expected_level,
+                              uint32_t *settle_ms_out)
+{
+    uint32_t waited_ms = 0;
+    int level = gpio_get_level(gpio_num);
+
+    while (level != expected_level && waited_ms < APP_PWR_HOLD_VERIFY_TIMEOUT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(APP_PWR_HOLD_VERIFY_POLL_MS));
+        waited_ms += APP_PWR_HOLD_VERIFY_POLL_MS;
+        level = gpio_get_level(gpio_num);
+    }
+
+    if (settle_ms_out != NULL) {
+        *settle_ms_out = waited_ms;
+    }
+
+    return level;
+}
+
 static esp_err_t configure_sdcard_power_gpio(void)
 {
     gpio_config_t io_config = {
         .pin_bit_mask = 1ULL << SDCARD_POWER_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
+        /* INPUT_OUTPUT so the pre-sleep rail audit can read the pad back. */
+        .mode = GPIO_MODE_INPUT_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
@@ -4886,6 +6450,27 @@ esp_err_t component_sdcard_disable_for_deep_sleep(void)
     }
 
     /*
+     * The board fits a pull-down on this gate so the card powers up by default.
+     * Stop ESP-IDF from switching the pad to its sleep configuration, otherwise
+     * that pull-down can win at the sleep boundary and re-power the card.
+     */
+    ret = gpio_sleep_sel_dis(SDCARD_POWER_GPIO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not disable sleep switching for GPIO%d: %s",
+            SDCARD_POWER_GPIO,
+            esp_err_to_name(ret));
+
+        (void)gpio_set_level(
+            SDCARD_POWER_GPIO,
+            SDCARD_POWER_ON_LEVEL);
+
+        (void)remount_after_shutdown_error();
+        return ret;
+    }
+
+    /*
      * Retain GPIO45 HIGH while the normal GPIO/IOMUX domain is powered down.
      * ESP32-P4 rev < 3.0 does not retain the hold after waking, which is useful
      * here because the board's pull-down then enables the card for the reboot.
@@ -4908,10 +6493,30 @@ esp_err_t component_sdcard_disable_for_deep_sleep(void)
 
     s_power_disabled = true;
 
+    uint32_t settle_ms = 0;
+    const int level_after_hold = wait_for_pad_level(
+        SDCARD_POWER_GPIO,
+        SDCARD_POWER_OFF_LEVEL,
+        &settle_ms);
+
+    if (level_after_hold != SDCARD_POWER_OFF_LEVEL) {
+        ESP_LOGE(
+            TAG,
+            "microSD gate still reads %d after holding for %" PRIu32
+            " ms (expected %d); SD1_VDD is still connected",
+            level_after_hold,
+            settle_ms,
+            SDCARD_POWER_OFF_LEVEL);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     ESP_LOGI(
         TAG,
-        "microSD power disabled: GPIO%d held HIGH",
-        SDCARD_POWER_GPIO);
+        "microSD power disabled: GPIO%d held HIGH "
+        "(read-back=%d after %" PRIu32 " ms)",
+        SDCARD_POWER_GPIO,
+        level_after_hold,
+        settle_ms);
 
     return ESP_OK;
 }
@@ -4983,9 +6588,16 @@ FILE: src/main/power/component_wifi.c
 ==================================================
 #include "power_save/component_wifi.h"
 
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "config/app_config.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 /*
  * Waveshare ESP32-P4-NANO connection:
@@ -4995,15 +6607,56 @@ FILE: src/main/power/component_wifi.c
  * LOW  = ESP32-C6 held in reset
  * HIGH = ESP32-C6 enabled
  */
-#define WIFI_C6_CHIP_PU_GPIO GPIO_NUM_54
+#define WIFI_C6_CHIP_PU_GPIO    APP_PWR_WIFI_C6_CHIP_PU_GPIO
+#define WIFI_C6_DISABLED_LEVEL  APP_PWR_WIFI_C6_DISABLED_LEVEL
+#define WIFI_C6_ENABLED_LEVEL   APP_PWR_WIFI_C6_ENABLED_LEVEL
 
 static const char *TAG = "component_wifi";
+
+static bool s_c6_disabled;
+
+/*
+ * Poll the pad until it reaches the expected level, or until the settle
+ * window expires.
+ *
+ * A pad does not always report its new level on the instruction immediately
+ * after gpio_hold_en(). On this board GPIO54 reads HIGH right after the hold
+ * and LOW a few tens of milliseconds later, which previously produced a false
+ * "coprocessor is still powered" error even though the pre-sleep rail audit
+ * then reported the pin correctly held LOW.
+ *
+ * Returns the last level read and reports how long the pad took to settle.
+ */
+static int wait_for_pad_level(gpio_num_t gpio_num, int expected_level,
+                              uint32_t *settle_ms_out)
+{
+    uint32_t waited_ms = 0;
+    int level = gpio_get_level(gpio_num);
+
+    while (level != expected_level && waited_ms < APP_PWR_HOLD_VERIFY_TIMEOUT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(APP_PWR_HOLD_VERIFY_POLL_MS));
+        waited_ms += APP_PWR_HOLD_VERIFY_POLL_MS;
+        level = gpio_get_level(gpio_num);
+    }
+
+    if (settle_ms_out != NULL) {
+        *settle_ms_out = waited_ms;
+    }
+
+    return level;
+}
 
 esp_err_t component_wifi_disable_for_deep_sleep(void)
 {
     gpio_config_t io_config = {
         .pin_bit_mask = 1ULL << WIFI_C6_CHIP_PU_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
+        /*
+         * INPUT_OUTPUT instead of OUTPUT so the pad can be read back after the
+         * hold is applied. The pre-sleep rail audit in deep_sleep.c relies on
+         * this to prove that CHIP_PU really stays LOW; a plain OUTPUT pad has
+         * its input path disabled and always reads 0.
+         */
+        .mode = GPIO_MODE_INPUT_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
@@ -5022,7 +6675,7 @@ esp_err_t component_wifi_disable_for_deep_sleep(void)
     /*
      * LOW holds the external ESP32-C6 in reset.
      */
-    ret = gpio_set_level(WIFI_C6_CHIP_PU_GPIO, 0);
+    ret = gpio_set_level(WIFI_C6_CHIP_PU_GPIO, WIFI_C6_DISABLED_LEVEL);
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -5059,10 +6712,37 @@ esp_err_t component_wifi_disable_for_deep_sleep(void)
         return ret;
     }
 
+    s_c6_disabled = true;
+
+    /*
+     * Read the pad back through the still-enabled input path. If it never
+     * settles LOW, the external pull-up has won and the ESP32-C6 is running,
+     * which is worth tens of milliamps during "Deep-sleep".
+     */
+    uint32_t settle_ms = 0;
+    const int level_after_hold = wait_for_pad_level(
+        WIFI_C6_CHIP_PU_GPIO,
+        WIFI_C6_DISABLED_LEVEL,
+        &settle_ms);
+
+    if (level_after_hold != WIFI_C6_DISABLED_LEVEL) {
+        ESP_LOGE(
+            TAG,
+            "ESP32-C6 CHIP_PU still reads %d after holding for %" PRIu32
+            " ms (expected %d); the coprocessor is still powered",
+            level_after_hold,
+            settle_ms,
+            WIFI_C6_DISABLED_LEVEL);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     ESP_LOGI(
         TAG,
-        "ESP32-C6 disabled: GPIO%d CHIP_PU held LOW",
-        WIFI_C6_CHIP_PU_GPIO);
+        "ESP32-C6 disabled: GPIO%d CHIP_PU held LOW "
+        "(read-back=%d after %" PRIu32 " ms)",
+        WIFI_C6_CHIP_PU_GPIO,
+        level_after_hold,
+        settle_ms);
 
     return ESP_OK;
 }
@@ -5073,6 +6753,10 @@ esp_err_t component_wifi_restore_after_failed_sleep(void)
      * This function is reached only if esp_deep_sleep_start()
      * unexpectedly returns.
      */
+    if (!s_c6_disabled) {
+        return ESP_OK;
+    }
+
     esp_err_t ret = gpio_hold_dis(WIFI_C6_CHIP_PU_GPIO);
     if (ret != ESP_OK) {
         ESP_LOGE(
@@ -5083,7 +6767,7 @@ esp_err_t component_wifi_restore_after_failed_sleep(void)
         return ret;
     }
 
-    ret = gpio_set_level(WIFI_C6_CHIP_PU_GPIO, 1);
+    ret = gpio_set_level(WIFI_C6_CHIP_PU_GPIO, WIFI_C6_ENABLED_LEVEL);
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -5091,6 +6775,8 @@ esp_err_t component_wifi_restore_after_failed_sleep(void)
             esp_err_to_name(ret));
         return ret;
     }
+
+    s_c6_disabled = false;
 
     ESP_LOGW(TAG, "Deep sleep failed; ESP32-C6 re-enabled");
     return ESP_OK;
@@ -5104,6 +6790,7 @@ FILE: src/main/power/cpu_power.c
 
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "sdkconfig.h"
@@ -5115,82 +6802,53 @@ FILE: src/main/power/cpu_power.c
 
 #include "config/app_config.h"
 
-static const char *TAG = "cpu_power";
-
-/*
- * ESP32-P4 active CPU policy.
- *
- * The complete active window keeps the display-safe 90..360 MHz DFS range.
- * ESP-IDF may therefore raise the CPU/APB clock when the scheduler or a driver
- * needs more bandwidth and return to the 90 MHz floor between work.
- *
- * PERFORMANCE explicitly acquires ESP_PM_CPU_FREQ_MAX during AI inference.
- * BALANCED and ECO do not acquire that application lock and reduce the face
- * detection duty cycle. This saves active power without imposing the unsafe
- * 90 MHz hard maximum that caused MIPI-DSI underruns in the V3 test.
- *
- * Actual Light-sleep is still entered explicitly by app_sleep.c. During
- * Light-sleep, the CPU clock is gated rather than merely reduced to 90 MHz.
- */
-#define CPU_ACTIVE_FLOOR_FREQ_MHZ 90
-#define CPU_PERFORMANCE_MAX_FREQ_MHZ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ
+static const char *TAG = "PWR_CPU";
 
 typedef enum {
-    CPU_POWER_PROFILE_PERFORMANCE = 0,
-    CPU_POWER_PROFILE_BALANCED,
-    CPU_POWER_PROFILE_ECO,
-} cpu_power_profile_t;
+    CPU_POWER_STATE_ACTIVE = 0,
+    CPU_POWER_STATE_ECO_SCAN_8,
+    CPU_POWER_STATE_ECO_SCAN_16,
+} cpu_power_state_t;
 
 static esp_pm_lock_handle_t s_ai_cpu_lock;
 static SemaphoreHandle_t s_policy_mutex;
 static bool s_initialized;
-static bool s_ai_session_holds_mutex;
-static cpu_power_profile_t s_profile = CPU_POWER_PROFILE_PERFORMANCE;
-static int s_applied_min_mhz;
-static int s_applied_max_mhz;
+static bool s_face_boost_active;
+static cpu_power_state_t s_state = CPU_POWER_STATE_ACTIVE;
 
-/* Used only for short cross-task reads/writes of the profile/session flags. */
 static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
-static const char *profile_name(cpu_power_profile_t profile)
+static const char *state_name(cpu_power_state_t state)
 {
-    switch (profile) {
-    case CPU_POWER_PROFILE_PERFORMANCE:
-        return "PERFORMANCE";
-    case CPU_POWER_PROFILE_BALANCED:
-        return "BALANCED";
-    case CPU_POWER_PROFILE_ECO:
-        return "ECO";
-    default:
-        return "UNKNOWN";
+    if (state == CPU_POWER_STATE_ECO_SCAN_8) {
+        return "ECO-SCAN-8";
     }
+    if (state == CPU_POWER_STATE_ECO_SCAN_16) {
+        return "ECO-SCAN-16";
+    }
+    return "ACTIVE";
 }
 
-static uint32_t profile_detection_interval(cpu_power_profile_t profile)
+static uint32_t detection_interval_for_state(cpu_power_state_t state)
 {
-    switch (profile) {
-    case CPU_POWER_PROFILE_BALANCED:
-        return APP_FACE_DETECT_BALANCED_INTERVAL_FRAMES;
-    case CPU_POWER_PROFILE_ECO:
-        return APP_FACE_DETECT_ECO_INTERVAL_FRAMES;
-    case CPU_POWER_PROFILE_PERFORMANCE:
-    default:
-        return APP_FACE_DETECT_INTERVAL_FRAMES;
+    if (state == CPU_POWER_STATE_ECO_SCAN_16) {
+        return APP_FACE_DETECT_IDLE_90_INTERVAL_FRAMES;
     }
+    if (state == CPU_POWER_STATE_ECO_SCAN_8) {
+        return APP_FACE_DETECT_IDLE_180_INTERVAL_FRAMES;
+    }
+    return APP_FACE_DETECT_INTERVAL_FRAMES;
 }
 
-/*
- * Must be called while s_policy_mutex is held.
- *
- * esp_pm_get_configuration() verifies that ESP-IDF accepted exactly the
- * requested range. The log therefore reports the applied policy, not only the
- * requested one.
- */
-static esp_err_t apply_active_dfs_policy_locked(void)
+/* Must be called while s_policy_mutex is held. */
+static esp_err_t apply_frequency_policy_locked(
+    int baseline_mhz,
+    cpu_power_state_t state,
+    uint32_t inactive_ms)
 {
     const esp_pm_config_t requested = {
-        .max_freq_mhz = CPU_PERFORMANCE_MAX_FREQ_MHZ,
-        .min_freq_mhz = CPU_ACTIVE_FLOOR_FREQ_MHZ,
+        .max_freq_mhz = APP_CPU_MAX_FREQ_MHZ,
+        .min_freq_mhz = baseline_mhz,
         .light_sleep_enable = false,
     };
 
@@ -5198,9 +6856,11 @@ static esp_err_t apply_active_dfs_policy_locked(void)
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
-            "ACTIVE-POWER-V6 esp_pm_configure rejected %d..%d MHz: %s",
-            CPU_ACTIVE_FLOOR_FREQ_MHZ,
-            CPU_PERFORMANCE_MAX_FREQ_MHZ,
+            "event=CPU_POLICY_REJECTED state=%s baseline_mhz=%d max_mhz=%d "
+            "error=%s",
+            state_name(state),
+            baseline_mhz,
+            APP_CPU_MAX_FREQ_MHZ,
             esp_err_to_name(ret));
         return ret;
     }
@@ -5208,80 +6868,41 @@ static esp_err_t apply_active_dfs_policy_locked(void)
     esp_pm_config_t applied = {0};
     ret = esp_pm_get_configuration(&applied);
     if (ret != ESP_OK) {
-        s_applied_min_mhz = 0;
-        s_applied_max_mhz = 0;
-        ESP_LOGE(
-            TAG,
-            "ACTIVE-POWER-V6 could not verify PM configuration: %s",
-            esp_err_to_name(ret));
+        ESP_LOGE(TAG, "event=CPU_CLOCK_VERIFY_READ_FAILED error=%s",
+                 esp_err_to_name(ret));
         return ret;
     }
 
-    s_applied_min_mhz = applied.min_freq_mhz;
-    s_applied_max_mhz = applied.max_freq_mhz;
-
-    if (applied.min_freq_mhz != CPU_ACTIVE_FLOOR_FREQ_MHZ ||
-        applied.max_freq_mhz != CPU_PERFORMANCE_MAX_FREQ_MHZ ||
+    if (applied.min_freq_mhz != baseline_mhz ||
+        applied.max_freq_mhz != APP_CPU_MAX_FREQ_MHZ ||
         applied.light_sleep_enable) {
         ESP_LOGE(
             TAG,
-            "ACTIVE-POWER-V6 PM verification mismatch: requested=%d..%d "
-            "applied=%d..%d MHz auto_light_sleep=%s",
-            CPU_ACTIVE_FLOOR_FREQ_MHZ,
-            CPU_PERFORMANCE_MAX_FREQ_MHZ,
+            "event=CPU_POLICY_VERIFY_MISMATCH state=%s "
+            "requested_baseline_mhz=%d requested_max_mhz=%d "
+            "applied_min_mhz=%d applied_max_mhz=%d auto_light_sleep=%s",
+            state_name(state),
+            baseline_mhz,
+            APP_CPU_MAX_FREQ_MHZ,
             applied.min_freq_mhz,
             applied.max_freq_mhz,
             applied.light_sleep_enable ? "on" : "off");
         return ESP_FAIL;
     }
 
-    return ESP_OK;
-}
-
-static void log_profile(cpu_power_profile_t profile)
-{
-    const bool ai_max_lock_enabled =
-        profile == CPU_POWER_PROFILE_PERFORMANCE;
-
     ESP_LOGI(
         TAG,
-        "ACTIVE-POWER-V6 profile=%s active_DFS=%d..%d MHz "
-        "AI_max_lock=%s policy=verified detect_every=%" PRIu32 " frames",
-        profile_name(profile),
-        s_applied_min_mhz,
-        s_applied_max_mhz,
-        ai_max_lock_enabled ? "enabled" : "disabled",
-        profile_detection_interval(profile));
-}
+        "event=CPU_POLICY_APPLIED state=%s inactive_ms=%" PRIu32
+        " baseline_mhz=%d max_mhz=%d face_boost=%s "
+        "detect_every_frames=%" PRIu32,
+        state_name(state),
+        inactive_ms,
+        baseline_mhz,
+        APP_CPU_MAX_FREQ_MHZ,
+        s_face_boost_active ? "on" : "off",
+        detection_interval_for_state(state));
 
-static void set_profile(cpu_power_profile_t new_profile)
-{
-    if (!s_initialized || s_policy_mutex == NULL) {
-        return;
-    }
-
-    if (xSemaphoreTake(s_policy_mutex, portMAX_DELAY) != pdTRUE) {
-        ESP_LOGE(TAG, "ACTIVE-POWER-V6 failed to lock CPU policy mutex");
-        return;
-    }
-
-    cpu_power_profile_t old_profile;
-    portENTER_CRITICAL(&s_state_lock);
-    old_profile = s_profile;
-    portEXIT_CRITICAL(&s_state_lock);
-
-    if (old_profile == new_profile) {
-        xSemaphoreGive(s_policy_mutex);
-        return;
-    }
-
-    /* Only the AI-lock policy and detection interval change here. */
-    portENTER_CRITICAL(&s_state_lock);
-    s_profile = new_profile;
-    portEXIT_CRITICAL(&s_state_lock);
-
-    log_profile(new_profile);
-    xSemaphoreGive(s_policy_mutex);
+    return ESP_OK;
 }
 
 esp_err_t cpu_power_init(void)
@@ -5290,9 +6911,17 @@ esp_err_t cpu_power_init(void)
         return ESP_OK;
     }
 
+    if (CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ != APP_CPU_MAX_FREQ_MHZ) {
+        ESP_LOGE(
+            TAG,
+            "event=CPU_DEFAULT_MISMATCH expected_mhz=%d configured_mhz=%d",
+            APP_CPU_MAX_FREQ_MHZ,
+            CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     s_policy_mutex = xSemaphoreCreateMutex();
     if (s_policy_mutex == NULL) {
-        ESP_LOGE(TAG, "Creating CPU policy mutex failed");
         return ESP_ERR_NO_MEM;
     }
 
@@ -5302,7 +6931,10 @@ esp_err_t cpu_power_init(void)
         return ESP_FAIL;
     }
 
-    esp_err_t ret = apply_active_dfs_policy_locked();
+    esp_err_t ret = apply_frequency_policy_locked(
+        APP_CPU_ACTIVE_FREQ_MHZ,
+        CPU_POWER_STATE_ACTIVE,
+        0U);
 
     xSemaphoreGive(s_policy_mutex);
 
@@ -5319,109 +6951,189 @@ esp_err_t cpu_power_init(void)
         &s_ai_cpu_lock);
 
     if (ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "Creating AI CPU lock failed: %s",
-            esp_err_to_name(ret));
         vSemaphoreDelete(s_policy_mutex);
         s_policy_mutex = NULL;
         return ret;
     }
 
     portENTER_CRITICAL(&s_state_lock);
-    s_profile = CPU_POWER_PROFILE_PERFORMANCE;
-    s_ai_session_holds_mutex = false;
+    s_state = CPU_POWER_STATE_ACTIVE;
+    s_face_boost_active = false;
     s_initialized = true;
     portEXIT_CRITICAL(&s_state_lock);
 
     ESP_LOGI(
         TAG,
-        "ACTIVE-POWER-V6 initialized: active_DFS=%d..%d MHz, "
-        "BALANCED/ECO release AI max lock, balanced=%d ms, eco=%d ms",
-        CPU_ACTIVE_FLOOR_FREQ_MHZ,
-        CPU_PERFORMANCE_MAX_FREQ_MHZ,
-        APP_CPU_BALANCED_AFTER_MS,
-        APP_CPU_ECO_AFTER_MS);
-    log_profile(CPU_POWER_PROFILE_PERFORMANCE);
+        "event=CPU_POLICY active_baseline_mhz=%d max_mhz=%d "
+        "eco_scan_8_after_ms=%u eco_scan_16_after_ms=%u "
+        "camera_display_teardown=disabled",
+        APP_CPU_ACTIVE_FREQ_MHZ,
+        APP_CPU_MAX_FREQ_MHZ,
+        (unsigned)APP_CPU_IDLE_180_AFTER_MS,
+        (unsigned)APP_CPU_IDLE_90_AFTER_MS);
 
     return ESP_OK;
 }
 
-esp_err_t cpu_power_ai_begin(void)
+esp_err_t cpu_power_register_idle_scan_callbacks(
+    cpu_power_idle_transition_callback_t enter_idle_scan,
+    cpu_power_idle_transition_callback_t exit_idle_scan,
+    void *user_data)
 {
-    if (!s_initialized || s_ai_cpu_lock == NULL ||
-        s_policy_mutex == NULL) {
+    if (enter_idle_scan == NULL || exit_idle_scan == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
 
     /*
-     * Hold the policy mutex until cpu_power_ai_end() in PERFORMANCE mode.
-     * This prevents the inactivity task from changing the logical profile
-     * while the same AI operation owns its maximum-frequency lock.
+     * Retain the API so app_main does not need a risky broad rewrite. The old
+     * callbacks dismantled MIPI-DSI/DPHY while CSI/ISP was still producing
+     * interrupts. They are therefore deliberately accepted but not stored or
+     * invoked. The coordinated Light-sleep path remains responsible for first
+     * stopping the camera and only then suspending the display.
      */
+    (void)enter_idle_scan;
+    (void)exit_idle_scan;
+    (void)user_data;
+
+    ESP_LOGW(
+        TAG,
+        "event=IDLE_DISPLAY_CALLBACKS_DISABLED reason=CSI_ISP_ACTIVE");
+    return ESP_OK;
+}
+
+esp_err_t cpu_power_face_boost_begin(void)
+{
+    if (!s_initialized || s_ai_cpu_lock == NULL || s_policy_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     if (xSemaphoreTake(s_policy_mutex, portMAX_DELAY) != pdTRUE) {
         return ESP_FAIL;
     }
 
-    cpu_power_profile_t profile;
+    bool already_active;
     portENTER_CRITICAL(&s_state_lock);
-    profile = s_profile;
+    already_active = s_face_boost_active;
     portEXIT_CRITICAL(&s_state_lock);
 
-    if (profile != CPU_POWER_PROFILE_PERFORMANCE) {
+    if (already_active) {
         xSemaphoreGive(s_policy_mutex);
         return ESP_OK;
     }
 
     esp_err_t ret = esp_pm_lock_acquire(s_ai_cpu_lock);
+
+    if (ret == ESP_OK) {
+        portENTER_CRITICAL(&s_state_lock);
+        s_face_boost_active = true;
+        portEXIT_CRITICAL(&s_state_lock);
+    }
+
+    xSemaphoreGive(s_policy_mutex);
+
     if (ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "Acquiring AI CPU lock failed: %s",
-            esp_err_to_name(ret));
-        xSemaphoreGive(s_policy_mutex);
+        ESP_LOGE(TAG, "event=FACE_BOOST_ACQUIRE_FAILED error=%s",
+                 esp_err_to_name(ret));
         return ret;
     }
 
-    portENTER_CRITICAL(&s_state_lock);
-    s_ai_session_holds_mutex = true;
-    portEXIT_CRITICAL(&s_state_lock);
-
+    ESP_LOGI(TAG, "event=FACE_BOOST_ACQUIRED target_mhz=%d",
+             APP_CPU_MAX_FREQ_MHZ);
     return ESP_OK;
 }
 
-esp_err_t cpu_power_ai_end(void)
+esp_err_t cpu_power_face_boost_end(void)
 {
-    if (!s_initialized || s_ai_cpu_lock == NULL ||
-        s_policy_mutex == NULL) {
+    if (!s_initialized || s_ai_cpu_lock == NULL || s_policy_mutex == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    bool release_required;
+    if (xSemaphoreTake(s_policy_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_FAIL;
+    }
+
+    bool boost_active;
     portENTER_CRITICAL(&s_state_lock);
-    release_required = s_ai_session_holds_mutex;
+    boost_active = s_face_boost_active;
     portEXIT_CRITICAL(&s_state_lock);
 
-    /* BALANCED/ECO cpu_power_ai_begin() is intentionally a successful no-op. */
-    if (!release_required) {
+    if (!boost_active) {
+        xSemaphoreGive(s_policy_mutex);
         return ESP_OK;
     }
 
     esp_err_t ret = esp_pm_lock_release(s_ai_cpu_lock);
-    if (ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "Releasing AI CPU lock failed: %s",
-            esp_err_to_name(ret));
+
+    if (ret == ESP_OK) {
+        portENTER_CRITICAL(&s_state_lock);
+        s_face_boost_active = false;
+        portEXIT_CRITICAL(&s_state_lock);
     }
 
+    xSemaphoreGive(s_policy_mutex);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "event=FACE_BOOST_RELEASE_FAILED error=%s",
+                 esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "event=FACE_BOOST_RELEASED active_baseline_mhz=%d",
+             APP_CPU_ACTIVE_FREQ_MHZ);
+    return ret;
+}
+
+bool cpu_power_is_face_boost_active(void)
+{
+    bool active;
     portENTER_CRITICAL(&s_state_lock);
-    s_ai_session_holds_mutex = false;
+    active = s_face_boost_active;
+    portEXIT_CRITICAL(&s_state_lock);
+    return active;
+}
+
+static void select_scan_state(
+    cpu_power_state_t requested_state,
+    uint32_t inactive_ms)
+{
+    if (xSemaphoreTake(s_policy_mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+
+    cpu_power_state_t target_state = requested_state;
+    if (s_face_boost_active) {
+        target_state = CPU_POWER_STATE_ACTIVE;
+    }
+
+    cpu_power_state_t previous_state;
+    portENTER_CRITICAL(&s_state_lock);
+    previous_state = s_state;
+    s_state = target_state;
     portEXIT_CRITICAL(&s_state_lock);
 
-    /* Always release the mutex so a PM-lock error cannot deadlock the system. */
+    if (previous_state != target_state) {
+        ESP_LOGI(
+            TAG,
+            "event=SCAN_RATE_APPLIED state=%s inactive_ms=%" PRIu32
+            " baseline_mhz=%d max_mhz=%d detect_every_frames=%" PRIu32
+            " camera=on display=on",
+            state_name(target_state),
+            inactive_ms,
+            APP_CPU_ACTIVE_FREQ_MHZ,
+            APP_CPU_MAX_FREQ_MHZ,
+            detection_interval_for_state(target_state));
+    }
+
     xSemaphoreGive(s_policy_mutex);
-    return ret;
+}
+
+static void restore_active(void)
+{
+    select_scan_state(CPU_POWER_STATE_ACTIVE, 0U);
 }
 
 void cpu_power_update_inactivity(uint32_t inactive_ms)
@@ -5430,34 +7142,40 @@ void cpu_power_update_inactivity(uint32_t inactive_ms)
         return;
     }
 
-    cpu_power_profile_t new_profile = CPU_POWER_PROFILE_PERFORMANCE;
-
-    if (inactive_ms >= APP_CPU_ECO_AFTER_MS) {
-        new_profile = CPU_POWER_PROFILE_ECO;
-    } else if (inactive_ms >= APP_CPU_BALANCED_AFTER_MS) {
-        new_profile = CPU_POWER_PROFILE_BALANCED;
+    /* A face-authentication burst always has priority over idle staging. */
+    if (cpu_power_is_face_boost_active()) {
+        restore_active();
+        return;
     }
 
-    set_profile(new_profile);
+    if (inactive_ms >= APP_CPU_IDLE_90_AFTER_MS) {
+        select_scan_state(CPU_POWER_STATE_ECO_SCAN_16, inactive_ms);
+    } else if (inactive_ms >= APP_CPU_IDLE_180_AFTER_MS) {
+        select_scan_state(CPU_POWER_STATE_ECO_SCAN_8, inactive_ms);
+    } else {
+        restore_active();
+    }
 }
 
 void cpu_power_notify_activity(void)
 {
     if (s_initialized) {
-        set_profile(CPU_POWER_PROFILE_PERFORMANCE);
+        restore_active();
     }
 }
 
 uint32_t cpu_power_get_face_detect_interval_frames(void)
 {
-    cpu_power_profile_t profile;
-
+    cpu_power_state_t state;
     portENTER_CRITICAL(&s_state_lock);
-    profile = s_profile;
+    state = s_state;
     portEXIT_CRITICAL(&s_state_lock);
+    return detection_interval_for_state(state);
+}
 
-    const uint32_t interval = profile_detection_interval(profile);
-    return interval > 0 ? interval : 1;
+bool cpu_power_is_idle_scan_active(void)
+{
+    return false;
 }
 
 
@@ -5466,29 +7184,396 @@ FILE: src/main/power/deep_sleep.c
 ==================================================
 #include "deep_sleep.h"
 
+#include <stdbool.h>
+#include <stdio.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "config/app_config.h"
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
-
-#include <stdio.h>
+#include "soc/soc_caps.h"
 
 static const char *TAG = "deep_sleep";
 
-#define WAKE_BUTTON_GPIO GPIO_NUM_3
+#define WAKE_BUTTON_GPIO APP_DEEP_SLEEP_BUTTON_GPIO
+
+/*
+ * ESP32-P4-NANO shared I2C bus from the Waveshare schematic:
+ *
+ *     GPIO7 = ESP_I2C_SDA
+ *     GPIO8 = ESP_I2C_SCL
+ *
+ * R50 (SDA) and R48 (SCL) are external 2.2K pull-ups to ESP_3V3.
+ * Software cannot disconnect those physical resistors. The lowest-current
+ * software state is therefore to disable every internal pull resistor and
+ * isolate the ESP32-P4 pads so that the external pull-ups can hold both lines
+ * HIGH without a DC path through the SoC.
+ *
+ * Do this only at the final, irreversible Deep-sleep boundary. Light-sleep
+ * must retain this bus because the application polls the GT911 touchscreen.
+ */
+#define SHARED_I2C_SDA_GPIO APP_PWR_SHARED_I2C_SDA_GPIO
+#define SHARED_I2C_SCL_GPIO APP_PWR_SHARED_I2C_SCL_GPIO
+
+/*
+ * NOTE ON GPIO HOLDS AND ESP32-P4
+ *
+ * ESP32-P4 defines SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP = 1, meaning a
+ * per-pin gpio_hold_en() keeps a digital pad frozen while the digital domain
+ * is powered down. Because of that capability, ESP-IDF does NOT declare
+ * gpio_deep_sleep_hold_en() for this target - the header guards it with
+ * "#if !SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP". Calling it here would not
+ * compile, and it is not needed: the per-pin holds taken by the
+ * power_save/component_*.c modules are already the correct mechanism.
+ *
+ * gpio_force_hold_all() does exist on ESP32-P4, but it also freezes GPIO3.
+ * That is the Deep-sleep wake pin, so it is deliberately NOT used here.
+ */
+
+static void record_first_error(
+    esp_err_t operation_result,
+    esp_err_t *first_error)
+{
+    if (operation_result != ESP_OK && *first_error == ESP_OK) {
+        *first_error = operation_result;
+    }
+}
+
+#if APP_PWR_DEEP_SLEEP_AUDIT_ENABLED
+
+static const char *AUDIT_TAG = "PWR_AUDIT";
+
+typedef struct {
+    int gpio_num;
+    const char *description;
+    int expected_level;
+    const char *consequence_if_wrong;
+} deep_sleep_rail_t;
+
+static const deep_sleep_rail_t s_audited_rails[] = {
+    {
+        .gpio_num = APP_PWR_WIFI_C6_CHIP_PU_GPIO,
+        .description = "ESP32-C6 CHIP_PU",
+        .expected_level = APP_PWR_WIFI_C6_DISABLED_LEVEL,
+        .consequence_if_wrong = "Wi-Fi coprocessor is running (tens of mA)",
+    },
+    {
+        .gpio_num = APP_PWR_ETHERNET_PHY_RESET_GPIO,
+        .description = "IP101GRI PHY RESET",
+        .expected_level = APP_PWR_ETHERNET_RESET_ACTIVE_LEVEL,
+        .consequence_if_wrong = "Ethernet PHY is auto-negotiating (20-40 mA)",
+    },
+    {
+        .gpio_num = APP_PWR_AUDIO_AMP_GPIO,
+        .description = "audio amplifier EN",
+        .expected_level = APP_PWR_AUDIO_AMP_DISABLED_LEVEL,
+        .consequence_if_wrong = "audio amplifier is enabled",
+    },
+    {
+        .gpio_num = APP_PWR_SDCARD_POWER_GPIO,
+        .description = "microSD Q1 gate",
+        .expected_level = APP_PWR_SDCARD_POWER_OFF_LEVEL,
+        .consequence_if_wrong = "SD1_VDD is still connected to the card",
+    },
+#if APP_PWR_DISPLAY_BACKLIGHT_GPIO >= 0
+    {
+        .gpio_num = APP_PWR_DISPLAY_BACKLIGHT_GPIO,
+        .description = "display backlight EN",
+        .expected_level = APP_PWR_DISPLAY_BACKLIGHT_OFF_LEVEL,
+        .consequence_if_wrong = "backlight driver is partly on",
+    },
+#endif
+#if APP_PWR_TOUCH_INT_GPIO >= 0
+    {
+        .gpio_num = APP_PWR_TOUCH_INT_GPIO,
+        .description = "GT911 INT",
+        .expected_level = 0,
+        .consequence_if_wrong = "GT911 can wake itself out of sleep",
+    },
+#endif
+    {
+        .gpio_num = SHARED_I2C_SDA_GPIO,
+        .description = "shared I2C SDA",
+        .expected_level = 1,
+        .consequence_if_wrong = "~1.5 mA through the 2.2K pull-up",
+    },
+    {
+        .gpio_num = SHARED_I2C_SCL_GPIO,
+        .description = "shared I2C SCL",
+        .expected_level = 1,
+        .consequence_if_wrong = "~1.5 mA through the 2.2K pull-up",
+    },
+};
+
+/*
+ * Report every controlled rail immediately before Deep-sleep is entered.
+ *
+ * A pad that was configured with GPIO_MODE_INPUT_OUTPUT reads back its real
+ * electrical level even while it is held, so a hold that silently failed - or
+ * an external device pulling a line - shows up in the serial log instead of
+ * only on a multimeter.
+ */
+static void audit_rails_before_deep_sleep(void)
+{
+    unsigned mismatches = 0;
+
+    ESP_LOGI(AUDIT_TAG, "---- Pre-Deep-sleep rail audit ----------------------");
+
+    for (size_t i = 0; i < sizeof(s_audited_rails) / sizeof(s_audited_rails[0]); i++) {
+        const deep_sleep_rail_t *rail = &s_audited_rails[i];
+        const int level = gpio_get_level((gpio_num_t)rail->gpio_num);
+        const bool matches = (level == rail->expected_level);
+
+        if (matches) {
+            ESP_LOGI(AUDIT_TAG, "GPIO%-2d %-22s level=%d expected=%d  OK",
+                     rail->gpio_num,
+                     rail->description,
+                     level,
+                     rail->expected_level);
+        } else {
+            mismatches++;
+            ESP_LOGE(AUDIT_TAG,
+                     "GPIO%-2d %-22s level=%d expected=%d  MISMATCH -> %s",
+                     rail->gpio_num,
+                     rail->description,
+                     level,
+                     rail->expected_level,
+                     rail->consequence_if_wrong);
+        }
+    }
+
+    if (mismatches == 0) {
+        ESP_LOGI(AUDIT_TAG,
+                 "All controlled rails are in their Deep-sleep state. "
+                 "Remaining current belongs to always-on hardware "
+                 "(camera module, panel, PHY, regulators, LED, USB bridge).");
+    } else {
+        ESP_LOGE(AUDIT_TAG,
+                 "%u rail(s) are NOT in their Deep-sleep state; expect "
+                 "elevated sleep current",
+                 mismatches);
+    }
+
+    ESP_LOGI(AUDIT_TAG, "-----------------------------------------------------");
+}
+
+#else /* APP_PWR_DEEP_SLEEP_AUDIT_ENABLED */
+
+static void audit_rails_before_deep_sleep(void)
+{
+}
+
+#endif /* APP_PWR_DEEP_SLEEP_AUDIT_ENABLED */
+
+static esp_err_t isolate_i2c_pin_for_deep_sleep(
+    gpio_num_t gpio_num,
+    const char *signal_name,
+    int level_before_isolation)
+{
+    esp_err_t first_error = ESP_OK;
+    esp_err_t ret;
+
+    if (level_before_isolation == 0) {
+        /*
+         * One externally pulled-up 2.2K line held LOW draws approximately
+         * 3.3 V / 2200 ohm = 1.5 mA. Isolation removes an SoC-side LOW path,
+         * but it cannot release a line that an external peripheral holds LOW.
+         */
+        ESP_LOGW(
+            TAG,
+            "%s GPIO%d is LOW before isolation; check whether an external "
+            "I2C device is holding the bus LOW",
+            signal_name,
+            gpio_num);
+    }
+
+    ret = gpio_pullup_dis(gpio_num);
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Could not disable the internal pull-up on %s GPIO%d: %s",
+            signal_name,
+            gpio_num,
+            esp_err_to_name(ret));
+        record_first_error(ret, &first_error);
+    }
+
+    ret = gpio_pulldown_dis(gpio_num);
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Could not disable the internal pull-down on %s GPIO%d: %s",
+            signal_name,
+            gpio_num,
+            esp_err_to_name(ret));
+        record_first_error(ret, &first_error);
+    }
+
+    /*
+     * GPIO7 and GPIO8 are ESP32-P4 LP/RTC-capable GPIOs. rtc_gpio_isolate()
+     * disconnects the pad's digital input/output paths and internal pulls for
+     * Deep-sleep. A Deep-sleep wake resets the application, so no runtime
+     * restoration path is required here.
+     */
+    ret = rtc_gpio_isolate(gpio_num);
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Could not isolate %s GPIO%d for Deep-sleep: %s",
+            signal_name,
+            gpio_num,
+            esp_err_to_name(ret));
+        record_first_error(ret, &first_error);
+    }
+
+    return first_error;
+}
+
+static esp_err_t isolate_shared_i2c_for_deep_sleep(void)
+{
+    /* Sample the physical bus before disconnecting the ESP32-P4 pads. */
+    const int sda_level = gpio_get_level(SHARED_I2C_SDA_GPIO);
+    const int scl_level = gpio_get_level(SHARED_I2C_SCL_GPIO);
+    esp_err_t first_error = ESP_OK;
+
+    esp_err_t ret = isolate_i2c_pin_for_deep_sleep(
+        SHARED_I2C_SDA_GPIO,
+        "SDA",
+        sda_level);
+    record_first_error(ret, &first_error);
+
+    ret = isolate_i2c_pin_for_deep_sleep(
+        SHARED_I2C_SCL_GPIO,
+        "SCL",
+        scl_level);
+    record_first_error(ret, &first_error);
+
+    ESP_LOGI(
+        TAG,
+        "Shared I2C prepared for Deep-sleep: "
+        "SDA=GPIO%d level_before=%d, SCL=GPIO%d level_before=%d, "
+        "internal_pulls=OFF pads=ISOLATED",
+        SHARED_I2C_SDA_GPIO,
+        sda_level,
+        SHARED_I2C_SCL_GPIO,
+        scl_level);
+
+    return first_error;
+}
+
+#if APP_PWR_ISOLATE_SDMMC_PINS
+/*
+ * Float a non-RTC digital pad and freeze it.
+ *
+ * rtc_gpio_isolate() only works on GPIO0..GPIO15 (the LP-capable range) on
+ * ESP32-P4. The SDMMC signals are outside that range, so the equivalent action
+ * is: configure as a pull-less input, stop ESP-IDF from switching the pad to
+ * its sleep configuration, then hold it. This keeps the ESP32-P4 from
+ * back-powering the microSD card through its ESD structures after SD1_VDD has
+ * already been switched off.
+ */
+static esp_err_t float_and_hold_digital_pin(gpio_num_t gpio_num)
+{
+    gpio_config_t io_config = {
+        .pin_bit_mask = 1ULL << gpio_num,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    esp_err_t ret = gpio_config(&io_config);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    (void)gpio_sleep_sel_dis(gpio_num);
+    return gpio_hold_en(gpio_num);
+}
+
+static void float_sdmmc_pins_for_deep_sleep(void)
+{
+    static const int sdmmc_pins[] = APP_PWR_SDMMC_PIN_LIST;
+
+    for (size_t i = 0; i < sizeof(sdmmc_pins) / sizeof(sdmmc_pins[0]); i++) {
+        const gpio_num_t gpio_num = (gpio_num_t)sdmmc_pins[i];
+        const esp_err_t ret = float_and_hold_digital_pin(gpio_num);
+
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Could not float SDMMC GPIO%d: %s",
+                     (int)gpio_num, esp_err_to_name(ret));
+        }
+    }
+
+    ESP_LOGI(TAG,
+             "SDMMC pads floated so the powered-down microSD card cannot be "
+             "back-powered through its signal lines");
+}
+#endif /* APP_PWR_ISOLATE_SDMMC_PINS */
+
+#if APP_PWR_DEEP_SLEEP_POWER_DOWN_FLASH
+static void power_down_flash_for_deep_sleep(void)
+{
+    /*
+     * GPIO3 is the only Deep-sleep wake source; the RTC timer is never armed.
+     * Under that condition ESP-IDF is allowed to remove power from the SPI
+     * flash rail for the whole sleep interval.
+     *
+     * The capability macro guard keeps this portable: on a target without a
+     * switchable VDD_SPI domain the enum value does not exist and the request
+     * is simply skipped.
+     */
+#if defined(SOC_PM_SUPPORT_VDDSDIO_PD) && SOC_PM_SUPPORT_VDDSDIO_PD
+    const esp_err_t ret = esp_sleep_pd_config(
+        ESP_PD_DOMAIN_VDDSDIO,
+        ESP_PD_OPTION_OFF);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "SPI flash rail (VDD_SPI) will be powered down");
+    } else if (ret == ESP_ERR_INVALID_STATE) {
+        /*
+         * Expected on this build. The boot log reports
+         *   mmu_psram: .rodata xip on psram
+         *   mmu_psram: .text   xip on psram
+         * so code and constants execute in place from the PSRAM that shares
+         * the VDD_SPI rail with the flash; IDF refuses to switch that rail
+         * off. Nothing is wrong, and the saving would have been a few tens of
+         * microamps - far below this board's floor.
+         */
+        ESP_LOGI(TAG,
+                 "VDD_SPI power-down declined (XIP from PSRAM shares this "
+                 "rail); continuing without it");
+    } else {
+        ESP_LOGW(TAG, "Could not request flash power-down: %s",
+                 esp_err_to_name(ret));
+    }
+#else
+    ESP_LOGI(TAG,
+             "This target has no software-switchable VDD_SPI domain; "
+             "flash power-down skipped");
+#endif
+}
+#endif
 
 void enter_deep_sleep(void)
 {
     /*
      * Button wiring:
      *
-     * GPIO3 ---- button ---- GND
+     * ESP_3V3 ---- external 47K..100K pull-up ---- GPIO3
+     * GPIO3  ---- button ------------------------- GND
      *
      * Released: GPIO3 = HIGH
      * Pressed:  GPIO3 = LOW
+     *
+     * Keep the internal pull-up enabled as a safe fallback. Disable it only
+     * after the physical external GPIO3 pull-up has been installed and
+     * verified with a meter.
      */
     gpio_config_t button_config = {
         .pin_bit_mask = 1ULL << WAKE_BUTTON_GPIO,
@@ -5500,59 +7585,75 @@ void enter_deep_sleep(void)
 
     ESP_ERROR_CHECK(gpio_config(&button_config));
 
-    /*
-     * Verify that GPIO3 is supported as a deep-sleep wake pin.
-     */
+    /* Verify that GPIO3 is supported as a Deep-sleep wake pin. */
     if (!esp_sleep_is_valid_wakeup_gpio(WAKE_BUTTON_GPIO)) {
         ESP_LOGE(
             TAG,
-            "GPIO%d cannot wake this ESP32-P4 from deep sleep",
-            WAKE_BUTTON_GPIO
-        );
-
+            "GPIO%d cannot wake this ESP32-P4 from Deep-sleep",
+            WAKE_BUTTON_GPIO);
         return;
     }
 
-    /*
-     * Prevent immediate wake-up if the button is currently pressed.
-     */
+    /* Prevent immediate wake-up if the button is currently pressed. */
     if (gpio_get_level(WAKE_BUTTON_GPIO) == 0) {
         ESP_LOGW(
             TAG,
-            "Button is currently pressed. Release it before deep sleep."
-        );
+            "Button is currently pressed. Release it before Deep-sleep.");
 
         while (gpio_get_level(WAKE_BUTTON_GPIO) == 0) {
             vTaskDelay(pdMS_TO_TICKS(20));
         }
     }
 
-    /*
-     * Wake when GPIO3 becomes LOW.
-     *
-     * No timer wake-up is enabled.
-     */
+    /* Wake when GPIO3 becomes LOW. No timer wake-up is enabled. */
     ESP_ERROR_CHECK(
         esp_deep_sleep_enable_gpio_wakeup(
             1ULL << WAKE_BUTTON_GPIO,
-            ESP_GPIO_WAKEUP_GPIO_LOW
-        )
-    );
+            ESP_GPIO_WAKEUP_GPIO_LOW));
+
+    /*
+     * Report the state of every controlled rail while the pads can still be
+     * read. This is the last point at which a released hold is observable in
+     * software.
+     */
+    audit_rails_before_deep_sleep();
+
+#if APP_PWR_ISOLATE_SDMMC_PINS
+    float_sdmmc_pins_for_deep_sleep();
+#endif
+
+#if APP_PWR_DEEP_SLEEP_POWER_DOWN_FLASH
+    power_down_flash_for_deep_sleep();
+#endif
+
+    /*
+     * All camera/display teardown has completed before this function is
+     * called. Isolate the shared I2C pins at this final boundary so the GT911
+     * Light-sleep polling path is not affected.
+     */
+    esp_err_t i2c_ret = isolate_shared_i2c_for_deep_sleep();
+    if (i2c_ret != ESP_OK) {
+        /*
+         * Continue into Deep-sleep even if one isolation operation failed.
+         * Remaining active would consume far more current than sleeping, and
+         * the ESP32-P4 powers down its digital I2C peripheral in Deep-sleep.
+         */
+        ESP_LOGW(
+            TAG,
+            "I2C pin isolation completed with errors: %s; continuing",
+            esp_err_to_name(i2c_ret));
+    }
 
     ESP_LOGI(
         TAG,
-        "Entering deep sleep. Press the GPIO%d button to wake up.",
-        WAKE_BUTTON_GPIO
-    );
+        "Entering Deep-sleep. Press the GPIO%d button to wake up.",
+        WAKE_BUTTON_GPIO);
 
-    /*
-     * Flush buffered output before entering deep sleep.
-     */
+    /* Flush buffered output before entering Deep-sleep. */
     fflush(stdout);
 
     esp_deep_sleep_start();
 }
-
 
 
 ==================================================
@@ -5635,6 +7736,7 @@ static esp_err_t enter_light_sleep_internal(
         gpio_config_t wake_gpio_config = {
             .pin_bit_mask = 1ULL << wake_gpio,
             .mode = GPIO_MODE_INPUT,
+            /* GPIO3 is held HIGH by the board's external pull-up. */
             .pull_up_en = GPIO_PULLUP_ENABLE,
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type = GPIO_INTR_DISABLE,
@@ -5817,6 +7919,7 @@ esp_sleep_wakeup_cause_t light_sleep_get_last_wakeup_cause(void)
 {
     return s_last_wakeup_cause;
 }
+
 
 
 ==================================================

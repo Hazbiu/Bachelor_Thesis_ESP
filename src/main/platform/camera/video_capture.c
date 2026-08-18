@@ -21,11 +21,39 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_video_init.h"
+#include "driver/i2c_master.h"
 
 #include "linux/videodev2.h"
 #include "platform/camera/video_capture.h"
 
 static const char *TAG = "app_video";
+
+/*
+ * Keep Deep-sleep camera-power messages under POWER_PROFILE so they remain
+ * visible when APP_LOG_ENABLE_CAMERA == 0 but power/sleep logging is enabled.
+ */
+static const char *CAMERA_POWER_TAG = "POWER_PROFILE";
+
+/*
+ * OV5647 SCCB address.
+ *
+ * The datasheet lists the 8-bit SCCB slave ID as 0x6C. ESP-IDF's new I2C
+ * master driver expects the raw 7-bit address without the R/W bit:
+ *
+ *     0x6C >> 1 = 0x36
+ */
+#define OV5647_I2C_ADDRESS                  0x36
+#define OV5647_I2C_TIMEOUT_MS               100
+
+/*
+ * The Waveshare BSP owns the physical I2C controller. app_video_main() stores
+ * only the bus handle so the destructive Deep-sleep path can issue the final
+ * OV5647 register writes after STREAMOFF and before the shared I2C pads are
+ * isolated. The bus itself is never deleted here because the display/touch
+ * shutdown still needs it later in the system shutdown sequence.
+ */
+static i2c_master_bus_handle_t s_camera_i2c_bus = NULL;
+
 
 #define MAX_BUFFER_COUNT                  3
 #define MIN_BUFFER_COUNT                  2
@@ -34,6 +62,74 @@ static const char *TAG = "app_video";
 #define VIDEO_STOP_TIMEOUT_MS             1500
 #define VIDEO_NO_FRAME_RETRY_DELAY_MS     2
 #define VIDEO_ERROR_RETRY_DELAY_MS        10
+
+/*
+ * =====================================================================
+ * OV5647 software-only Deep-sleep quiesce
+ * =====================================================================
+ *
+ * The ESP32-P4-NANO board does not expose a software-controlled OV5647 PWDN
+ * or RESET signal to this application:
+ *
+ *     .reset_pin = -1
+ *     .pwdn_pin  = -1
+ *
+ * Therefore we cannot enter the sensor's true hardware standby or physically
+ * remove its supply from software.
+ *
+ * We can, however, place substantially more of the sensor into a quiet state
+ * before ESP32-P4 Deep-sleep:
+ *
+ *     1. normal VIDIOC_STREAMOFF
+ *     2. disable MIPI data lanes
+ *     3. gate/place MIPI clock lane into low-power mode
+ *     4. power down MIPI HS TX and LP RX
+ *     5. request MIPI subsystem suspend
+ *     6. confirm SCCB software sleep
+ *
+ * These writes are deliberately performed only from app_video_shutdown().
+ * Light-sleep continues to use the normal reversible STREAMOFF/STREAMON path
+ * and is therefore unaffected by this extra Deep-sleep quiesce.
+ */
+
+/* OV5647 register addresses. */
+#define OV5647_REG_MODE_SELECT             0x0100
+#define OV5647_REG_MIPI_SC_CTRL            0x3018
+#define OV5647_REG_MIPI_CTRL00             0x4800
+#define OV5647_REG_MIPI_CTRL05             0x4805
+
+/*
+ * 0x3018 SC_CMMN_MIPI_SC_CTRL
+ *
+ * bit 4 = power down MIPI high-speed transmitter
+ * bit 3 = power down MIPI low-power receiver
+ * bit 2 = MIPI enable              <-- preserve existing value
+ * bit 1 = MIPI system suspend
+ */
+#define OV5647_MIPI_PHY_HS_TX_POWER_DOWN   (1U << 4)
+#define OV5647_MIPI_LP_RX_POWER_DOWN       (1U << 3)
+#define OV5647_MIPI_SYSTEM_SUSPEND          (1U << 1)
+
+/*
+ * 0x4800 MIPI CTRL 00
+ *
+ * bit 5 = clock lane gating
+ * bit 0 = manually place clock lane into low-power mode
+ */
+#define OV5647_MIPI_CLOCK_LANE_GATE         (1U << 5)
+#define OV5647_MIPI_CLOCK_LANE_LOW_POWER    (1U << 0)
+
+/*
+ * 0x4805 MIPI CTRL 05
+ *
+ * bit 7 = disable MIPI data lane 1
+ * bit 6 = disable MIPI data lane 2
+ */
+#define OV5647_MIPI_DATA_LANE1_DISABLE      (1U << 7)
+#define OV5647_MIPI_DATA_LANE2_DISABLE      (1U << 6)
+
+/* 0x0100 bit 0: 1 = streaming, 0 = SCCB software sleep. */
+#define OV5647_MODE_STREAMING_BIT           (1U << 0)
 
 typedef struct {
     uint8_t *camera_buffer[MAX_BUFFER_COUNT];
@@ -98,8 +194,376 @@ static void reset_camera_runtime_state(void)
     }
 }
 
+/*
+ * Read one OV5647 register directly through the shared SCCB/I2C bus.
+ *
+ * OV5647 registers use a 16-bit register address and an 8-bit value. The
+ * transmit-receive API keeps the write phase and read phase in one transaction
+ * with a repeated START, which is the normal SCCB register-read sequence.
+ */
+static esp_err_t ov5647_read_register(
+    i2c_master_dev_handle_t device,
+    uint16_t reg_addr,
+    uint8_t *value)
+{
+    if (device == NULL || value == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const uint8_t register_address[2] = {
+        (uint8_t)(reg_addr >> 8),
+        (uint8_t)(reg_addr & 0xFFU),
+    };
+
+    esp_err_t ret = i2c_master_transmit_receive(
+        device,
+        register_address,
+        sizeof(register_address),
+        value,
+        1,
+        OV5647_I2C_TIMEOUT_MS);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: OV5647 read reg 0x%04X failed: %s",
+            (unsigned)reg_addr,
+            esp_err_to_name(ret));
+    }
+
+    return ret;
+}
+
+/*
+ * Write one 8-bit OV5647 register directly through SCCB/I2C.
+ */
+static esp_err_t ov5647_write_register(
+    i2c_master_dev_handle_t device,
+    uint16_t reg_addr,
+    uint8_t value)
+{
+    if (device == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const uint8_t payload[3] = {
+        (uint8_t)(reg_addr >> 8),
+        (uint8_t)(reg_addr & 0xFFU),
+        value,
+    };
+
+    esp_err_t ret = i2c_master_transmit(
+        device,
+        payload,
+        sizeof(payload),
+        OV5647_I2C_TIMEOUT_MS);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: OV5647 write reg 0x%04X=0x%02X failed: %s",
+            (unsigned)reg_addr,
+            (unsigned)value,
+            esp_err_to_name(ret));
+    }
+
+    return ret;
+}
+
+/*
+ * Perform a safe read-modify-write.
+ *
+ * set_mask:
+ *     every 1 bit is forced HIGH.
+ *
+ * clear_mask:
+ *     every 1 bit is forced LOW.
+ *
+ * All unrelated bits are preserved. The register is read back afterwards and
+ * the controlled bits are verified.
+ */
+static esp_err_t ov5647_update_register_bits(
+    i2c_master_dev_handle_t device,
+    uint16_t reg_addr,
+    uint8_t set_mask,
+    uint8_t clear_mask,
+    const char *description)
+{
+    uint8_t before = 0;
+
+    esp_err_t ret = ov5647_read_register(
+        device,
+        reg_addr,
+        &before);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    const uint8_t requested =
+        (uint8_t)((before | set_mask) &
+                  (uint8_t)(~clear_mask));
+
+    if (requested != before) {
+        ret = ov5647_write_register(
+            device,
+            reg_addr,
+            requested);
+
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+
+    uint8_t read_back = 0;
+
+    ret = ov5647_read_register(
+        device,
+        reg_addr,
+        &read_back);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    const uint8_t controlled_mask =
+        (uint8_t)(set_mask | clear_mask);
+
+    if ((read_back & controlled_mask) !=
+        (requested & controlled_mask)) {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: %s verification failed: "
+            "reg=0x%04X before=0x%02X requested=0x%02X readback=0x%02X",
+            description,
+            (unsigned)reg_addr,
+            (unsigned)before,
+            (unsigned)requested,
+            (unsigned)read_back);
+
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(
+        CAMERA_POWER_TAG,
+        "CAMERA-Q: %-24s reg=0x%04X 0x%02X -> 0x%02X "
+        "readback=0x%02X",
+        description,
+        (unsigned)reg_addr,
+        (unsigned)before,
+        (unsigned)requested,
+        (unsigned)read_back);
+
+    return ESP_OK;
+}
+
+/*
+ * Put the OV5647 into the lowest software-controlled state available with the
+ * present ESP32-P4-NANO/Raspberry-Pi-Camera-B wiring.
+ *
+ * IMPORTANT:
+ * This is NOT the same as physically removing power from the camera. The board
+ * does not expose a camera supply switch, PWDN pin or RESET pin to this module.
+ * These SCCB writes quiesce the streaming/MIPI parts that software can control.
+ *
+ * Light-sleep is deliberately unaffected. This function is called only by the
+ * destructive Deep-sleep shutdown after normal V4L2 STREAMOFF has completed.
+ */
+static esp_err_t ov5647_quiesce_for_deep_sleep(void)
+{
+    if (s_camera_i2c_bus == NULL) {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: shared camera I2C bus is unavailable");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(
+        CAMERA_POWER_TAG,
+        "CAMERA-Q: applying OV5647 Deep-sleep software quiesce");
+
+    /*
+     * STREAMOFF has already stopped capture, so no sensor-control transaction
+     * should be in flight from the video task. Confirm that the OV5647 still
+     * ACKs at its normal 7-bit SCCB address before creating the temporary
+     * handle used only for this shutdown sequence.
+     */
+    esp_err_t ret = i2c_master_probe(
+        s_camera_i2c_bus,
+        OV5647_I2C_ADDRESS,
+        OV5647_I2C_TIMEOUT_MS);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: OV5647 did not answer at I2C address 0x%02X: %s",
+            OV5647_I2C_ADDRESS,
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    i2c_device_config_t device_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = OV5647_I2C_ADDRESS,
+        .scl_speed_hz = CONFIG_BSP_I2C_CLK_SPEED_HZ,
+    };
+
+    i2c_master_dev_handle_t device = NULL;
+
+    ret = i2c_master_bus_add_device(
+        s_camera_i2c_bus,
+        &device_config,
+        &device);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: could not attach temporary OV5647 I2C handle: %s",
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    esp_err_t first_error = ESP_OK;
+
+    /*
+     * Step A: disable both MIPI data lanes.
+     *
+     * 0x4805:
+     *   bit7 = MIPI lane1 disable
+     *   bit6 = MIPI lane2 disable
+     *
+     * A disabled data lane is driven into LP00 according to the OV5647
+     * register description. All unrelated bits are preserved.
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_MIPI_CTRL05,
+        OV5647_MIPI_DATA_LANE1_DISABLE |
+            OV5647_MIPI_DATA_LANE2_DISABLE,
+        0,
+        "MIPI data lanes OFF");
+
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+
+    /*
+     * Step B: gate the MIPI clock lane and manually request low-power mode.
+     *
+     * 0x4800:
+     *   bit5 = clock lane gate enable
+     *   bit0 = clock lane disable / manually set low-power mode
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_MIPI_CTRL00,
+        OV5647_MIPI_CLOCK_LANE_GATE |
+            OV5647_MIPI_CLOCK_LANE_LOW_POWER,
+        0,
+        "MIPI clock lane LP");
+
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+
+    /*
+     * Step C: power down MIPI PHY blocks and request MIPI-system suspend.
+     *
+     * 0x3018:
+     *   bit4 = power down MIPI HS TX
+     *   bit3 = power down MIPI LP RX
+     *   bit2 = MIPI enable -- PRESERVED
+     *   bit1 = MIPI system suspend
+     *
+     * Read-modify-write is essential because lane-mode and MIPI-enable fields
+     * share the same register.
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_MIPI_SC_CTRL,
+        OV5647_MIPI_PHY_HS_TX_POWER_DOWN |
+            OV5647_MIPI_LP_RX_POWER_DOWN |
+            OV5647_MIPI_SYSTEM_SUSPEND,
+        0,
+        "MIPI PHY/suspend");
+
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+
+    /*
+     * Step D: explicitly confirm sensor software sleep.
+     *
+     * 0x0100 bit0:
+     *   1 = streaming
+     *   0 = software sleep / stream stopped
+     *
+     * The stock OV5647 STREAMOFF path already clears this bit. Doing it again
+     * makes the final Deep-sleep sensor state explicit and verifiable.
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_MODE_SELECT,
+        0,
+        OV5647_MODE_STREAMING_BIT,
+        "OV5647 software sleep");
+
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+
+    /*
+     * Remove only our temporary OV5647 device handle. The physical I2C bus is
+     * BSP-owned and must remain alive for the following display/touch shutdown.
+     */
+    ret = i2c_master_bus_rm_device(device);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: could not remove temporary OV5647 I2C handle: %s",
+            esp_err_to_name(ret));
+
+        if (first_error == ESP_OK) {
+            first_error = ret;
+        }
+    }
+
+    if (first_error == ESP_OK) {
+        ESP_LOGI(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: OV5647 software quiesce COMPLETE: "
+            "stream=OFF data_lanes=OFF clock_lane=LP "
+            "MIPI_PHY=POWER_DOWN MIPI=suspended sensor=sleep");
+    } else {
+        /*
+         * Never prevent the rest of the Deep-sleep teardown merely because one
+         * optional sensor register could not be written. app_video_shutdown()
+         * still closes the V4L2 device and app_sleep.c continues shutting down
+         * the display, SD card, C6, Ethernet PHY, and remaining peripherals.
+         */
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: OV5647 software quiesce completed with errors: %s",
+            esp_err_to_name(first_error));
+    }
+
+    return first_error;
+}
+
 esp_err_t app_video_main(i2c_master_bus_handle_t i2c_bus_handle)
 {
+    if (i2c_bus_handle == NULL) {
+        ESP_LOGE(TAG, "Camera initialization requires a valid I2C bus");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+     * Keep a non-owning reference to the BSP bus. ESP-Video receives exactly
+     * the same handle for normal SCCB sensor control.
+     */
+    s_camera_i2c_bus = i2c_bus_handle;
+
     esp_video_init_csi_config_t csi_config[] = {
         {
             .sccb_config = {
@@ -108,8 +572,9 @@ esp_err_t app_video_main(i2c_master_bus_handle_t i2c_bus_handle)
                 .freq = CONFIG_BSP_I2C_CLK_SPEED_HZ,
             },
             /*
-             * The board/BSP currently does not expose camera RESET or PWDN
-             * control through this module.
+             * The present board/BSP does not expose camera RESET or PWDN
+             * control through this module, so software cannot physically
+             * power-gate the OV5647.
              */
             .reset_pin = -1,
             .pwdn_pin = -1,
@@ -120,7 +585,17 @@ esp_err_t app_video_main(i2c_master_bus_handle_t i2c_bus_handle)
         .csi = csi_config,
     };
 
-    return esp_video_init(&cam_config);
+    esp_err_t ret = esp_video_init(&cam_config);
+
+    if (ret != ESP_OK) {
+        /*
+         * Do not keep a bus reference for a camera stack that never
+         * initialized successfully.
+         */
+        s_camera_i2c_bus = NULL;
+    }
+
+    return ret;
 }
 
 int app_video_open(char *dev, video_fmt_t init_fmt)
@@ -824,6 +1299,13 @@ esp_err_t app_video_shutdown(void)
         TAG,
         "Shutting down camera before deep sleep");
 
+    /*
+     * First stop CSI capture normally.
+     *
+     * For OV5647, ESP-Video's STREAMOFF path calls the sensor driver's
+     * ov5647_set_stream(false), which stops normal sensor streaming before we
+     * start changing MIPI power-state registers.
+     */
     esp_err_t stop_ret =
         app_video_stream_task_stop(video_fd);
 
@@ -831,14 +1313,43 @@ esp_err_t app_video_shutdown(void)
         ESP_LOGW(
             TAG,
             "Graceful camera-task stop failed: %s; "
-            "closing the device to force release",
+            "continuing with Deep-sleep quiesce before forced close",
             esp_err_to_name(stop_ret));
     }
 
     /*
+     * Apply the extra OV5647 low-power register sequence over the same
+     * BSP-owned I2C bus that ESP-Video uses for SCCB.
+     *
+     * This is deliberately done after STREAMOFF so the video task no longer
+     * competes for sensor control, and before later Deep-sleep code isolates
+     * the shared I2C pads.
+     *
+     * Light-sleep never calls this path, so its reversible STREAMOFF/STREAMON
+     * behavior remains unchanged.
+     */
+    esp_err_t quiesce_ret =
+        ov5647_quiesce_for_deep_sleep();
+
+    if (quiesce_ret == ESP_OK) {
+        ESP_LOGI(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: sensor register shutdown completed before V4L2 close");
+    } else {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: sensor register shutdown had errors: %s; "
+            "closing camera anyway",
+            esp_err_to_name(quiesce_ret));
+    }
+
+    /*
      * Always close the camera file descriptor, even when the normal task-stop
-     * handshake times out. The previous implementation returned early and
-     * therefore left the CSI device open during deep sleep.
+     * handshake or sensor quiesce fails.
+     *
+     * Remaining awake because an optional shutdown operation failed would
+     * consume far more power than continuing into the normal Deep-sleep
+     * sequence.
      */
     esp_err_t close_ret = ESP_OK;
 
@@ -858,7 +1369,9 @@ esp_err_t app_video_shutdown(void)
      * permanently. Explicitly suspend before deletion so another core cannot
      * be executing the task while its resources are released.
      */
-    TaskHandle_t video_task = app_camera_video.video_stream_task_handle;
+    TaskHandle_t video_task =
+        app_camera_video.video_stream_task_handle;
+
     app_camera_video.video_stream_task_handle = NULL;
 
     if (video_task != NULL) {
@@ -868,13 +1381,24 @@ esp_err_t app_video_shutdown(void)
 
     reset_camera_runtime_state();
 
+    /*
+     * Closing the device is the most fundamental shutdown operation, so report
+     * a close failure first. Otherwise expose a sensor-quiesce failure to the
+     * higher-level Deep-sleep log while still allowing app_sleep.c to continue
+     * shutting down all remaining peripherals.
+     */
     if (close_ret != ESP_OK) {
         return close_ret;
     }
 
+    if (quiesce_ret != ESP_OK) {
+        return quiesce_ret;
+    }
+
     ESP_LOGI(
         TAG,
-        "Camera stream stopped and camera device closed");
+        "Camera stream stopped, OV5647 quiesced, "
+        "and camera device closed");
 
     return ESP_OK;
 }

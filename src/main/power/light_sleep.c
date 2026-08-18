@@ -66,6 +66,7 @@ static esp_err_t enter_light_sleep_internal(
         gpio_config_t wake_gpio_config = {
             .pin_bit_mask = 1ULL << wake_gpio,
             .mode = GPIO_MODE_INPUT,
+            /* GPIO3 is held HIGH by the board's external pull-up. */
             .pull_up_en = GPIO_PULLUP_ENABLE,
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type = GPIO_INTR_DISABLE,
@@ -248,3 +249,4 @@ esp_sleep_wakeup_cause_t light_sleep_get_last_wakeup_cause(void)
 {
     return s_last_wakeup_cause;
 }
+

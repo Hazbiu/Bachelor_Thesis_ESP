@@ -11,7 +11,7 @@
  */
 #define APP_LOG_ENABLE_CPU_POWER             1
 #define APP_LOG_ENABLE_ESP_PM                0
-#define APP_LOG_ENABLE_POWER_SLEEP           0
+#define APP_LOG_ENABLE_POWER_SLEEP 1
 #define APP_LOG_ENABLE_APPLICATION           0
 #define APP_LOG_ENABLE_CAMERA                0
 #define APP_LOG_ENABLE_DISPLAY               0
