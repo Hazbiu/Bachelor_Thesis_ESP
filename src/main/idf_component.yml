@@ -12,10 +12,9 @@ dependencies:
   espressif/human_face_detect: ^0.4.2
   espressif/human_face_recognition: '*'
 
-  # TensorFlow Lite Micro comparison backend.
-  # The selected BlazeFace and MobileFaceNet files are FP32 models.
+  # TensorFlow Lite Micro runtime used by both FP32 and full-INT8 backends.
   espressif/esp-tflite-micro: ^1.3.7
 
-  # Kept available for a later true INT8/ESP-NN experiment.
-  # The FP32 backend in this update must not be described as an ESP-NN benchmark.
+  # Optimized INT8 kernels used by the TFLM-INT8 backend on ESP32-P4.
+  # The FP32 backend remains a separate non-ESP-NN comparison path.
   espressif/esp-nn: '>=1.1.1'

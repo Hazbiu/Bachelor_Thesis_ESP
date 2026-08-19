@@ -9,6 +9,8 @@ extern "C" esp_err_t face_detect_init(void)
     return espdl_face_detect_init();
 #elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_FP32
     return tflm_fp32_face_detect_init();
+#elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+    return tflm_int8_face_detect_init();
 #else
 #error "Unsupported face-detection backend"
 #endif
@@ -25,6 +27,9 @@ extern "C" int face_detect_run_rgb565(
     return espdl_face_detect_run_rgb565(buf, width, height, boxes, max_boxes);
 #elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_FP32
     return tflm_fp32_face_detect_run_rgb565(
+        buf, width, height, boxes, max_boxes);
+#elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+    return tflm_int8_face_detect_run_rgb565(
         buf, width, height, boxes, max_boxes);
 #else
     return 0;
@@ -43,6 +48,9 @@ extern "C" int face_detect_run_rgb888(
 #elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_FP32
     return tflm_fp32_face_detect_run_rgb888(
         buf, width, height, boxes, max_boxes);
+#elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+    return tflm_int8_face_detect_run_rgb888(
+        buf, width, height, boxes, max_boxes);
 #else
     return 0;
 #endif
@@ -54,6 +62,8 @@ extern "C" const char *face_detect_backend_name(void)
     return "ESP-DL";
 #elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_FP32
     return "TFLM-FP32/BLAZEFACE";
+#elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+    return "TFLM-INT8+ESP-NN/BLAZEFACE";
 #else
     return "UNKNOWN";
 #endif

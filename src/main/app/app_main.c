@@ -36,6 +36,7 @@
 #include "freertos/task.h"
 #include "power_save/cpu_power.h"
 #include "config/app_config.h"
+#include "config/app_features.h"
 #include "config/log_config.h"
 #include "app_sleep.h"
 
@@ -980,6 +981,43 @@ static void scale_box_to_source(
     }
 }
 
+/*
+ * Display-only expansion for the quantized BlazeFace box.
+ *
+ * The detector's keypoints and the snapshot-space box passed to MobileFaceNet
+ * are deliberately NOT changed.  Only the source/display rectangle is widened.
+ */
+static void expand_box_for_display(
+    face_box_t *box,
+    uint32_t source_width,
+    uint32_t source_height,
+    float margin_ratio)
+{
+    if (box == NULL || source_width == 0 || source_height == 0 ||
+        margin_ratio <= 0.0f) {
+        return;
+    }
+
+    const int width = box->x2 - box->x1;
+    const int height = box->y2 - box->y1;
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    const int margin_x = (int)((float)width * margin_ratio + 0.5f);
+    const int margin_y = (int)((float)height * margin_ratio + 0.5f);
+
+    box->x1 -= margin_x;
+    box->y1 -= margin_y;
+    box->x2 += margin_x;
+    box->y2 += margin_y;
+
+    if (box->x1 < 0) box->x1 = 0;
+    if (box->y1 < 0) box->y1 = 0;
+    if (box->x2 >= (int)source_width) box->x2 = (int)source_width - 1;
+    if (box->y2 >= (int)source_height) box->y2 = (int)source_height - 1;
+}
+
 static void publish_detected_boxes(
     const face_box_t *boxes,
     int count,
@@ -1089,6 +1127,29 @@ static void ai_worker_mark_idle(void)
     portEXIT_CRITICAL(&ai_worker_state_lock);
 }
 
+/*
+ * Preserve the existing >0.70 recognition gate for ESP-DL and TFLM-FP32.
+ *
+ * The INT8 detector's classifier output is quantized on a coarse grid. Its
+ * candidate-generation threshold is exactly q=122 -> probability 0.50.
+ * Accepted INT8 candidates must be allowed into MobileFaceNet so the second
+ * stage can verify identity and request the PIN screen.
+ */
+static bool ai_detection_allows_recognition(float detector_score)
+{
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+    /*
+     * The INT8 detector has already applied its own candidate threshold.
+     * Do not filter the accepted candidate a second time before MobileFaceNet.
+     * This avoids float/grid edge cases around the exact q=122 -> 0.50 score.
+     */
+    (void)detector_score;
+    return true;
+#else
+    return detector_score > APP_FACE_RECOG_MIN_SCORE;
+#endif
+}
+
 static void ai_worker_task(void *arg)
 {
     (void)arg;
@@ -1189,6 +1250,16 @@ static void ai_worker_task(void *arg)
         /* A positive detector result is real activity even if recognition fails. */
         app_sleep_notify_face_detected();
 
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+        printf(
+            "[INT8-POSITIVE-PATH] frame=%" PRIu32
+            " faces=%d idle_scan=%d display_suspended=%d\n",
+            job.frame_id,
+            face_count,
+            job.idle_scan_frame ? 1 : 0,
+            idle_scan_display_is_suspended() ? 1 : 0);
+#endif
+
         int update_count = face_count;
         if (update_count > APP_MAX_FACE_BOXES) update_count = APP_MAX_FACE_BOXES;
 
@@ -1201,6 +1272,14 @@ static void ai_worker_task(void *arg)
                 job.source_width,
                 job.source_height,
                 &source_boxes[i]);
+
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+            expand_box_for_display(
+                &source_boxes[i],
+                job.source_width,
+                job.source_height,
+                APP_TFLM_INT8_DISPLAY_BOX_MARGIN_RATIO);
+#endif
 
             ESP_LOGI(TAG,
                      "Face %d score=%.2f box=[%d,%d,%d,%d]",
@@ -1224,8 +1303,17 @@ static void ai_worker_task(void *arg)
             continue;
         }
 
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+        /*
+         * Every accepted INT8 face should immediately enter MobileFaceNet.
+         * The detector already runs asynchronously on CPU1 and the existing
+         * mutex/360-MHz lock stays held through this recognition call.
+         */
+        const bool run_recognition = true;
+#else
         const bool run_recognition =
             (job.frame_id % APP_FACE_RECOG_INTERVAL_FRAMES) == 0;
+#endif
         bool pin_transition_requested = false;
 
         if (run_recognition) {
@@ -1235,12 +1323,22 @@ static void ai_worker_task(void *arg)
              * DET -> REC serial execution at maximum CPU frequency.
              */
             for (int i = 0; i < update_count; i++) {
-                if (snapshot_boxes[i].score <= APP_FACE_RECOG_MIN_SCORE) {
+                if (!ai_detection_allows_recognition(
+                        snapshot_boxes[i].score)) {
                     continue;
                 }
 
                 char name[FACE_RECOG_MAX_NAME_LEN] = "unknown";
                 float recog_score = 0.0f;
+
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+                printf(
+                    "[INT8-RECOG-TRIGGER] frame=%" PRIu32
+                    " face=%d detector_score=%.6f\n",
+                    job.frame_id,
+                    i,
+                    (double)snapshot_boxes[i].score);
+#endif
 
                 esp_err_t recog_ret = face_recognition_recognize(
                     ai_snapshot_buffer,

@@ -19,10 +19,13 @@ idf_component_register(
         "services/vision/face_detection/face_detector_espdl.cpp"
         "services/vision/face_recognition/face_recognizer_espdl.cpp"
 
-        # TensorFlow Lite Micro FP32 comparison backend
+        # TensorFlow Lite Micro backends. FP32 is the software baseline;
+        # full-INT8 uses the same TFLM runner and the Espressif ESP-NN kernels.
         "services/vision/tflm/tflm_model_runner.cpp"
         "services/vision/face_detection/face_detector_tflm_fp32.cpp"
         "services/vision/face_recognition/face_recognizer_tflm_fp32.cpp"
+        "services/vision/face_detection/face_detector_tflm_int8.cpp"
+        "services/vision/face_recognition/face_recognizer_tflm_int8.cpp"
 
         # Power management and sleep modes
         "power/app_sleep.c"

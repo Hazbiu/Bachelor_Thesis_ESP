@@ -524,7 +524,7 @@ static esp_err_t collect_enrollment_images(
      * Enrollment boxes/eyes come from BlazeFace. Include that model file in the
      * database fingerprint so changing the detector rebuilds the embeddings.
      */
-    (void)hash_file(APP_TFLM_FACE_DETECT_MODEL_PATH, fingerprint);
+    (void)hash_file(APP_TFLM_FP32_FACE_DETECT_MODEL_PATH, fingerprint);
 #endif
 
     DIR *root = opendir(APP_FACE_ENROLL_ROOT);
@@ -701,7 +701,7 @@ static int largest_face(
 
 static esp_err_t save_database(uint64_t fingerprint)
 {
-    FILE *file = fopen(APP_TFLM_RECOG_DATABASE_PATH, "wb");
+    FILE *file = fopen(APP_TFLM_FP32_RECOG_DATABASE_PATH, "wb");
     if (!file) {
         return ESP_FAIL;
     }
@@ -747,7 +747,7 @@ static bool load_database(
     uint64_t fingerprint,
     size_t expected_dim)
 {
-    FILE *file = fopen(APP_TFLM_RECOG_DATABASE_PATH, "rb");
+    FILE *file = fopen(APP_TFLM_FP32_RECOG_DATABASE_PATH, "rb");
     if (!file) {
         return false;
     }
@@ -891,7 +891,7 @@ static esp_err_t rebuild_database(
         ESP_LOGE(
             TAG,
             "Could not save %s: %s",
-            APP_TFLM_RECOG_DATABASE_PATH,
+            APP_TFLM_FP32_RECOG_DATABASE_PATH,
             esp_err_to_name(save_ret));
         return save_ret;
     }
@@ -902,7 +902,7 @@ static esp_err_t rebuild_database(
         (unsigned)s_entries.size(),
         rejected,
         (unsigned)s_embedding_dim,
-        APP_TFLM_RECOG_DATABASE_PATH);
+        APP_TFLM_FP32_RECOG_DATABASE_PATH);
 
     return ESP_OK;
 }
@@ -910,14 +910,14 @@ static esp_err_t rebuild_database(
 extern "C" esp_err_t tflm_fp32_face_recognition_init(void)
 {
     const esp_err_t init_ret = s_runner.init(
-        APP_TFLM_FACE_RECOG_MODEL_PATH,
+        APP_TFLM_FP32_FACE_RECOG_MODEL_PATH,
         APP_TFLM_RECOG_TENSOR_ARENA_BYTES);
 
     if (init_ret != ESP_OK) {
         ESP_LOGE(
             TAG,
             "MobileFaceNet model initialization failed: path=%s error=%s",
-            APP_TFLM_FACE_RECOG_MODEL_PATH,
+            APP_TFLM_FP32_FACE_RECOG_MODEL_PATH,
             esp_err_to_name(init_ret));
         return init_ret;
     }
@@ -940,7 +940,7 @@ extern "C" esp_err_t tflm_fp32_face_recognition_init(void)
     ESP_LOGI(
         TAG,
         "TFLM-FP32 MobileFaceNet ready: model=%s dim=%u arena_used=%u",
-        APP_TFLM_FACE_RECOG_MODEL_PATH,
+        APP_TFLM_FP32_FACE_RECOG_MODEL_PATH,
         (unsigned)s_embedding_dim,
         (unsigned)s_runner.arena_used_bytes());
 
@@ -964,7 +964,7 @@ extern "C" esp_err_t tflm_fp32_face_recognition_init(void)
             "TFLM-FP32 database loaded: entries=%u dim=%u path=%s",
             (unsigned)s_entries.size(),
             (unsigned)s_embedding_dim,
-            APP_TFLM_RECOG_DATABASE_PATH);
+            APP_TFLM_FP32_RECOG_DATABASE_PATH);
         return ESP_OK;
     }
 

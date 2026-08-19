@@ -1,7 +1,9 @@
 #include "config/app_features.h"
 
 #if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_FP32 || \
-    APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_FP32
+    APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_FP32 || \
+    APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8 || \
+    APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_INT8
 
 #include "services/vision/backends/tflm_model_runner.hpp"
 
@@ -44,8 +46,9 @@ static esp_err_t register_model_ops(AppTflmOpResolver *resolver)
 } while (0)
 
     /*
-     * Broad resolver for the BlazeFace FP32 + MobileFaceNet FP32 experiment.
-     * This replaces the removed AllOpsResolver API in current Espressif TFLM.
+     * Shared resolver for the BlazeFace + MobileFaceNet TFLM experiments.
+     * It covers both the FP32 graph and the full-INT8 graph. On ESP32-P4 the
+     * Espressif TFLM component routes supported INT8 kernels through ESP-NN.
      * If AllocateTensors later reports one missing builtin opcode, add only
      * that specific operator here.
      */

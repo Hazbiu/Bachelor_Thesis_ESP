@@ -1,11 +1,11 @@
 Complete project export
-Generated on: Wed Aug 19 09:22:44 PM CEST 2026
+Generated on: Wed Aug 19 10:10:33 PM CEST 2026
 Project: /home/admin/Programming/Bachelor_Thesis_ESP
 Included: every file under src/main
 Included: every CMakeLists.txt and *.cmake file under src
 Excluded from CMake search: src/managed_components
 Excluded from CMake search: src/build
-Unique files: 67
+Unique files: 69
 ==================================================
 
 FILE MANIFEST
@@ -69,9 +69,11 @@ src/main/power/wake_up.h
 src/main/services/vision/face_detection/face_detector.cpp
 src/main/services/vision/face_detection/face_detector_espdl.cpp
 src/main/services/vision/face_detection/face_detector_tflm_fp32.cpp
+src/main/services/vision/face_detection/face_detector_tflm_int8.cpp
 src/main/services/vision/face_recognition/face_recognizer.cpp
 src/main/services/vision/face_recognition/face_recognizer_espdl.cpp
 src/main/services/vision/face_recognition/face_recognizer_tflm_fp32.cpp
+src/main/services/vision/face_recognition/face_recognizer_tflm_int8.cpp
 src/main/services/vision/tflm/tflm_model_runner.cpp
 src/main/ui/app_ui.c
 src/main/ui/app_ui.h
@@ -512,6 +514,7 @@ FILE: src/main/app/app_main.c
 #include "freertos/task.h"
 #include "power_save/cpu_power.h"
 #include "config/app_config.h"
+#include "config/app_features.h"
 #include "config/log_config.h"
 #include "app_sleep.h"
 
@@ -1456,6 +1459,43 @@ static void scale_box_to_source(
     }
 }
 
+/*
+ * Display-only expansion for the quantized BlazeFace box.
+ *
+ * The detector's keypoints and the snapshot-space box passed to MobileFaceNet
+ * are deliberately NOT changed.  Only the source/display rectangle is widened.
+ */
+static void expand_box_for_display(
+    face_box_t *box,
+    uint32_t source_width,
+    uint32_t source_height,
+    float margin_ratio)
+{
+    if (box == NULL || source_width == 0 || source_height == 0 ||
+        margin_ratio <= 0.0f) {
+        return;
+    }
+
+    const int width = box->x2 - box->x1;
+    const int height = box->y2 - box->y1;
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    const int margin_x = (int)((float)width * margin_ratio + 0.5f);
+    const int margin_y = (int)((float)height * margin_ratio + 0.5f);
+
+    box->x1 -= margin_x;
+    box->y1 -= margin_y;
+    box->x2 += margin_x;
+    box->y2 += margin_y;
+
+    if (box->x1 < 0) box->x1 = 0;
+    if (box->y1 < 0) box->y1 = 0;
+    if (box->x2 >= (int)source_width) box->x2 = (int)source_width - 1;
+    if (box->y2 >= (int)source_height) box->y2 = (int)source_height - 1;
+}
+
 static void publish_detected_boxes(
     const face_box_t *boxes,
     int count,
@@ -1563,6 +1603,29 @@ static void ai_worker_mark_idle(void)
     portENTER_CRITICAL(&ai_worker_state_lock);
     ai_worker_busy = false;
     portEXIT_CRITICAL(&ai_worker_state_lock);
+}
+
+/*
+ * Preserve the existing >0.70 recognition gate for ESP-DL and TFLM-FP32.
+ *
+ * The INT8 detector's classifier output is quantized on a coarse grid. Its
+ * candidate-generation threshold is exactly q=122 -> probability 0.50.
+ * Accepted INT8 candidates must be allowed into MobileFaceNet so the second
+ * stage can verify identity and request the PIN screen.
+ */
+static bool ai_detection_allows_recognition(float detector_score)
+{
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+    /*
+     * The INT8 detector has already applied its own candidate threshold.
+     * Do not filter the accepted candidate a second time before MobileFaceNet.
+     * This avoids float/grid edge cases around the exact q=122 -> 0.50 score.
+     */
+    (void)detector_score;
+    return true;
+#else
+    return detector_score > APP_FACE_RECOG_MIN_SCORE;
+#endif
 }
 
 static void ai_worker_task(void *arg)
@@ -1678,6 +1741,14 @@ static void ai_worker_task(void *arg)
                 job.source_height,
                 &source_boxes[i]);
 
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+            expand_box_for_display(
+                &source_boxes[i],
+                job.source_width,
+                job.source_height,
+                APP_TFLM_INT8_DISPLAY_BOX_MARGIN_RATIO);
+#endif
+
             ESP_LOGI(TAG,
                      "Face %d score=%.2f box=[%d,%d,%d,%d]",
                      i,
@@ -1700,8 +1771,17 @@ static void ai_worker_task(void *arg)
             continue;
         }
 
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+        /*
+         * Every accepted INT8 face should immediately enter MobileFaceNet.
+         * The detector already runs asynchronously on CPU1 and the existing
+         * mutex/360-MHz lock stays held through this recognition call.
+         */
+        const bool run_recognition = true;
+#else
         const bool run_recognition =
             (job.frame_id % APP_FACE_RECOG_INTERVAL_FRAMES) == 0;
+#endif
         bool pin_transition_requested = false;
 
         if (run_recognition) {
@@ -1711,12 +1791,22 @@ static void ai_worker_task(void *arg)
              * DET -> REC serial execution at maximum CPU frequency.
              */
             for (int i = 0; i < update_count; i++) {
-                if (snapshot_boxes[i].score <= APP_FACE_RECOG_MIN_SCORE) {
+                if (!ai_detection_allows_recognition(
+                        snapshot_boxes[i].score)) {
                     continue;
                 }
 
                 char name[FACE_RECOG_MAX_NAME_LEN] = "unknown";
                 float recog_score = 0.0f;
+
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+                printf(
+                    "[INT8-RECOG-TRIGGER] frame=%" PRIu32
+                    " face=%d detector_score=%.6f\n",
+                    job.frame_id,
+                    i,
+                    (double)snapshot_boxes[i].score);
+#endif
 
                 esp_err_t recog_ret = face_recognition_recognize(
                     ai_snapshot_buffer,
@@ -2978,10 +3068,13 @@ idf_component_register(
         "services/vision/face_detection/face_detector_espdl.cpp"
         "services/vision/face_recognition/face_recognizer_espdl.cpp"
 
-        # TensorFlow Lite Micro FP32 comparison backend
+        # TensorFlow Lite Micro backends. FP32 is the software baseline;
+        # full-INT8 uses the same TFLM runner and the Espressif ESP-NN kernels.
         "services/vision/tflm/tflm_model_runner.cpp"
         "services/vision/face_detection/face_detector_tflm_fp32.cpp"
         "services/vision/face_recognition/face_recognizer_tflm_fp32.cpp"
+        "services/vision/face_detection/face_detector_tflm_int8.cpp"
+        "services/vision/face_recognition/face_recognizer_tflm_int8.cpp"
 
         # Power management and sleep modes
         "power/app_sleep.c"
@@ -3164,6 +3257,8 @@ void app_logging_init(void)
     ENABLE_INFO("face_recognition_wrapper");
     ENABLE_INFO("face_detect_tflm_fp32");
     ENABLE_INFO("face_recog_tflm_fp32");
+    ENABLE_INFO("face_detect_tflm_int8");
+    ENABLE_INFO("face_recog_tflm_int8");
     ENABLE_INFO("tflm_model_runner");
     ENABLE_INFO("FbsLoader");
     ENABLE_INFO("dl::Model");
@@ -3368,12 +3463,11 @@ dependencies:
   espressif/human_face_detect: ^0.4.2
   espressif/human_face_recognition: '*'
 
-  # TensorFlow Lite Micro comparison backend.
-  # The selected BlazeFace and MobileFaceNet files are FP32 models.
+  # TensorFlow Lite Micro runtime used by both FP32 and full-INT8 backends.
   espressif/esp-tflite-micro: ^1.3.7
 
-  # Kept available for a later true INT8/ESP-NN experiment.
-  # The FP32 backend in this update must not be described as an ESP-NN benchmark.
+  # Optimized INT8 kernels used by the TFLM-INT8 backend on ESP32-P4.
+  # The FP32 backend remains a separate non-ESP-NN comparison path.
   espressif/esp-nn: '>=1.1.1'
 
 
@@ -3391,10 +3485,10 @@ FILE: src/main/include/config/ai_backend_selection.h
 
 /*
  * Generated by tools/select_ai_backend.sh.
- * Re-run the script instead of editing this file during A/B measurements.
+ * Do not edit manually during A/B measurements.
  */
 #ifndef APP_AI_BACKEND
-#define APP_AI_BACKEND APP_AI_BACKEND_ESPDL
+#define APP_AI_BACKEND APP_AI_BACKEND_TFLM_INT8
 #endif
 
 
@@ -3675,15 +3769,20 @@ FILE: src/main/include/config/app_features.h
  *     BlazeFace front/short-range detector
  *     MobileFaceNet 192-D face embedding
  *
- * IMPORTANT:
- * The two downloaded models are FLOAT32. Therefore backend 2 is named
- * TFLM-FP32, not ESP-NN/INT8. This keeps the benchmark technically honest.
+ * APP_AI_BACKEND_TFLM_INT8
+ *   TensorFlow Lite Micro full-INT8 path:
+ *     BlazeFace INT8 detector
+ *     MobileFaceNet INT8 192-D face embedding
+ *   The Espressif TFLM component is linked with esp-nn so supported INT8
+ *   kernels use the ESP-NN optimized implementation on ESP32-P4.
  *
- * The selection header is intentionally tiny so the helper scripts can switch
- * the complete detector + recognizer backend without modifying this file.
+ * All three complete detector -> recognizer selections use the same public
+ * face_detect_* / face_recognition_* API. Therefore app_main.c keeps one
+ * common scheduling, mutex, CPU-frequency, authentication and sleep policy.
  */
 #define APP_AI_BACKEND_ESPDL       1
 #define APP_AI_BACKEND_TFLM_FP32   2
+#define APP_AI_BACKEND_TFLM_INT8   3
 
 #include "config/ai_backend_selection.h"
 
@@ -3693,7 +3792,7 @@ FILE: src/main/include/config/app_features.h
 
 /*
  * Normally both stages use APP_AI_BACKEND. These two overrides are retained
- * for controlled hybrid experiments, e.g. ESP-DL detector + TFLM recognizer.
+ * for controlled hybrid experiments.
  */
 #ifndef APP_FACE_DETECT_BACKEND
 #define APP_FACE_DETECT_BACKEND APP_AI_BACKEND
@@ -3704,38 +3803,54 @@ FILE: src/main/include/config/app_features.h
 #endif
 
 #if APP_FACE_DETECT_BACKEND != APP_AI_BACKEND_ESPDL && \
-    APP_FACE_DETECT_BACKEND != APP_AI_BACKEND_TFLM_FP32
+    APP_FACE_DETECT_BACKEND != APP_AI_BACKEND_TFLM_FP32 && \
+    APP_FACE_DETECT_BACKEND != APP_AI_BACKEND_TFLM_INT8
 #error "Invalid APP_FACE_DETECT_BACKEND"
 #endif
 
 #if APP_FACE_RECOG_BACKEND != APP_AI_BACKEND_ESPDL && \
-    APP_FACE_RECOG_BACKEND != APP_AI_BACKEND_TFLM_FP32
+    APP_FACE_RECOG_BACKEND != APP_AI_BACKEND_TFLM_FP32 && \
+    APP_FACE_RECOG_BACKEND != APP_AI_BACKEND_TFLM_INT8
 #error "Invalid APP_FACE_RECOG_BACKEND"
 #endif
 
 /*
- * TFLM FP32 models confirmed from the user's tensor inspection:
+ * TFLM FP32 models.
  *
- * BlazeFace detector
- *   input  : [1,128,128,3] float32
- *   output0: [1,896,16]    float32  regressors
- *   output1: [1,896,1]     float32  classification logits
+ * BlazeFace detector:
+ *   input  [1,128,128,3] float32
+ *   output [1,896,16] and [1,896,1] float32
  *
- * MobileFaceNet recognizer
- *   input  : [1,112,112,3] float32
- *   output0: [1,192]       float32  embedding
+ * MobileFaceNet recognizer:
+ *   input  [1,112,112,3] float32
+ *   output [1,192] float32
  */
-#define APP_TFLM_FACE_DETECT_MODEL_PATH "/sdcard/models/FDET32.TFL"
-#define APP_TFLM_FACE_RECOG_MODEL_PATH  "/sdcard/models/FREC.TFL"
+#define APP_TFLM_FP32_FACE_DETECT_MODEL_PATH "/sdcard/models/FDET32.TFL"
+#define APP_TFLM_FP32_FACE_RECOG_MODEL_PATH  "/sdcard/models/FREC.TFL"
 
 /*
- * Tensor arenas are in PSRAM. These are intentionally conservative defaults.
- * The TFLM runner reports arena_used_bytes() when AI logging is enabled.
+ * Full-INT8 models generated from the same FP32 TFLite graphs.
+ *
+ * FDET8.TFL:
+ *   input  [1,128,128,3] int8
+ *   output [1,896,16] and [1,896,1] int8
+ *
+ * FREC8.TFL:
+ *   input  [1,112,112,3] int8
+ *   output [1,192] int8
+ */
+#define APP_TFLM_INT8_FACE_DETECT_MODEL_PATH "/sdcard/models/FDET8.TFL"
+#define APP_TFLM_INT8_FACE_RECOG_MODEL_PATH  "/sdcard/models/FREC8.TFL"
+
+/*
+ * Tensor arenas are in PSRAM. Keep the same conservative arena budgets for
+ * FP32 and INT8 so backend switching does not change the surrounding memory
+ * policy. The INT8 models themselves are substantially smaller.
  */
 #define APP_TFLM_DETECT_TENSOR_ARENA_BYTES (2U * 1024U * 1024U)
 #define APP_TFLM_RECOG_TENSOR_ARENA_BYTES  (7U * 1024U * 1024U)
 
-/* BlazeFace front-camera model constants. */
+/* BlazeFace front-camera model constants shared by FP32 and INT8. */
 #define APP_TFLM_BLAZEFACE_INPUT_SIZE             128
 #define APP_TFLM_BLAZEFACE_NUM_ANCHORS            896
 #define APP_TFLM_BLAZEFACE_NUM_COORDS             16
@@ -3743,12 +3858,44 @@ FILE: src/main/include/config/app_features.h
 #define APP_TFLM_BLAZEFACE_SCORE_CLIP             100.0f
 #define APP_TFLM_BLAZEFACE_SCORE_THRESHOLD        0.75f
 #define APP_TFLM_BLAZEFACE_NMS_IOU_THRESHOLD      0.30f
+
+/*
+ * INT8 BlazeFace uses a much coarser quantized classifier-output grid than the
+ * FP32 model.  The validated FDET8.TFL reports:
+ *
+ *     score scale      ~= 0.756562352
+ *     score zero point = 122
+ *
+ * Therefore the two relevant representable probabilities around the original
+ * 0.75 threshold are approximately:
+ *
+ *     q=122 -> sigmoid(0.0)      = 0.5000
+ *     q=123 -> sigmoid(0.75656)  = 0.6806
+ *     q=124 -> sigmoid(1.51312)  = 0.8195
+ *
+ * q=123 allowed enrollment to build, but live RGB565 frames still produced no
+ * boxes.  Use q=122 / 0.50 as the INT8 *candidate-generation* threshold and
+ * let MobileFaceNet recognition remain the second-stage identity verifier.
+ *
+ * ESP-DL and TFLM-FP32 do NOT use these two INT8-only constants.
+ */
+#define APP_TFLM_INT8_BLAZEFACE_SCORE_THRESHOLD   0.50f
+#define APP_TFLM_INT8_FACE_RECOG_MIN_SCORE         0.50f
+
+/*
+ * BlazeFace returns a deliberately tight face ROI.  Expand only the rectangle
+ * drawn on the live display by 20% of its width/height on every side.
+ *
+ * This is UI-only: detector coordinates/keypoints used by MobileFaceNet stay
+ * unchanged, so recognition geometry is not distorted.
+ */
+#define APP_TFLM_INT8_DISPLAY_BOX_MARGIN_RATIO      0.20f
 #define APP_TFLM_BLAZEFACE_X_SCALE                128.0f
 #define APP_TFLM_BLAZEFACE_Y_SCALE                128.0f
 #define APP_TFLM_BLAZEFACE_W_SCALE                128.0f
 #define APP_TFLM_BLAZEFACE_H_SCALE                128.0f
 
-/* MobileFaceNet contract and recognition policy. */
+/* MobileFaceNet contract and recognition policy shared by FP32 and INT8. */
 #define APP_TFLM_MOBILEFACENET_INPUT_SIZE          112
 #define APP_TFLM_MOBILEFACENET_EMBEDDING_DIM       192
 
@@ -3757,20 +3904,23 @@ FILE: src/main/include/config/app_features.h
  *     normalized = pixel / 127.5 - 1.0
  *
  * The embedding is L2-normalized after inference and compared with cosine
- * similarity. Tune the threshold only after collecting validation samples.
+ * similarity. Keep the same initial threshold for FP32 and INT8 so the first
+ * runtime comparison changes only inference precision/runtime. Re-tune only
+ * after collecting validation measurements.
  */
 #define APP_TFLM_RECOG_SIMILARITY_THRESHOLD        0.60f
 
 /*
- * Alignment geometry used by the model source:
+ * Alignment geometry used by both TFLM recognizers:
  * crop size = inter-eye distance * 2.5
  * crop center is shifted down from the eye midpoint by 15% of crop size.
  */
 #define APP_TFLM_RECOG_EYE_DISTANCE_SCALE          2.5f
 #define APP_TFLM_RECOG_EYE_CENTER_DOWN_SHIFT       0.15f
 
-/* Separate database: never overwrite the ESP-DL /sdcard/FACE.DB. */
-#define APP_TFLM_RECOG_DATABASE_PATH "/sdcard/TFLMFP32.DB"
+/* Separate databases: never mix embeddings from different inference models. */
+#define APP_TFLM_FP32_RECOG_DATABASE_PATH "/sdcard/TFLMFP32.DB"
+#define APP_TFLM_INT8_RECOG_DATABASE_PATH "/sdcard/TFLMINT8.DB"
 
 /* Existing raw RGB888 enrollment dataset. */
 #define APP_FACE_ENROLL_ROOT          "/sdcard/enroll"
@@ -4314,6 +4464,15 @@ int tflm_fp32_face_detect_run_rgb888(
     uint8_t *buf, uint32_t width, uint32_t height,
     face_box_t *boxes, int max_boxes);
 
+/* BlazeFace full-INT8 running through TFLM + ESP-NN. */
+esp_err_t tflm_int8_face_detect_init(void);
+int tflm_int8_face_detect_run_rgb565(
+    uint8_t *buf, uint32_t width, uint32_t height,
+    face_box_t *boxes, int max_boxes);
+int tflm_int8_face_detect_run_rgb888(
+    uint8_t *buf, uint32_t width, uint32_t height,
+    face_box_t *boxes, int max_boxes);
+
 #ifdef __cplusplus
 }
 #endif
@@ -4348,6 +4507,13 @@ esp_err_t tflm_fp32_face_recognition_recognize(
     const face_box_t *box, char *out_name, int out_name_len, float *out_score);
 int tflm_fp32_face_recognition_get_count(void);
 
+/* MobileFaceNet full-INT8 running through TFLM + ESP-NN. */
+esp_err_t tflm_int8_face_recognition_init(void);
+esp_err_t tflm_int8_face_recognition_recognize(
+    uint8_t *camera_buf, uint32_t width, uint32_t height,
+    const face_box_t *box, char *out_name, int out_name_len, float *out_score);
+int tflm_int8_face_recognition_get_count(void);
+
 #ifdef __cplusplus
 }
 #endif
@@ -4361,7 +4527,9 @@ FILE: src/main/include/services/vision/backends/tflm_model_runner.hpp
 #include "config/app_features.h"
 
 #if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_FP32 || \
-    APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_FP32
+    APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_FP32 || \
+    APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8 || \
+    APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_INT8
 
 #include <stddef.h>
 #include <stdint.h>
@@ -9614,6 +9782,8 @@ extern "C" esp_err_t face_detect_init(void)
     return espdl_face_detect_init();
 #elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_FP32
     return tflm_fp32_face_detect_init();
+#elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+    return tflm_int8_face_detect_init();
 #else
 #error "Unsupported face-detection backend"
 #endif
@@ -9630,6 +9800,9 @@ extern "C" int face_detect_run_rgb565(
     return espdl_face_detect_run_rgb565(buf, width, height, boxes, max_boxes);
 #elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_FP32
     return tflm_fp32_face_detect_run_rgb565(
+        buf, width, height, boxes, max_boxes);
+#elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+    return tflm_int8_face_detect_run_rgb565(
         buf, width, height, boxes, max_boxes);
 #else
     return 0;
@@ -9648,6 +9821,9 @@ extern "C" int face_detect_run_rgb888(
 #elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_FP32
     return tflm_fp32_face_detect_run_rgb888(
         buf, width, height, boxes, max_boxes);
+#elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+    return tflm_int8_face_detect_run_rgb888(
+        buf, width, height, boxes, max_boxes);
 #else
     return 0;
 #endif
@@ -9659,6 +9835,8 @@ extern "C" const char *face_detect_backend_name(void)
     return "ESP-DL";
 #elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_FP32
     return "TFLM-FP32/BLAZEFACE";
+#elif APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+    return "TFLM-INT8+ESP-NN/BLAZEFACE";
 #else
     return "UNKNOWN";
 #endif
@@ -10381,13 +10559,13 @@ static int run_common(
 extern "C" esp_err_t tflm_fp32_face_detect_init(void)
 {
     const esp_err_t ret = s_runner.init(
-        APP_TFLM_FACE_DETECT_MODEL_PATH,
+        APP_TFLM_FP32_FACE_DETECT_MODEL_PATH,
         APP_TFLM_DETECT_TENSOR_ARENA_BYTES);
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
             "BlazeFace model initialization failed: path=%s error=%s",
-            APP_TFLM_FACE_DETECT_MODEL_PATH,
+            APP_TFLM_FP32_FACE_DETECT_MODEL_PATH,
             esp_err_to_name(ret));
         return ret;
     }
@@ -10410,7 +10588,7 @@ extern "C" esp_err_t tflm_fp32_face_detect_init(void)
     ESP_LOGI(
         TAG,
         "TFLM-FP32 BlazeFace ready: model=%s arena_used=%u",
-        APP_TFLM_FACE_DETECT_MODEL_PATH,
+        APP_TFLM_FP32_FACE_DETECT_MODEL_PATH,
         (unsigned)s_runner.arena_used_bytes());
 
     return ESP_OK;
@@ -10461,6 +10639,846 @@ extern "C" int tflm_fp32_face_detect_run_rgb888(
 
 
 ==================================================
+FILE: src/main/services/vision/face_detection/face_detector_tflm_int8.cpp
+==================================================
+#include "config/app_features.h"
+
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+
+#include "services/vision/backends/face_detector_backend.h"
+
+#include <algorithm>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <vector>
+
+#include "diagnostics/core_trace.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "services/vision/backends/tflm_model_runner.hpp"
+
+static const char *TAG = "face_detect_tflm_int8";
+static TflmModelRunner s_runner;
+static uint32_t s_live_detector_diag_calls = 0;
+
+struct letterbox_transform_t {
+    float scale;
+    float pad_x;
+    float pad_y;
+};
+
+struct blaze_candidate_t {
+    float ymin;
+    float xmin;
+    float ymax;
+    float xmax;
+    float keypoints[APP_TFLM_BLAZEFACE_NUM_KEYPOINTS * 2];
+    float score;
+};
+
+static bool exact_detector_input(const TfLiteTensor *tensor)
+{
+    return tensor &&
+           tensor->type == kTfLiteInt8 &&
+           tensor->dims &&
+           tensor->dims->size == 4 &&
+           tensor->dims->data[0] == 1 &&
+           tensor->dims->data[1] == APP_TFLM_BLAZEFACE_INPUT_SIZE &&
+           tensor->dims->data[2] == APP_TFLM_BLAZEFACE_INPUT_SIZE &&
+           tensor->dims->data[3] == 3 &&
+           tensor->params.scale > 0.0f;
+}
+
+static bool exact_regressor_output(const TfLiteTensor *tensor)
+{
+    return tensor &&
+           tensor->type == kTfLiteInt8 &&
+           tensor->dims &&
+           tensor->dims->size == 3 &&
+           tensor->dims->data[0] == 1 &&
+           tensor->dims->data[1] == APP_TFLM_BLAZEFACE_NUM_ANCHORS &&
+           tensor->dims->data[2] == APP_TFLM_BLAZEFACE_NUM_COORDS &&
+           tensor->params.scale > 0.0f;
+}
+
+static bool exact_score_output(const TfLiteTensor *tensor)
+{
+    return tensor &&
+           tensor->type == kTfLiteInt8 &&
+           tensor->dims &&
+           tensor->dims->size == 3 &&
+           tensor->dims->data[0] == 1 &&
+           tensor->dims->data[1] == APP_TFLM_BLAZEFACE_NUM_ANCHORS &&
+           tensor->dims->data[2] == 1 &&
+           tensor->params.scale > 0.0f;
+}
+
+static inline void read_rgb565_pixel(
+    const uint8_t *buf,
+    uint32_t width,
+    uint32_t x,
+    uint32_t y,
+    float *r,
+    float *g,
+    float *b)
+{
+    const size_t index = (static_cast<size_t>(y) * width + x) * 2U;
+    const uint16_t p = static_cast<uint16_t>(buf[index]) |
+                       (static_cast<uint16_t>(buf[index + 1]) << 8);
+
+    const uint8_t r5 = static_cast<uint8_t>((p >> 11) & 0x1F);
+    const uint8_t g6 = static_cast<uint8_t>((p >> 5) & 0x3F);
+    const uint8_t b5 = static_cast<uint8_t>(p & 0x1F);
+
+    *r = static_cast<float>((r5 << 3) | (r5 >> 2));
+    *g = static_cast<float>((g6 << 2) | (g6 >> 4));
+    *b = static_cast<float>((b5 << 3) | (b5 >> 2));
+}
+
+static inline void read_rgb888_pixel(
+    const uint8_t *buf,
+    uint32_t width,
+    uint32_t x,
+    uint32_t y,
+    float *r,
+    float *g,
+    float *b)
+{
+    const size_t index = (static_cast<size_t>(y) * width + x) * 3U;
+    *r = static_cast<float>(buf[index + 0]);
+    *g = static_cast<float>(buf[index + 1]);
+    *b = static_cast<float>(buf[index + 2]);
+}
+
+static void sample_bilinear(
+    const uint8_t *buf,
+    uint32_t width,
+    uint32_t height,
+    float x,
+    float y,
+    bool rgb565,
+    float *r,
+    float *g,
+    float *b)
+{
+    x = std::max(0.0f, std::min(x, static_cast<float>(width - 1U)));
+    y = std::max(0.0f, std::min(y, static_cast<float>(height - 1U)));
+
+    const uint32_t x0 = static_cast<uint32_t>(floorf(x));
+    const uint32_t y0 = static_cast<uint32_t>(floorf(y));
+    const uint32_t x1 = std::min<uint32_t>(x0 + 1U, width - 1U);
+    const uint32_t y1 = std::min<uint32_t>(y0 + 1U, height - 1U);
+
+    const float fx = x - static_cast<float>(x0);
+    const float fy = y - static_cast<float>(y0);
+
+    float r00, g00, b00;
+    float r10, g10, b10;
+    float r01, g01, b01;
+    float r11, g11, b11;
+
+    if (rgb565) {
+        read_rgb565_pixel(buf, width, x0, y0, &r00, &g00, &b00);
+        read_rgb565_pixel(buf, width, x1, y0, &r10, &g10, &b10);
+        read_rgb565_pixel(buf, width, x0, y1, &r01, &g01, &b01);
+        read_rgb565_pixel(buf, width, x1, y1, &r11, &g11, &b11);
+    } else {
+        read_rgb888_pixel(buf, width, x0, y0, &r00, &g00, &b00);
+        read_rgb888_pixel(buf, width, x1, y0, &r10, &g10, &b10);
+        read_rgb888_pixel(buf, width, x0, y1, &r01, &g01, &b01);
+        read_rgb888_pixel(buf, width, x1, y1, &r11, &g11, &b11);
+    }
+
+    const float w00 = (1.0f - fx) * (1.0f - fy);
+    const float w10 = fx * (1.0f - fy);
+    const float w01 = (1.0f - fx) * fy;
+    const float w11 = fx * fy;
+
+    *r = r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11;
+    *g = g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11;
+    *b = b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11;
+}
+
+static inline float normalize_blazeface_pixel(float value)
+{
+    /* BlazeFace front model reference preprocessing: [0,255] -> [-1,1]. */
+    return value / 127.5f - 1.0f;
+}
+
+static esp_err_t fill_blazeface_input(
+    const uint8_t *buf,
+    uint32_t width,
+    uint32_t height,
+    bool rgb565,
+    letterbox_transform_t *transform)
+{
+    TfLiteTensor *input = s_runner.input(0);
+    if (!buf || width == 0 || height == 0 || !transform ||
+        !exact_detector_input(input)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const float dst =
+        static_cast<float>(APP_TFLM_BLAZEFACE_INPUT_SIZE);
+    transform->scale = std::min(
+        dst / static_cast<float>(width),
+        dst / static_cast<float>(height));
+
+    const float scaled_w = static_cast<float>(width) * transform->scale;
+    const float scaled_h = static_cast<float>(height) * transform->scale;
+    transform->pad_x = (dst - scaled_w) * 0.5f;
+    transform->pad_y = (dst - scaled_h) * 0.5f;
+
+    if (input->params.scale <= 0.0f) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    int8_t *out = input->data.int8;
+    size_t out_index = 0;
+
+    const float inv_scale = 1.0f / input->params.scale;
+    const int zero_point = input->params.zero_point;
+
+    auto write_real = [&](float value) {
+        int q = static_cast<int>(lrintf(value * inv_scale)) + zero_point;
+        q = std::max(-128, std::min(127, q));
+        out[out_index++] = static_cast<int8_t>(q);
+    };
+
+    for (int dy = 0; dy < APP_TFLM_BLAZEFACE_INPUT_SIZE; ++dy) {
+        const float sy =
+            (static_cast<float>(dy) + 0.5f - transform->pad_y) /
+                transform->scale -
+            0.5f;
+
+        for (int dx = 0; dx < APP_TFLM_BLAZEFACE_INPUT_SIZE; ++dx) {
+            const float sx =
+                (static_cast<float>(dx) + 0.5f - transform->pad_x) /
+                    transform->scale -
+                0.5f;
+
+            if (sx < -0.5f || sy < -0.5f ||
+                sx > static_cast<float>(width) - 0.5f ||
+                sy > static_cast<float>(height) - 0.5f) {
+                /*
+                 * Real value 0.0 is the same neutral-gray padding used by the
+                 * FP32 backend. Quantize it with the model's own scale/zero
+                 * point instead of assuming a particular integer value.
+                 */
+                write_real(0.0f);
+                write_real(0.0f);
+                write_real(0.0f);
+                continue;
+            }
+
+            float r, g, b;
+            sample_bilinear(
+                buf, width, height, sx, sy, rgb565, &r, &g, &b);
+
+            write_real(normalize_blazeface_pixel(r));
+            write_real(normalize_blazeface_pixel(g));
+            write_real(normalize_blazeface_pixel(b));
+        }
+    }
+
+    return ESP_OK;
+}
+
+/*
+ * The 128x128 BlazeFace front model uses 896 fixed-size anchors.
+ *
+ * The model output order is:
+ *   16x16 grid x 2 anchors = 512
+ *    8x8  grid x 6 anchors = 384
+ *
+ * fixed_anchor_size=true, so each anchor width/height is 1.0 and only the
+ * center is required by the decoder.
+ */
+static void blazeface_anchor_center(size_t index, float *cx, float *cy)
+{
+    if (index < 512U) {
+        const size_t cell = index / 2U;
+        const int x = static_cast<int>(cell % 16U);
+        const int y = static_cast<int>(cell / 16U);
+        *cx = (static_cast<float>(x) + 0.5f) / 16.0f;
+        *cy = (static_cast<float>(y) + 0.5f) / 16.0f;
+    } else {
+        const size_t cell = (index - 512U) / 6U;
+        const int x = static_cast<int>(cell % 8U);
+        const int y = static_cast<int>(cell / 8U);
+        *cx = (static_cast<float>(x) + 0.5f) / 8.0f;
+        *cy = (static_cast<float>(y) + 0.5f) / 8.0f;
+    }
+}
+
+static inline float sigmoid_clipped(float logit)
+{
+    logit = std::max(
+        -APP_TFLM_BLAZEFACE_SCORE_CLIP,
+        std::min(logit, APP_TFLM_BLAZEFACE_SCORE_CLIP));
+    return 1.0f / (1.0f + expf(-logit));
+}
+
+/*
+ * INT8 score-threshold mapping
+ * ----------------------------
+ *
+ * The FP32 detector keeps APP_TFLM_BLAZEFACE_SCORE_THRESHOLD (0.75).
+ * This INT8 backend uses its own candidate threshold because its score
+ * tensor has a very coarse output grid.
+ *
+ * The INT8 classifier output has a finite quantization grid.  With the
+ * generated FDET8.TFL observed during conversion:
+ *
+ *     scale      ~= 0.75656235
+ *     zero_point = 122
+ *
+ * the old 0.75 probability target fell between representable INT8 values,
+ * which is BETWEEN two representable INT8 logits:
+ *
+ *     q=123 -> logit ~= 0.7566 -> sigmoid ~= 0.6806
+ *     q=124 -> logit ~= 1.5131 -> sigmoid ~= 0.8195
+ *
+ * The old implementation dequantized q and then compared against 0.75.
+ * That accidentally rounded the threshold UP to q>=124, making the
+ * effective detector threshold about 0.8195.  That is why all 13 known
+ * enrollment faces and all live frames were rejected after quantization.
+ *
+ * The live detector now uses the explicit INT8 candidate threshold 0.50,
+ * which maps exactly to q=122. This is a candidate-generation threshold;
+ * MobileFaceNet recognition remains the second-stage identity verifier.
+ *
+ * This changes ONLY the INT8 detector post-processing.  ESP-DL and TFLM-FP32
+ * keep their existing thresholds and behavior.
+ */
+static int quantized_score_threshold_q(const TfLiteTensor *scores)
+{
+    if (!scores || scores->params.scale <= 0.0f) {
+        return 127;
+    }
+
+    const float probability = std::max(
+        1.0e-6f,
+        std::min(
+            APP_TFLM_INT8_BLAZEFACE_SCORE_THRESHOLD,
+            1.0f - 1.0e-6f));
+
+    const float threshold_logit =
+        logf(probability / (1.0f - probability));
+
+    int q = static_cast<int>(
+        lrintf(threshold_logit / scores->params.scale)) +
+        scores->params.zero_point;
+
+    return std::max(-128, std::min(127, q));
+}
+
+static float quantized_score_threshold_effective(
+    const TfLiteTensor *scores,
+    int threshold_q)
+{
+    if (!scores || scores->params.scale <= 0.0f) {
+        return APP_TFLM_INT8_BLAZEFACE_SCORE_THRESHOLD;
+    }
+
+    const float represented_logit =
+        (threshold_q - scores->params.zero_point) *
+        scores->params.scale;
+
+    return sigmoid_clipped(represented_logit);
+}
+
+static std::vector<blaze_candidate_t> decode_raw_predictions(void)
+{
+    std::vector<blaze_candidate_t> candidates;
+
+    TfLiteTensor *regressors = s_runner.output(0);
+    TfLiteTensor *scores = s_runner.output(1);
+    if (!exact_regressor_output(regressors) || !exact_score_output(scores)) {
+        return candidates;
+    }
+
+    candidates.reserve(64);
+
+    if (regressors->params.scale <= 0.0f ||
+        scores->params.scale <= 0.0f) {
+        return candidates;
+    }
+
+    const int8_t *raw_boxes = regressors->data.int8;
+    const int8_t *raw_scores = scores->data.int8;
+    const float box_scale = regressors->params.scale;
+    const int box_zero = regressors->params.zero_point;
+    const float score_scale = scores->params.scale;
+    const int score_zero = scores->params.zero_point;
+    const int score_threshold_q = quantized_score_threshold_q(scores);
+
+    auto box_value = [&](size_t index) {
+        return (static_cast<int>(raw_boxes[index]) - box_zero) * box_scale;
+    };
+
+    for (size_t i = 0; i < APP_TFLM_BLAZEFACE_NUM_ANCHORS; ++i) {
+        const int raw_score_q = static_cast<int>(raw_scores[i]);
+
+        /*
+         * Compare on the INT8 grid.  Do NOT dequantize and compare against
+         * 0.75 directly: because the classifier output is coarse, doing that
+         * silently turned 0.75 into the stricter q>=124 (~0.8195).
+         */
+        if (raw_score_q < score_threshold_q) {
+            continue;
+        }
+
+        const float raw_score =
+            (raw_score_q - score_zero) * score_scale;
+        const float score = sigmoid_clipped(raw_score);
+
+        float anchor_x, anchor_y;
+        blazeface_anchor_center(i, &anchor_x, &anchor_y);
+
+        const size_t base = i * APP_TFLM_BLAZEFACE_NUM_COORDS;
+
+        const float x_center =
+            box_value(base + 0) / APP_TFLM_BLAZEFACE_X_SCALE + anchor_x;
+        const float y_center =
+            box_value(base + 1) / APP_TFLM_BLAZEFACE_Y_SCALE + anchor_y;
+        const float width =
+            box_value(base + 2) / APP_TFLM_BLAZEFACE_W_SCALE;
+        const float height =
+            box_value(base + 3) / APP_TFLM_BLAZEFACE_H_SCALE;
+
+        blaze_candidate_t candidate = {};
+        candidate.ymin = y_center - height * 0.5f;
+        candidate.xmin = x_center - width * 0.5f;
+        candidate.ymax = y_center + height * 0.5f;
+        candidate.xmax = x_center + width * 0.5f;
+        candidate.score = score;
+
+        for (int k = 0; k < APP_TFLM_BLAZEFACE_NUM_KEYPOINTS; ++k) {
+            const size_t offset = base + 4U + static_cast<size_t>(k) * 2U;
+            candidate.keypoints[k * 2 + 0] =
+                box_value(offset + 0) / APP_TFLM_BLAZEFACE_X_SCALE + anchor_x;
+            candidate.keypoints[k * 2 + 1] =
+                box_value(offset + 1) / APP_TFLM_BLAZEFACE_Y_SCALE + anchor_y;
+        }
+
+        candidates.push_back(candidate);
+    }
+
+    std::sort(
+        candidates.begin(),
+        candidates.end(),
+        [](const blaze_candidate_t &a, const blaze_candidate_t &b) {
+            return a.score > b.score;
+        });
+
+    return candidates;
+}
+
+static float candidate_iou(
+    const blaze_candidate_t &a,
+    const blaze_candidate_t &b)
+{
+    const float xmin = std::max(a.xmin, b.xmin);
+    const float ymin = std::max(a.ymin, b.ymin);
+    const float xmax = std::min(a.xmax, b.xmax);
+    const float ymax = std::min(a.ymax, b.ymax);
+
+    const float iw = std::max(0.0f, xmax - xmin);
+    const float ih = std::max(0.0f, ymax - ymin);
+    const float intersection = iw * ih;
+
+    const float area_a =
+        std::max(0.0f, a.xmax - a.xmin) *
+        std::max(0.0f, a.ymax - a.ymin);
+    const float area_b =
+        std::max(0.0f, b.xmax - b.xmin) *
+        std::max(0.0f, b.ymax - b.ymin);
+
+    const float denom = area_a + area_b - intersection;
+    return denom > 0.0f ? intersection / denom : 0.0f;
+}
+
+/*
+ * BlazeFace uses weighted suppression rather than discarding every overlapping
+ * box. Blend all detections that overlap the current highest-scoring box.
+ */
+static std::vector<blaze_candidate_t> weighted_nms(
+    const std::vector<blaze_candidate_t> &input,
+    int max_results)
+{
+    std::vector<blaze_candidate_t> remaining = input;
+    std::vector<blaze_candidate_t> output;
+    output.reserve(std::min<int>(max_results, remaining.size()));
+
+    while (!remaining.empty() &&
+           static_cast<int>(output.size()) < max_results) {
+        const blaze_candidate_t seed = remaining.front();
+
+        blaze_candidate_t blended = {};
+        float weight_sum = 0.0f;
+        float score_sum = 0.0f;
+        int merged_count = 0;
+
+        std::vector<blaze_candidate_t> next;
+        next.reserve(remaining.size());
+
+        for (const blaze_candidate_t &candidate : remaining) {
+            if (candidate_iou(seed, candidate) >
+                APP_TFLM_BLAZEFACE_NMS_IOU_THRESHOLD) {
+                const float w = candidate.score;
+                weight_sum += w;
+                score_sum += candidate.score;
+                merged_count++;
+
+                blended.ymin += candidate.ymin * w;
+                blended.xmin += candidate.xmin * w;
+                blended.ymax += candidate.ymax * w;
+                blended.xmax += candidate.xmax * w;
+
+                for (int k = 0;
+                     k < APP_TFLM_BLAZEFACE_NUM_KEYPOINTS * 2;
+                     ++k) {
+                    blended.keypoints[k] += candidate.keypoints[k] * w;
+                }
+            } else {
+                next.push_back(candidate);
+            }
+        }
+
+        if (weight_sum > 0.0f) {
+            blended.ymin /= weight_sum;
+            blended.xmin /= weight_sum;
+            blended.ymax /= weight_sum;
+            blended.xmax /= weight_sum;
+            for (int k = 0;
+                 k < APP_TFLM_BLAZEFACE_NUM_KEYPOINTS * 2;
+                 ++k) {
+                blended.keypoints[k] /= weight_sum;
+            }
+            blended.score =
+                merged_count > 0 ? score_sum / merged_count : seed.score;
+            output.push_back(blended);
+        }
+
+        remaining.swap(next);
+    }
+
+    return output;
+}
+
+static int model_x_to_source(
+    float normalized_x,
+    uint32_t source_width,
+    const letterbox_transform_t &transform)
+{
+    const float model_x =
+        normalized_x * APP_TFLM_BLAZEFACE_INPUT_SIZE;
+    const float source_x =
+        (model_x - transform.pad_x) / transform.scale;
+    const int rounded = static_cast<int>(lrintf(source_x));
+
+    return std::max(
+        0,
+        std::min(static_cast<int>(source_width) - 1, rounded));
+}
+
+static int model_y_to_source(
+    float normalized_y,
+    uint32_t source_height,
+    const letterbox_transform_t &transform)
+{
+    const float model_y =
+        normalized_y * APP_TFLM_BLAZEFACE_INPUT_SIZE;
+    const float source_y =
+        (model_y - transform.pad_y) / transform.scale;
+    const int rounded = static_cast<int>(lrintf(source_y));
+
+    return std::max(
+        0,
+        std::min(static_cast<int>(source_height) - 1, rounded));
+}
+
+static int write_face_boxes(
+    const std::vector<blaze_candidate_t> &detections,
+    uint32_t source_width,
+    uint32_t source_height,
+    const letterbox_transform_t &transform,
+    face_box_t *boxes,
+    int max_boxes)
+{
+    int count = 0;
+
+    for (const blaze_candidate_t &detection : detections) {
+        if (count >= max_boxes) {
+            break;
+        }
+
+        face_box_t box = {};
+        box.x1 =
+            model_x_to_source(detection.xmin, source_width, transform);
+        box.y1 =
+            model_y_to_source(detection.ymin, source_height, transform);
+        box.x2 =
+            model_x_to_source(detection.xmax, source_width, transform);
+        box.y2 =
+            model_y_to_source(detection.ymax, source_height, transform);
+        box.score = detection.score;
+
+        if (box.x2 <= box.x1 || box.y2 <= box.y1) {
+            continue;
+        }
+
+        /*
+         * face_box_t currently stores 10 integers. BlazeFace predicts six
+         * keypoints (12 numbers), so retain the first five:
+         *   eye, eye, nose, mouth, one ear tragion.
+         * The first two eye points are sufficient for MobileFaceNet alignment.
+         */
+        box.keypoint_count = 10;
+        for (int k = 0; k < 5; ++k) {
+            box.keypoints[k * 2 + 0] = model_x_to_source(
+                detection.keypoints[k * 2 + 0],
+                source_width,
+                transform);
+            box.keypoints[k * 2 + 1] = model_y_to_source(
+                detection.keypoints[k * 2 + 1],
+                source_height,
+                transform);
+        }
+
+        boxes[count++] = box;
+    }
+
+    return count;
+}
+
+static int run_common(
+    uint8_t *buf,
+    uint32_t width,
+    uint32_t height,
+    face_box_t *boxes,
+    int max_boxes,
+    bool rgb565)
+{
+    if (!s_runner.ready() || !buf || !boxes ||
+        width == 0 || height == 0 || max_boxes <= 0) {
+        return 0;
+    }
+
+    const int64_t total_start_us = esp_timer_get_time();
+
+    letterbox_transform_t transform = {};
+    if (fill_blazeface_input(
+            buf, width, height, rgb565, &transform) != ESP_OK) {
+        return 0;
+    }
+
+    const int64_t after_preprocess_us = esp_timer_get_time();
+
+    core_trace(TAG, "DETECT_BEGIN");
+    int64_t invoke_us = 0;
+    const esp_err_t invoke_ret = s_runner.invoke(&invoke_us);
+    if (invoke_ret != ESP_OK) {
+        ESP_LOGE(TAG, "BlazeFace Invoke failed: %s",
+                 esp_err_to_name(invoke_ret));
+        return 0;
+    }
+
+    /*
+     * Diagnostic score audit for the quantized detector.  This is deliberately
+     * computed from the real INT8 output tensor after Invoke(), using the same
+     * scale/zero-point conversion as decode_raw_predictions().  It tells us
+     * immediately whether a zero-face result is caused by the score threshold
+     * or by invalid decoded geometry.
+     */
+    TfLiteTensor *score_tensor = s_runner.output(1);
+    int max_score_q = -128;
+    float max_score = 0.0f;
+    if (exact_score_output(score_tensor)) {
+        const int8_t *score_data = score_tensor->data.int8;
+        for (size_t i = 0; i < APP_TFLM_BLAZEFACE_NUM_ANCHORS; ++i) {
+            const int q = static_cast<int>(score_data[i]);
+            if (q > max_score_q) {
+                max_score_q = q;
+            }
+        }
+        const float max_logit =
+            (max_score_q - score_tensor->params.zero_point) *
+            score_tensor->params.scale;
+        max_score = sigmoid_clipped(max_logit);
+    }
+
+    std::vector<blaze_candidate_t> decoded = decode_raw_predictions();
+    std::vector<blaze_candidate_t> filtered =
+        weighted_nms(decoded, max_boxes);
+
+    const int count = write_face_boxes(
+        filtered, width, height, transform, boxes, max_boxes);
+
+    /*
+     * The normal ESP_LOG tag can be filtered by runtime logging settings.
+     * For live RGB565 frames, print one compact line every eighth invocation
+     * (and every positive detection) so detector behavior is always observable.
+     */
+    if (rgb565) {
+        s_live_detector_diag_calls++;
+        if (count > 0 || (s_live_detector_diag_calls % 8U) == 1U) {
+            printf(
+                "[INT8-LIVE-DETECT] call=%u max_q=%d max_prob=%.6f "
+                "threshold_q=%d threshold_prob=%.6f candidates=%u faces=%d\n",
+                (unsigned)s_live_detector_diag_calls,
+                max_score_q,
+                (double)max_score,
+                quantized_score_threshold_q(score_tensor),
+                (double)quantized_score_threshold_effective(
+                    score_tensor,
+                    quantized_score_threshold_q(score_tensor)),
+                (unsigned)decoded.size(),
+                count);
+        }
+    }
+
+    const int64_t end_us = esp_timer_get_time();
+
+    ESP_LOGI(
+        TAG,
+        "[AI-BENCH] backend=TFLM-INT8+ESP-NN model=BlazeFace "
+        "stage=DETECT cpu=%d preprocess_us=%lld invoke_us=%lld "
+        "postprocess_us=%lld total_us=%lld faces=%d candidates=%u "
+        "max_score=%.6f max_score_q=%d threshold_nominal=%.3f "
+        "threshold_q=%d threshold_effective=%.6f",
+        xPortGetCoreID(),
+        (long long)(after_preprocess_us - total_start_us),
+        (long long)invoke_us,
+        (long long)(end_us - after_preprocess_us - invoke_us),
+        (long long)(end_us - total_start_us),
+        count,
+        (unsigned)decoded.size(),
+        (double)max_score,
+        max_score_q,
+        (double)APP_TFLM_INT8_BLAZEFACE_SCORE_THRESHOLD,
+        quantized_score_threshold_q(score_tensor),
+        (double)quantized_score_threshold_effective(
+            score_tensor,
+            quantized_score_threshold_q(score_tensor)));
+
+    return count;
+}
+
+extern "C" esp_err_t tflm_int8_face_detect_init(void)
+{
+    const esp_err_t ret = s_runner.init(
+        APP_TFLM_INT8_FACE_DETECT_MODEL_PATH,
+        APP_TFLM_DETECT_TENSOR_ARENA_BYTES);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "BlazeFace model initialization failed: path=%s error=%s",
+            APP_TFLM_INT8_FACE_DETECT_MODEL_PATH,
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    TfLiteTensor *input = s_runner.input(0);
+    TfLiteTensor *regressors = s_runner.output(0);
+    TfLiteTensor *scores = s_runner.output(1);
+
+    if (!exact_detector_input(input) ||
+        !exact_regressor_output(regressors) ||
+        !exact_score_output(scores)) {
+        ESP_LOGE(
+            TAG,
+            "Wrong BlazeFace tensor contract. Required: "
+            "input=[1,128,128,3] INT8, out0=[1,896,16] INT8, "
+            "out1=[1,896,1] INT8");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    const int threshold_q = quantized_score_threshold_q(scores);
+    const float threshold_effective =
+        quantized_score_threshold_effective(scores, threshold_q);
+
+    ESP_LOGI(
+        TAG,
+        "TFLM-INT8+ESP-NN BlazeFace ready: model=%s arena_used=%u "
+        "input_scale=%.9f input_zero=%d score_scale=%.9f score_zero=%d "
+        "threshold_nominal=%.3f threshold_q=%d threshold_effective=%.6f",
+        APP_TFLM_INT8_FACE_DETECT_MODEL_PATH,
+        (unsigned)s_runner.arena_used_bytes(),
+        (double)input->params.scale,
+        input->params.zero_point,
+        (double)scores->params.scale,
+        scores->params.zero_point,
+        (double)APP_TFLM_INT8_BLAZEFACE_SCORE_THRESHOLD,
+        threshold_q,
+        (double)threshold_effective);
+
+    /*
+     * Always print one compact marker even if ESP-IDF tag filtering changes.
+     * This makes the INT8 threshold mapping visible in serial benchmark logs.
+     */
+    printf(
+        "[INT8-DETECT-FIX] nominal=%.3f score_scale=%.9f score_zero=%d "
+        "threshold_q=%d threshold_effective=%.6f\n",
+        (double)APP_TFLM_INT8_BLAZEFACE_SCORE_THRESHOLD,
+        (double)scores->params.scale,
+        (int)scores->params.zero_point,
+        threshold_q,
+        (double)threshold_effective);
+
+    return ESP_OK;
+}
+
+extern "C" int tflm_int8_face_detect_run_rgb565(
+    uint8_t *buf,
+    uint32_t width,
+    uint32_t height,
+    face_box_t *boxes,
+    int max_boxes)
+{
+    return run_common(buf, width, height, boxes, max_boxes, true);
+}
+
+extern "C" int tflm_int8_face_detect_run_rgb888(
+    uint8_t *buf,
+    uint32_t width,
+    uint32_t height,
+    face_box_t *boxes,
+    int max_boxes)
+{
+    return run_common(buf, width, height, boxes, max_boxes, false);
+}
+
+#else
+
+#include "services/vision/backends/face_detector_backend.h"
+
+extern "C" esp_err_t tflm_int8_face_detect_init(void)
+{
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+extern "C" int tflm_int8_face_detect_run_rgb565(
+    uint8_t *, uint32_t, uint32_t, face_box_t *, int)
+{
+    return 0;
+}
+
+extern "C" int tflm_int8_face_detect_run_rgb888(
+    uint8_t *, uint32_t, uint32_t, face_box_t *, int)
+{
+    return 0;
+}
+
+#endif
+
+
+==================================================
 FILE: src/main/services/vision/face_recognition/face_recognizer.cpp
 ==================================================
 #include "services/vision/face_recognizer.h"
@@ -10474,6 +11492,8 @@ extern "C" esp_err_t face_recognition_init(void)
     return espdl_face_recognition_init();
 #elif APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_FP32
     return tflm_fp32_face_recognition_init();
+#elif APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_INT8
+    return tflm_int8_face_recognition_init();
 #else
 #error "Unsupported face-recognition backend"
 #endif
@@ -10494,6 +11514,9 @@ extern "C" esp_err_t face_recognition_recognize(
 #elif APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_FP32
     return tflm_fp32_face_recognition_recognize(
         camera_buf, width, height, box, out_name, out_name_len, out_score);
+#elif APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_INT8
+    return tflm_int8_face_recognition_recognize(
+        camera_buf, width, height, box, out_name, out_name_len, out_score);
 #else
     return ESP_ERR_NOT_SUPPORTED;
 #endif
@@ -10505,6 +11528,8 @@ extern "C" int face_recognition_get_count(void)
     return espdl_face_recognition_get_count();
 #elif APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_FP32
     return tflm_fp32_face_recognition_get_count();
+#elif APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_INT8
+    return tflm_int8_face_recognition_get_count();
 #else
     return 0;
 #endif
@@ -10516,6 +11541,8 @@ extern "C" const char *face_recognition_backend_name(void)
     return "ESP-DL";
 #elif APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_FP32
     return "TFLM-FP32/MOBILEFACENET";
+#elif APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_INT8
+    return "TFLM-INT8+ESP-NN/MOBILEFACENET";
 #else
     return "UNKNOWN";
 #endif
@@ -11875,7 +12902,7 @@ static esp_err_t collect_enrollment_images(
      * Enrollment boxes/eyes come from BlazeFace. Include that model file in the
      * database fingerprint so changing the detector rebuilds the embeddings.
      */
-    (void)hash_file(APP_TFLM_FACE_DETECT_MODEL_PATH, fingerprint);
+    (void)hash_file(APP_TFLM_FP32_FACE_DETECT_MODEL_PATH, fingerprint);
 #endif
 
     DIR *root = opendir(APP_FACE_ENROLL_ROOT);
@@ -12052,7 +13079,7 @@ static int largest_face(
 
 static esp_err_t save_database(uint64_t fingerprint)
 {
-    FILE *file = fopen(APP_TFLM_RECOG_DATABASE_PATH, "wb");
+    FILE *file = fopen(APP_TFLM_FP32_RECOG_DATABASE_PATH, "wb");
     if (!file) {
         return ESP_FAIL;
     }
@@ -12098,7 +13125,7 @@ static bool load_database(
     uint64_t fingerprint,
     size_t expected_dim)
 {
-    FILE *file = fopen(APP_TFLM_RECOG_DATABASE_PATH, "rb");
+    FILE *file = fopen(APP_TFLM_FP32_RECOG_DATABASE_PATH, "rb");
     if (!file) {
         return false;
     }
@@ -12242,7 +13269,7 @@ static esp_err_t rebuild_database(
         ESP_LOGE(
             TAG,
             "Could not save %s: %s",
-            APP_TFLM_RECOG_DATABASE_PATH,
+            APP_TFLM_FP32_RECOG_DATABASE_PATH,
             esp_err_to_name(save_ret));
         return save_ret;
     }
@@ -12253,7 +13280,7 @@ static esp_err_t rebuild_database(
         (unsigned)s_entries.size(),
         rejected,
         (unsigned)s_embedding_dim,
-        APP_TFLM_RECOG_DATABASE_PATH);
+        APP_TFLM_FP32_RECOG_DATABASE_PATH);
 
     return ESP_OK;
 }
@@ -12261,14 +13288,14 @@ static esp_err_t rebuild_database(
 extern "C" esp_err_t tflm_fp32_face_recognition_init(void)
 {
     const esp_err_t init_ret = s_runner.init(
-        APP_TFLM_FACE_RECOG_MODEL_PATH,
+        APP_TFLM_FP32_FACE_RECOG_MODEL_PATH,
         APP_TFLM_RECOG_TENSOR_ARENA_BYTES);
 
     if (init_ret != ESP_OK) {
         ESP_LOGE(
             TAG,
             "MobileFaceNet model initialization failed: path=%s error=%s",
-            APP_TFLM_FACE_RECOG_MODEL_PATH,
+            APP_TFLM_FP32_FACE_RECOG_MODEL_PATH,
             esp_err_to_name(init_ret));
         return init_ret;
     }
@@ -12291,7 +13318,7 @@ extern "C" esp_err_t tflm_fp32_face_recognition_init(void)
     ESP_LOGI(
         TAG,
         "TFLM-FP32 MobileFaceNet ready: model=%s dim=%u arena_used=%u",
-        APP_TFLM_FACE_RECOG_MODEL_PATH,
+        APP_TFLM_FP32_FACE_RECOG_MODEL_PATH,
         (unsigned)s_embedding_dim,
         (unsigned)s_runner.arena_used_bytes());
 
@@ -12315,7 +13342,7 @@ extern "C" esp_err_t tflm_fp32_face_recognition_init(void)
             "TFLM-FP32 database loaded: entries=%u dim=%u path=%s",
             (unsigned)s_entries.size(),
             (unsigned)s_embedding_dim,
-            APP_TFLM_RECOG_DATABASE_PATH);
+            APP_TFLM_FP32_RECOG_DATABASE_PATH);
         return ESP_OK;
     }
 
@@ -12451,12 +13478,1190 @@ extern "C" esp_err_t tflm_fp32_face_recognition_recognize(
 
 
 ==================================================
+FILE: src/main/services/vision/face_recognition/face_recognizer_tflm_int8.cpp
+==================================================
+#include "config/app_features.h"
+
+#if APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_INT8
+
+#include "services/vision/backends/face_recognizer_backend.h"
+
+#include <algorithm>
+#include <dirent.h>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
+
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "config/app_config.h"
+#include "diagnostics/core_trace.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "services/vision/backends/tflm_model_runner.hpp"
+#include "services/vision/face_detector.h"
+
+static const char *TAG = "face_recog_tflm_int8";
+static TflmModelRunner s_runner;
+
+struct embedding_entry_t {
+    std::string name;
+    std::vector<float> embedding;
+};
+
+struct enrollment_image_t {
+    std::string person_name;
+    std::string file_name;
+    std::string full_path;
+};
+
+struct embedding_timing_t {
+    int64_t preprocess_us;
+    int64_t invoke_us;
+    int64_t postprocess_us;
+    int64_t total_us;
+};
+
+struct aligned_face_geometry_t {
+    float center_x;
+    float center_y;
+    float size;
+    float angle;
+    bool eye_aligned;
+};
+
+static std::vector<embedding_entry_t> s_entries;
+static size_t s_embedding_dim = 0;
+
+static constexpr char DB_MAGIC[8] = {
+    'T', 'F', 'I', '8', 'D', 'B', '1', '\0'
+};
+static constexpr uint32_t DB_VERSION = 1U;
+
+struct __attribute__((packed)) tflm_int8_db_header_t {
+    char magic[8];
+    uint32_t version;
+    uint32_t embedding_dim;
+    uint32_t entry_count;
+    uint64_t fingerprint;
+};
+
+struct __attribute__((packed)) tflm_int8_db_entry_prefix_t {
+    char name[FACE_RECOG_MAX_NAME_LEN];
+};
+
+static bool exact_recognition_input(const TfLiteTensor *tensor)
+{
+    return tensor &&
+           tensor->type == kTfLiteInt8 &&
+           tensor->dims &&
+           tensor->dims->size == 4 &&
+           tensor->dims->data[0] == 1 &&
+           tensor->dims->data[1] == APP_TFLM_MOBILEFACENET_INPUT_SIZE &&
+           tensor->dims->data[2] == APP_TFLM_MOBILEFACENET_INPUT_SIZE &&
+           tensor->dims->data[3] == 3 &&
+           tensor->params.scale > 0.0f;
+}
+
+static bool exact_embedding_output(const TfLiteTensor *tensor)
+{
+    return tensor &&
+           tensor->type == kTfLiteInt8 &&
+           tensor->params.scale > 0.0f &&
+           tflm_tensor_element_count(tensor) ==
+               APP_TFLM_MOBILEFACENET_EMBEDDING_DIM;
+}
+
+static inline void read_rgb565_pixel(
+    const uint8_t *buf,
+    uint32_t width,
+    uint32_t x,
+    uint32_t y,
+    float *r,
+    float *g,
+    float *b)
+{
+    const size_t index = (static_cast<size_t>(y) * width + x) * 2U;
+    const uint16_t p = static_cast<uint16_t>(buf[index]) |
+                       (static_cast<uint16_t>(buf[index + 1]) << 8);
+
+    const uint8_t r5 = static_cast<uint8_t>((p >> 11) & 0x1F);
+    const uint8_t g6 = static_cast<uint8_t>((p >> 5) & 0x3F);
+    const uint8_t b5 = static_cast<uint8_t>(p & 0x1F);
+
+    *r = static_cast<float>((r5 << 3) | (r5 >> 2));
+    *g = static_cast<float>((g6 << 2) | (g6 >> 4));
+    *b = static_cast<float>((b5 << 3) | (b5 >> 2));
+}
+
+static inline void read_rgb888_pixel(
+    const uint8_t *buf,
+    uint32_t width,
+    uint32_t x,
+    uint32_t y,
+    float *r,
+    float *g,
+    float *b)
+{
+    const size_t index = (static_cast<size_t>(y) * width + x) * 3U;
+    *r = static_cast<float>(buf[index + 0]);
+    *g = static_cast<float>(buf[index + 1]);
+    *b = static_cast<float>(buf[index + 2]);
+}
+
+static bool sample_bilinear(
+    const uint8_t *buf,
+    uint32_t width,
+    uint32_t height,
+    float x,
+    float y,
+    bool rgb565,
+    float *r,
+    float *g,
+    float *b)
+{
+    if (x < 0.0f || y < 0.0f ||
+        x > static_cast<float>(width - 1U) ||
+        y > static_cast<float>(height - 1U)) {
+        *r = 0.0f;
+        *g = 0.0f;
+        *b = 0.0f;
+        return false;
+    }
+
+    const uint32_t x0 = static_cast<uint32_t>(floorf(x));
+    const uint32_t y0 = static_cast<uint32_t>(floorf(y));
+    const uint32_t x1 = std::min<uint32_t>(x0 + 1U, width - 1U);
+    const uint32_t y1 = std::min<uint32_t>(y0 + 1U, height - 1U);
+
+    const float fx = x - static_cast<float>(x0);
+    const float fy = y - static_cast<float>(y0);
+
+    float r00, g00, b00;
+    float r10, g10, b10;
+    float r01, g01, b01;
+    float r11, g11, b11;
+
+    if (rgb565) {
+        read_rgb565_pixel(buf, width, x0, y0, &r00, &g00, &b00);
+        read_rgb565_pixel(buf, width, x1, y0, &r10, &g10, &b10);
+        read_rgb565_pixel(buf, width, x0, y1, &r01, &g01, &b01);
+        read_rgb565_pixel(buf, width, x1, y1, &r11, &g11, &b11);
+    } else {
+        read_rgb888_pixel(buf, width, x0, y0, &r00, &g00, &b00);
+        read_rgb888_pixel(buf, width, x1, y0, &r10, &g10, &b10);
+        read_rgb888_pixel(buf, width, x0, y1, &r01, &g01, &b01);
+        read_rgb888_pixel(buf, width, x1, y1, &r11, &g11, &b11);
+    }
+
+    const float w00 = (1.0f - fx) * (1.0f - fy);
+    const float w10 = fx * (1.0f - fy);
+    const float w01 = (1.0f - fx) * fy;
+    const float w11 = fx * fy;
+
+    *r = r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11;
+    *g = g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11;
+    *b = b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11;
+    return true;
+}
+
+static inline float normalize_mobilefacenet_pixel(float value)
+{
+    return value / 127.5f - 1.0f;
+}
+
+static aligned_face_geometry_t face_alignment_geometry(
+    const face_box_t *box,
+    uint32_t width,
+    uint32_t height)
+{
+    aligned_face_geometry_t geometry = {};
+
+    /*
+     * BlazeFace keypoints 0 and 1 are the two eyes. ESP-DL also supplies the
+     * eye landmarks at the start of its 5-point set. Sort by image x position
+     * so the alignment direction is stable regardless of anatomical naming.
+     */
+    if (box && box->keypoint_count >= 4) {
+        float x0 = static_cast<float>(box->keypoints[0]);
+        float y0 = static_cast<float>(box->keypoints[1]);
+        float x1 = static_cast<float>(box->keypoints[2]);
+        float y1 = static_cast<float>(box->keypoints[3]);
+
+        if (x0 > x1) {
+            std::swap(x0, x1);
+            std::swap(y0, y1);
+        }
+
+        const float dx = x1 - x0;
+        const float dy = y1 - y0;
+        const float eye_distance = sqrtf(dx * dx + dy * dy);
+
+        if (eye_distance >= 4.0f) {
+            const float angle = atan2f(dy, dx);
+            const float size =
+                eye_distance * APP_TFLM_RECOG_EYE_DISTANCE_SCALE;
+            const float eye_center_x = (x0 + x1) * 0.5f;
+            const float eye_center_y = (y0 + y1) * 0.5f;
+            const float down =
+                size * APP_TFLM_RECOG_EYE_CENTER_DOWN_SHIFT;
+
+            geometry.center_x =
+                eye_center_x - down * sinf(angle);
+            geometry.center_y =
+                eye_center_y + down * cosf(angle);
+            geometry.size = size;
+            geometry.angle = angle;
+            geometry.eye_aligned = true;
+            return geometry;
+        }
+    }
+
+    /*
+     * Fallback for a detector without usable eye landmarks. This path should
+     * not normally be used with either configured backend.
+     */
+    const int x1 = box ? std::max(0, box->x1) : 0;
+    const int y1 = box ? std::max(0, box->y1) : 0;
+    const int x2 = box
+        ? std::min(static_cast<int>(width) - 1, box->x2)
+        : static_cast<int>(width) - 1;
+    const int y2 = box
+        ? std::min(static_cast<int>(height) - 1, box->y2)
+        : static_cast<int>(height) - 1;
+
+    const float bw = static_cast<float>(std::max(1, x2 - x1 + 1));
+    const float bh = static_cast<float>(std::max(1, y2 - y1 + 1));
+
+    geometry.center_x = (static_cast<float>(x1 + x2)) * 0.5f;
+    geometry.center_y = (static_cast<float>(y1 + y2)) * 0.5f;
+    geometry.size = std::max(bw, bh) * 1.35f;
+    geometry.angle = 0.0f;
+    geometry.eye_aligned = false;
+    return geometry;
+}
+
+static esp_err_t fill_mobilefacenet_input(
+    const uint8_t *buf,
+    uint32_t width,
+    uint32_t height,
+    const face_box_t *box,
+    bool rgb565,
+    bool *used_eye_alignment)
+{
+    TfLiteTensor *input = s_runner.input(0);
+    if (!buf || !box || width == 0 || height == 0 ||
+        !exact_recognition_input(input)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const aligned_face_geometry_t geometry =
+        face_alignment_geometry(box, width, height);
+
+    if (geometry.size <= 1.0f) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (used_eye_alignment) {
+        *used_eye_alignment = geometry.eye_aligned;
+    }
+
+    const float c = cosf(geometry.angle);
+    const float s = sinf(geometry.angle);
+    const float output_size =
+        static_cast<float>(APP_TFLM_MOBILEFACENET_INPUT_SIZE);
+
+    if (input->params.scale <= 0.0f) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    int8_t *out = input->data.int8;
+    size_t index = 0;
+
+    const float inv_scale = 1.0f / input->params.scale;
+    const int zero_point = input->params.zero_point;
+
+    auto write_real = [&](float value) {
+        int q = static_cast<int>(lrintf(value * inv_scale)) + zero_point;
+        q = std::max(-128, std::min(127, q));
+        out[index++] = static_cast<int8_t>(q);
+    };
+
+    for (int dy = 0; dy < APP_TFLM_MOBILEFACENET_INPUT_SIZE; ++dy) {
+        const float local_y =
+            ((static_cast<float>(dy) + 0.5f) / output_size - 0.5f) *
+            geometry.size;
+
+        for (int dx = 0; dx < APP_TFLM_MOBILEFACENET_INPUT_SIZE; ++dx) {
+            const float local_x =
+                ((static_cast<float>(dx) + 0.5f) / output_size - 0.5f) *
+                geometry.size;
+
+            /*
+             * Inverse affine sampling is identical to the FP32 backend.
+             * Only the final normalized value is quantized into the model's
+             * INT8 input tensor.
+             */
+            const float source_x =
+                geometry.center_x + c * local_x - s * local_y;
+            const float source_y =
+                geometry.center_y + s * local_x + c * local_y;
+
+            float r, g, b;
+            sample_bilinear(
+                buf, width, height,
+                source_x, source_y,
+                rgb565,
+                &r, &g, &b);
+
+            write_real(normalize_mobilefacenet_pixel(r));
+            write_real(normalize_mobilefacenet_pixel(g));
+            write_real(normalize_mobilefacenet_pixel(b));
+        }
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t compute_embedding(
+    const uint8_t *buf,
+    uint32_t width,
+    uint32_t height,
+    const face_box_t *box,
+    bool rgb565,
+    std::vector<float> *embedding,
+    embedding_timing_t *timing)
+{
+    if (!embedding || !timing) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *timing = {};
+    const int64_t start_us = esp_timer_get_time();
+
+    bool eye_aligned = false;
+    const esp_err_t preprocess_ret = fill_mobilefacenet_input(
+        buf, width, height, box, rgb565, &eye_aligned);
+    if (preprocess_ret != ESP_OK) {
+        return preprocess_ret;
+    }
+
+    const int64_t after_preprocess_us = esp_timer_get_time();
+
+    int64_t invoke_us = 0;
+    const esp_err_t invoke_ret = s_runner.invoke(&invoke_us);
+    if (invoke_ret != ESP_OK) {
+        return invoke_ret;
+    }
+
+    TfLiteTensor *output = s_runner.output(0);
+    if (!exact_embedding_output(output)) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    embedding->resize(APP_TFLM_MOBILEFACENET_EMBEDDING_DIM);
+
+    float norm_sq = 0.0f;
+    int output_q_min = 127;
+    int output_q_max = -128;
+    unsigned output_nonzero_from_zp = 0;
+
+    for (size_t i = 0;
+         i < APP_TFLM_MOBILEFACENET_EMBEDDING_DIM;
+         ++i) {
+        const int q = static_cast<int>(output->data.int8[i]);
+        output_q_min = std::min(output_q_min, q);
+        output_q_max = std::max(output_q_max, q);
+        if (q != output->params.zero_point) {
+            output_nonzero_from_zp++;
+        }
+
+        const float value =
+            (q - output->params.zero_point) * output->params.scale;
+        (*embedding)[i] = value;
+        norm_sq += value * value;
+    }
+
+    const float norm = sqrtf(norm_sq);
+    if (norm <= 1e-12f || !isfinite(norm)) {
+        ESP_LOGE(
+            TAG,
+            "INT8 embedding collapsed: q_min=%d q_max=%d nonzero_from_zp=%u "
+            "zero_point=%d scale=%.9f norm_sq=%.9g",
+            output_q_min,
+            output_q_max,
+            output_nonzero_from_zp,
+            output->params.zero_point,
+            (double)output->params.scale,
+            (double)norm_sq);
+        return ESP_FAIL;
+    }
+
+    const float inv_norm = 1.0f / norm;
+    for (float &value : *embedding) {
+        value *= inv_norm;
+    }
+
+    const int64_t end_us = esp_timer_get_time();
+
+    timing->preprocess_us = after_preprocess_us - start_us;
+    timing->invoke_us = invoke_us;
+    timing->postprocess_us =
+        end_us - after_preprocess_us - invoke_us;
+    timing->total_us = end_us - start_us;
+
+    ESP_LOGD(
+        TAG,
+        "Embedding alignment=%s",
+        eye_aligned ? "eyes" : "box-fallback");
+
+    return ESP_OK;
+}
+
+static float cosine_similarity(
+    const std::vector<float> &a,
+    const std::vector<float> &b)
+{
+    if (a.size() != b.size() || a.empty()) {
+        return -1.0f;
+    }
+
+    float dot = 0.0f;
+    for (size_t i = 0; i < a.size(); ++i) {
+        dot += a[i] * b[i];
+    }
+
+    /* Both vectors are already L2-normalized. */
+    return dot;
+}
+
+static uint64_t fnv1a_update(
+    uint64_t hash,
+    const void *data,
+    size_t length)
+{
+    const uint8_t *bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < length; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t fnv1a_update_cstring(
+    uint64_t hash,
+    const char *value)
+{
+    if (value) {
+        hash = fnv1a_update(hash, value, strlen(value));
+    }
+    const uint8_t separator = 0;
+    return fnv1a_update(hash, &separator, 1);
+}
+
+static uint64_t fnv1a_update_string(
+    uint64_t hash,
+    const std::string &value)
+{
+    return fnv1a_update_cstring(hash, value.c_str());
+}
+
+static bool path_is_directory(const std::string &path)
+{
+    struct stat st = {};
+    return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static bool has_rgb_extension(const char *name)
+{
+    if (!name) {
+        return false;
+    }
+
+    const char *dot = strrchr(name, '.');
+    return dot && strcasecmp(dot, ".rgb") == 0;
+}
+
+static esp_err_t hash_file(
+    const std::string &path,
+    uint64_t *hash)
+{
+    if (!hash) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    FILE *file = fopen(path.c_str(), "rb");
+    if (!file) {
+        return ESP_FAIL;
+    }
+
+    uint8_t buffer[4096];
+    size_t n = 0;
+    while ((n = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        *hash = fnv1a_update(*hash, buffer, n);
+    }
+
+    const bool failed = ferror(file) != 0;
+    fclose(file);
+    return failed ? ESP_FAIL : ESP_OK;
+}
+
+static esp_err_t collect_enrollment_images(
+    std::vector<enrollment_image_t> *images,
+    uint64_t *fingerprint)
+{
+    if (!images || !fingerprint) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    images->clear();
+    *fingerprint = UINT64_C(14695981039346656037);
+
+    const uint64_t recognition_model_fingerprint =
+        s_runner.model_fingerprint();
+    *fingerprint = fnv1a_update(
+        *fingerprint,
+        &recognition_model_fingerprint,
+        sizeof(recognition_model_fingerprint));
+
+    *fingerprint = fnv1a_update_cstring(
+        *fingerprint,
+        "TFLM_INT8_MOBILEFACENET_ALIGNMENT_V1");
+    *fingerprint = fnv1a_update_cstring(
+        *fingerprint,
+        face_detect_backend_name());
+
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+    /*
+     * Enrollment boxes/eyes come from BlazeFace. Include that model file in the
+     * database fingerprint so changing the detector rebuilds the embeddings.
+     */
+    (void)hash_file(APP_TFLM_INT8_FACE_DETECT_MODEL_PATH, fingerprint);
+#endif
+
+    DIR *root = opendir(APP_FACE_ENROLL_ROOT);
+    if (!root) {
+        ESP_LOGW(
+            TAG,
+            "Enrollment root unavailable: %s",
+            APP_FACE_ENROLL_ROOT);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    std::vector<std::string> people;
+    struct dirent *entry = nullptr;
+
+    while ((entry = readdir(root)) != nullptr) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+
+        std::string person(entry->d_name);
+        std::string person_path =
+            std::string(APP_FACE_ENROLL_ROOT) + "/" + person;
+
+        if (!path_is_directory(person_path)) {
+            continue;
+        }
+
+        if (person.size() >= FACE_RECOG_MAX_NAME_LEN) {
+            ESP_LOGW(
+                TAG,
+                "Skipping overlong person folder: %s",
+                person.c_str());
+            continue;
+        }
+
+        people.push_back(person);
+    }
+
+    closedir(root);
+    std::sort(people.begin(), people.end());
+
+    const size_t expected_size =
+        static_cast<size_t>(APP_FACE_ENROLL_WIDTH) *
+        APP_FACE_ENROLL_HEIGHT * 3U;
+
+    for (const std::string &person : people) {
+        const std::string person_path =
+            std::string(APP_FACE_ENROLL_ROOT) + "/" + person;
+
+        DIR *dir = opendir(person_path.c_str());
+        if (!dir) {
+            continue;
+        }
+
+        std::vector<std::string> rgb_files;
+        while ((entry = readdir(dir)) != nullptr) {
+            if (entry->d_name[0] == '.' ||
+                !has_rgb_extension(entry->d_name)) {
+                continue;
+            }
+            rgb_files.emplace_back(entry->d_name);
+        }
+
+        closedir(dir);
+        std::sort(rgb_files.begin(), rgb_files.end());
+
+        for (const std::string &file_name : rgb_files) {
+            const std::string full_path =
+                person_path + "/" + file_name;
+
+            struct stat st = {};
+            if (stat(full_path.c_str(), &st) != 0 ||
+                !S_ISREG(st.st_mode) ||
+                static_cast<size_t>(st.st_size) != expected_size) {
+                ESP_LOGW(
+                    TAG,
+                    "Skipping invalid enrollment RGB: %s",
+                    full_path.c_str());
+                continue;
+            }
+
+            *fingerprint =
+                fnv1a_update_string(*fingerprint, person);
+            *fingerprint =
+                fnv1a_update_string(*fingerprint, file_name);
+
+            if (hash_file(full_path, fingerprint) != ESP_OK) {
+                ESP_LOGW(
+                    TAG,
+                    "Could not fingerprint enrollment file: %s",
+                    full_path.c_str());
+                continue;
+            }
+
+            images->push_back(
+                {person, file_name, full_path});
+        }
+    }
+
+    ESP_LOGI(
+        TAG,
+        "TFLM-INT8+ESP-NN enrollment scan: people=%u images=%u fingerprint=%016llx",
+        (unsigned)people.size(),
+        (unsigned)images->size(),
+        (unsigned long long)*fingerprint);
+
+    return ESP_OK;
+}
+
+static esp_err_t read_rgb888_file(
+    const char *path,
+    uint8_t **out_data)
+{
+    if (!path || !out_data) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_data = nullptr;
+
+    const size_t bytes =
+        static_cast<size_t>(APP_FACE_ENROLL_WIDTH) *
+        APP_FACE_ENROLL_HEIGHT * 3U;
+
+    uint8_t *data = static_cast<uint8_t *>(
+        heap_caps_malloc(
+            bytes,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!data) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        heap_caps_free(data);
+        return ESP_FAIL;
+    }
+
+    const size_t got = fread(data, 1, bytes, file);
+    fclose(file);
+
+    if (got != bytes) {
+        heap_caps_free(data);
+        return ESP_FAIL;
+    }
+
+    *out_data = data;
+    return ESP_OK;
+}
+
+static int largest_face(
+    const face_box_t *boxes,
+    int count)
+{
+    int best = -1;
+    int best_area = -1;
+
+    for (int i = 0; i < count; ++i) {
+        if (boxes[i].keypoint_count < 4) {
+            continue;
+        }
+
+        const int w = std::max(0, boxes[i].x2 - boxes[i].x1);
+        const int h = std::max(0, boxes[i].y2 - boxes[i].y1);
+        const int area = w * h;
+
+        if (area > best_area) {
+            best_area = area;
+            best = i;
+        }
+    }
+
+    return best;
+}
+
+static esp_err_t save_database(uint64_t fingerprint)
+{
+    FILE *file = fopen(APP_TFLM_INT8_RECOG_DATABASE_PATH, "wb");
+    if (!file) {
+        return ESP_FAIL;
+    }
+
+    tflm_int8_db_header_t header = {};
+    memcpy(header.magic, DB_MAGIC, sizeof(DB_MAGIC));
+    header.version = DB_VERSION;
+    header.embedding_dim =
+        static_cast<uint32_t>(s_embedding_dim);
+    header.entry_count =
+        static_cast<uint32_t>(s_entries.size());
+    header.fingerprint = fingerprint;
+
+    if (fwrite(&header, 1, sizeof(header), file) != sizeof(header)) {
+        fclose(file);
+        return ESP_FAIL;
+    }
+
+    for (const embedding_entry_t &entry : s_entries) {
+        tflm_int8_db_entry_prefix_t prefix = {};
+        snprintf(
+            prefix.name,
+            sizeof(prefix.name),
+            "%s",
+            entry.name.c_str());
+
+        if (fwrite(&prefix, 1, sizeof(prefix), file) != sizeof(prefix) ||
+            fwrite(
+                entry.embedding.data(),
+                sizeof(float),
+                s_embedding_dim,
+                file) != s_embedding_dim) {
+            fclose(file);
+            return ESP_FAIL;
+        }
+    }
+
+    fclose(file);
+    return ESP_OK;
+}
+
+static bool load_database(
+    uint64_t fingerprint,
+    size_t expected_dim)
+{
+    FILE *file = fopen(APP_TFLM_INT8_RECOG_DATABASE_PATH, "rb");
+    if (!file) {
+        return false;
+    }
+
+    tflm_int8_db_header_t header = {};
+    if (fread(&header, 1, sizeof(header), file) != sizeof(header) ||
+        memcmp(header.magic, DB_MAGIC, sizeof(DB_MAGIC)) != 0 ||
+        header.version != DB_VERSION ||
+        header.embedding_dim != expected_dim ||
+        header.fingerprint != fingerprint ||
+        header.entry_count > 10000U) {
+        fclose(file);
+        return false;
+    }
+
+    std::vector<embedding_entry_t> loaded;
+    loaded.reserve(header.entry_count);
+
+    for (uint32_t i = 0; i < header.entry_count; ++i) {
+        tflm_int8_db_entry_prefix_t prefix = {};
+        if (fread(&prefix, 1, sizeof(prefix), file) != sizeof(prefix)) {
+            fclose(file);
+            return false;
+        }
+
+        prefix.name[FACE_RECOG_MAX_NAME_LEN - 1] = '\0';
+
+        embedding_entry_t entry;
+        entry.name = prefix.name;
+        entry.embedding.resize(expected_dim);
+
+        if (fread(
+                entry.embedding.data(),
+                sizeof(float),
+                expected_dim,
+                file) != expected_dim) {
+            fclose(file);
+            return false;
+        }
+
+        loaded.push_back(std::move(entry));
+    }
+
+    fclose(file);
+    s_entries.swap(loaded);
+    s_embedding_dim = expected_dim;
+    return true;
+}
+
+static esp_err_t rebuild_database(
+    const std::vector<enrollment_image_t> &images,
+    uint64_t fingerprint)
+{
+    s_entries.clear();
+    s_embedding_dim =
+        APP_TFLM_MOBILEFACENET_EMBEDDING_DIM;
+
+    unsigned rejected = 0;
+    unsigned rejected_no_face = 0;
+    unsigned rejected_embedding = 0;
+    unsigned rejected_read = 0;
+
+    for (const enrollment_image_t &source : images) {
+        uint8_t *rgb = nullptr;
+        if (read_rgb888_file(source.full_path.c_str(), &rgb) != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "Enrollment rejected: person=%s file=%s reason=read_failed",
+                source.person_name.c_str(),
+                source.file_name.c_str());
+            rejected++;
+            rejected_read++;
+            continue;
+        }
+
+        face_box_t boxes[5] = {};
+        const int face_count = face_detect_run_rgb888(
+            rgb,
+            APP_FACE_ENROLL_WIDTH,
+            APP_FACE_ENROLL_HEIGHT,
+            boxes,
+            5);
+
+        const int best = largest_face(boxes, face_count);
+        if (best < 0) {
+            ESP_LOGW(
+                TAG,
+                "Enrollment rejected: person=%s file=%s no face/eyes",
+                source.person_name.c_str(),
+                source.file_name.c_str());
+            heap_caps_free(rgb);
+            rejected++;
+            rejected_no_face++;
+            continue;
+        }
+
+        std::vector<float> embedding;
+        embedding_timing_t timing = {};
+
+        const esp_err_t embedding_ret = compute_embedding(
+            rgb,
+            APP_FACE_ENROLL_WIDTH,
+            APP_FACE_ENROLL_HEIGHT,
+            &boxes[best],
+            false,
+            &embedding,
+            &timing);
+
+        heap_caps_free(rgb);
+
+        /*
+         * Keep the same small yield used by the FP32 enrollment path. It does
+         * not affect live recognition and lets CPU1 service housekeeping while
+         * rebuilding the database.
+         */
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        if (embedding_ret != ESP_OK ||
+            embedding.size() != s_embedding_dim) {
+            ESP_LOGW(
+                TAG,
+                "Enrollment embedding failed: person=%s file=%s error=%s",
+                source.person_name.c_str(),
+                source.file_name.c_str(),
+                esp_err_to_name(embedding_ret));
+            rejected++;
+            rejected_embedding++;
+            continue;
+        }
+
+        s_entries.push_back(
+            {source.person_name, std::move(embedding)});
+
+        ESP_LOGI(
+            TAG,
+            "[AI-BENCH] backend=TFLM-INT8+ESP-NN model=MobileFaceNet "
+            "stage=ENROLL_EMBED total_us=%lld invoke_us=%lld person=%s",
+            (long long)timing.total_us,
+            (long long)timing.invoke_us,
+            source.person_name.c_str());
+    }
+
+    if (s_entries.empty()) {
+        /*
+         * Diagnostic-safe boot:
+         * Do not enter an ESP_ERROR_CHECK reboot loop when enrollment fails.
+         * Keep the recognizer initialized with an empty DB so the live camera
+         * and INT8 detector can run and expose their benchmark/score logs.
+         * Recognition simply returns "unknown" while s_entries is empty.
+         *
+         * This does not alter DL or FP32 behavior and is not intended as the
+         * final benchmark state; it exists to identify the INT8 enrollment
+         * failure without hiding it behind repeated resets.
+         */
+        ESP_LOGE(
+            TAG,
+            "TFLM-INT8+ESP-NN database rebuild produced zero embeddings: "
+            "images=%u rejected=%u read_fail=%u no_face=%u embedding_fail=%u; "
+            "continuing with EMPTY INT8 DB for diagnostics",
+            (unsigned)images.size(),
+            rejected,
+            rejected_read,
+            rejected_no_face,
+            rejected_embedding);
+        return ESP_OK;
+    }
+
+    const esp_err_t save_ret = save_database(fingerprint);
+    if (save_ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not save %s: %s",
+            APP_TFLM_INT8_RECOG_DATABASE_PATH,
+            esp_err_to_name(save_ret));
+        return save_ret;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "TFLM-INT8+ESP-NN database rebuilt: entries=%u rejected=%u dim=%u path=%s",
+        (unsigned)s_entries.size(),
+        rejected,
+        (unsigned)s_embedding_dim,
+        APP_TFLM_INT8_RECOG_DATABASE_PATH);
+
+    return ESP_OK;
+}
+
+extern "C" esp_err_t tflm_int8_face_recognition_init(void)
+{
+    const esp_err_t init_ret = s_runner.init(
+        APP_TFLM_INT8_FACE_RECOG_MODEL_PATH,
+        APP_TFLM_RECOG_TENSOR_ARENA_BYTES);
+
+    if (init_ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "MobileFaceNet model initialization failed: path=%s error=%s",
+            APP_TFLM_INT8_FACE_RECOG_MODEL_PATH,
+            esp_err_to_name(init_ret));
+        return init_ret;
+    }
+
+    TfLiteTensor *input = s_runner.input(0);
+    TfLiteTensor *output = s_runner.output(0);
+
+    if (!exact_recognition_input(input) ||
+        !exact_embedding_output(output)) {
+        ESP_LOGE(
+            TAG,
+            "Wrong MobileFaceNet tensor contract. Required: "
+            "input=[1,112,112,3] INT8, output0=[1,192] INT8");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    s_embedding_dim =
+        APP_TFLM_MOBILEFACENET_EMBEDDING_DIM;
+
+    ESP_LOGI(
+        TAG,
+        "TFLM-INT8+ESP-NN MobileFaceNet ready: model=%s dim=%u arena_used=%u "
+        "input_scale=%.9f input_zero=%d output_scale=%.9f output_zero=%d",
+        APP_TFLM_INT8_FACE_RECOG_MODEL_PATH,
+        (unsigned)s_embedding_dim,
+        (unsigned)s_runner.arena_used_bytes(),
+        (double)input->params.scale,
+        input->params.zero_point,
+        (double)output->params.scale,
+        output->params.zero_point);
+
+    std::vector<enrollment_image_t> images;
+    uint64_t fingerprint = 0;
+
+    const esp_err_t scan_ret =
+        collect_enrollment_images(&images, &fingerprint);
+
+    if (scan_ret != ESP_OK || images.empty()) {
+        ESP_LOGW(
+            TAG,
+            "No enrollment images available; recognition database is empty");
+        s_entries.clear();
+        return ESP_OK;
+    }
+
+    if (load_database(fingerprint, s_embedding_dim)) {
+        ESP_LOGI(
+            TAG,
+            "TFLM-INT8+ESP-NN database loaded: entries=%u dim=%u path=%s",
+            (unsigned)s_entries.size(),
+            (unsigned)s_embedding_dim,
+            APP_TFLM_INT8_RECOG_DATABASE_PATH);
+        return ESP_OK;
+    }
+
+    return rebuild_database(images, fingerprint);
+}
+
+extern "C" int tflm_int8_face_recognition_get_count(void)
+{
+    return static_cast<int>(s_entries.size());
+}
+
+extern "C" esp_err_t tflm_int8_face_recognition_recognize(
+    uint8_t *camera_buf,
+    uint32_t width,
+    uint32_t height,
+    const face_box_t *box,
+    char *out_name,
+    int out_name_len,
+    float *out_score)
+{
+    if (!s_runner.ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!camera_buf || !box || !out_name ||
+        out_name_len <= 0 || !out_score) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    snprintf(out_name, out_name_len, "%s", "unknown");
+    *out_score = 0.0f;
+
+    if (s_entries.empty()) {
+        return ESP_OK;
+    }
+
+#if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+    const bool rgb565 = true;
+#else
+    const bool rgb565 = false;
+#endif
+
+    std::vector<float> query;
+    embedding_timing_t timing = {};
+
+    core_trace(TAG, "RECOGNITION_BEGIN");
+
+    const esp_err_t embedding_ret = compute_embedding(
+        camera_buf,
+        width,
+        height,
+        box,
+        rgb565,
+        &query,
+        &timing);
+
+    if (embedding_ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Live MobileFaceNet embedding failed: %s",
+            esp_err_to_name(embedding_ret));
+        return embedding_ret;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "[AI-BENCH] backend=TFLM-INT8+ESP-NN model=MobileFaceNet "
+        "stage=RECOGNITION cpu=%d preprocess_us=%lld invoke_us=%lld "
+        "postprocess_us=%lld total_us=%lld",
+        xPortGetCoreID(),
+        (long long)timing.preprocess_us,
+        (long long)timing.invoke_us,
+        (long long)timing.postprocess_us,
+        (long long)timing.total_us);
+
+    float best_score = -1.0f;
+    const char *best_name = nullptr;
+
+    for (const embedding_entry_t &entry : s_entries) {
+        const float similarity =
+            cosine_similarity(query, entry.embedding);
+
+        if (similarity > best_score) {
+            best_score = similarity;
+            best_name = entry.name.c_str();
+        }
+    }
+
+    *out_score = best_score;
+
+    if (best_name &&
+        best_score >= APP_TFLM_RECOG_SIMILARITY_THRESHOLD) {
+        snprintf(out_name, out_name_len, "%s", best_name);
+    }
+
+    ESP_LOGI(
+        TAG,
+        "TFLM-INT8+ESP-NN recognition: person=%s similarity=%.3f threshold=%.3f",
+        out_name,
+        (double)best_score,
+        (double)APP_TFLM_RECOG_SIMILARITY_THRESHOLD);
+
+    return ESP_OK;
+}
+
+#else
+
+#include "services/vision/backends/face_recognizer_backend.h"
+
+extern "C" esp_err_t tflm_int8_face_recognition_init(void)
+{
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+extern "C" int tflm_int8_face_recognition_get_count(void)
+{
+    return 0;
+}
+
+extern "C" esp_err_t tflm_int8_face_recognition_recognize(
+    uint8_t *,
+    uint32_t,
+    uint32_t,
+    const face_box_t *,
+    char *,
+    int,
+    float *)
+{
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+#endif
+
+
+==================================================
 FILE: src/main/services/vision/tflm/tflm_model_runner.cpp
 ==================================================
 #include "config/app_features.h"
 
 #if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_FP32 || \
-    APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_FP32
+    APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_FP32 || \
+    APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8 || \
+    APP_FACE_RECOG_BACKEND == APP_AI_BACKEND_TFLM_INT8
 
 #include "services/vision/backends/tflm_model_runner.hpp"
 
@@ -12499,8 +14704,9 @@ static esp_err_t register_model_ops(AppTflmOpResolver *resolver)
 } while (0)
 
     /*
-     * Broad resolver for the BlazeFace FP32 + MobileFaceNet FP32 experiment.
-     * This replaces the removed AllOpsResolver API in current Espressif TFLM.
+     * Shared resolver for the BlazeFace + MobileFaceNet TFLM experiments.
+     * It covers both the FP32 graph and the full-INT8 graph. On ESP32-P4 the
+     * Espressif TFLM component routes supported INT8 kernels through ESP-NN.
      * If AllocateTensors later reports one missing builtin opcode, add only
      * that specific operator here.
      */

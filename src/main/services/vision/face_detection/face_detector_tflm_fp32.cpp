@@ -563,13 +563,13 @@ static int run_common(
 extern "C" esp_err_t tflm_fp32_face_detect_init(void)
 {
     const esp_err_t ret = s_runner.init(
-        APP_TFLM_FACE_DETECT_MODEL_PATH,
+        APP_TFLM_FP32_FACE_DETECT_MODEL_PATH,
         APP_TFLM_DETECT_TENSOR_ARENA_BYTES);
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
             "BlazeFace model initialization failed: path=%s error=%s",
-            APP_TFLM_FACE_DETECT_MODEL_PATH,
+            APP_TFLM_FP32_FACE_DETECT_MODEL_PATH,
             esp_err_to_name(ret));
         return ret;
     }
@@ -592,7 +592,7 @@ extern "C" esp_err_t tflm_fp32_face_detect_init(void)
     ESP_LOGI(
         TAG,
         "TFLM-FP32 BlazeFace ready: model=%s arena_used=%u",
-        APP_TFLM_FACE_DETECT_MODEL_PATH,
+        APP_TFLM_FP32_FACE_DETECT_MODEL_PATH,
         (unsigned)s_runner.arena_used_bytes());
 
     return ESP_OK;

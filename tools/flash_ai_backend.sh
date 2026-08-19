@@ -1,53 +1,175 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$TOOLS_DIR/.." && pwd)"
-SRC_DIR="$PROJECT_ROOT/src"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+IDF_PROJECT="$PROJECT_ROOT/src"
 
-BACKEND="${1:-}"
-PORT="${2:-}"
+MODE="${1:-}"
+PORT="${2:-/dev/ttyACM0}"
 
-if [[ -z "$BACKEND" ]]; then
-    cat <<'EOF'
-Usage:
-  ./tools/flash_ai_backend.sh espdl /dev/ttyACM0
-  ./tools/flash_ai_backend.sh tflm-fp32 /dev/ttyACM0
+case "$MODE" in
+    dl|espdl|esp-dl)
+        CANONICAL="espdl"
+        LABEL="ESP-DL S8"
+        ;;
+    fp32|tflm|tflm-fp32)
+        CANONICAL="tflm-fp32"
+        LABEL="TFLM-FP32"
+        ;;
+    nn|int8|esp-nn|tflm-int8|tflm-int8-espnn)
+        CANONICAL="tflm-int8"
+        LABEL="TFLM-INT8 + ESP-NN"
+        ;;
+    *)
+        echo "Usage: $0 {dl|fp32|nn} [PORT]"
+        echo "Example: $0 nn /dev/ttyACM0"
+        exit 2
+        ;;
+esac
 
-The port is optional. If omitted, ESP-IDF will try to detect it.
-EOF
-    exit 2
+if [[ ! -f "$IDF_PROJECT/CMakeLists.txt" ]]; then
+    echo "[ERROR] ESP-IDF project not found:"
+    echo "  $IDF_PROJECT/CMakeLists.txt"
+    exit 1
 fi
 
-"$TOOLS_DIR/select_ai_backend.sh" "$BACKEND"
+"$SCRIPT_DIR/select_ai_backend.sh" "$CANONICAL"
 
+# The device reads the models from /sdcard. If the same card is mounted on the
+# host, validate the files before flashing. If it is already inside the board,
+# this host-side check is skipped and the firmware validates the tensor contract
+# at boot.
+HOST_SD="${APP_HOST_SD_ROOT:-/media/${USER}/SDCARD}"
+
+check_model() {
+    local path="$1"
+    local expected_sha="$2"
+
+    if [[ ! -f "$path" ]]; then
+        echo "[ERROR] Required model missing: $path"
+        return 1
+    fi
+
+    local actual
+    actual="$(sha256sum "$path" | awk '{print $1}')"
+    echo "  $(basename "$path")  $actual"
+
+    if [[ -n "$expected_sha" && "$actual" != "$expected_sha" ]]; then
+        echo "[ERROR] Model hash does not match the validated model."
+        echo "        expected: $expected_sha"
+        echo "        actual  : $actual"
+        return 1
+    fi
+}
+
+if [[ -d "$HOST_SD/models" ]]; then
+    echo
+    echo "========== SD MODEL CHECK =========="
+    case "$CANONICAL" in
+        tflm-fp32)
+            check_model "$HOST_SD/models/FDET32.TFL" \
+                "7493838b71715d96ef235ce6e3fc41f6b8feefb54214ec4c0bbf459fd6778bb7"
+            check_model "$HOST_SD/models/FREC.TFL" \
+                "be4bc7cfc53f7bc336d0f28b1ab92535f618c913a422b683210750f6b5354854"
+            ;;
+        tflm-int8)
+            check_model "$HOST_SD/models/FDET8.TFL" \
+                "d17bbb42ac96992b2e069d18c13013f9dbe9fd89c40ef5a3a6a05fb2b221497f"
+            check_model "$HOST_SD/models/FREC8.TFL" \
+                "83a8e78a434580bec16ae30a4c336d8f39a249a46d55521250ed94b5dcc260c3"
+            ;;
+        espdl)
+            echo "ESP-DL models are supplied by the Espressif components."
+            ;;
+    esac
+else
+    echo
+    echo "[INFO] Host SD card is not mounted at $HOST_SD."
+    echo "       Continuing; the firmware will read /sdcard on the ESP32-P4."
+fi
+
+# Preserve the established common power/scheduling policy for every backend.
+echo
+echo "========== COMMON POLICY CHECK =========="
+grep -Eq '^#define[[:space:]]+APP_CPU_MAX_FREQ_MHZ[[:space:]]+360([[:space:]]|$)' \
+    "$PROJECT_ROOT/src/main/include/config/app_config.h"
+grep -Eq '^#define[[:space:]]+APP_CPU_ACTIVE_FREQ_MHZ[[:space:]]+180([[:space:]]|$)' \
+    "$PROJECT_ROOT/src/main/include/config/app_config.h"
+grep -q 'xSemaphoreTake(ai_inference_mutex' \
+    "$PROJECT_ROOT/src/main/app/app_main.c"
+grep -q 'cpu_power_face_boost_begin' \
+    "$PROJECT_ROOT/src/main/app/app_main.c"
+grep -q 'face_detect_run_rgb' \
+    "$PROJECT_ROOT/src/main/app/app_main.c"
+grep -q 'face_recognition_recognize' \
+    "$PROJECT_ROOT/src/main/app/app_main.c"
+
+echo "  baseline CPU       : 180 MHz"
+echo "  AI high-performance: 360 MHz"
+echo "  DET -> REC mutex   : present"
+echo "  sleep/PIN pipeline : shared app_main path"
+
+# Load ESP-IDF 5.5.4 when idf.py is not already in the shell environment.
 if ! command -v idf.py >/dev/null 2>&1; then
     IDF_EXPORT="${IDF_EXPORT:-$HOME/esp/esp-idf-v5.5.4/export.sh}"
     if [[ ! -f "$IDF_EXPORT" ]]; then
-        echo "[ERROR] idf.py is not in PATH and ESP-IDF export script was not found:"
-        echo "        $IDF_EXPORT"
-        echo "Set IDF_EXPORT=/path/to/esp-idf/export.sh and run again."
+        echo "[ERROR] idf.py is unavailable and ESP-IDF export script was not found:"
+        echo "  $IDF_EXPORT"
         exit 1
     fi
-
     # shellcheck disable=SC1090
     source "$IDF_EXPORT"
 fi
 
-cd "$SRC_DIR"
+cd "$IDF_PROJECT"
 
+# For the true NN case, refuse to silently benchmark an unoptimized build.
+if [[ "$CANONICAL" == "tflm-int8" ]]; then
+    if [[ ! -f sdkconfig ]] || ! grep -q '^CONFIG_NN_OPTIMIZED=y' sdkconfig; then
+        echo "[ERROR] CONFIG_NN_OPTIMIZED=y is required for the nn backend."
+        echo "        Current project: $IDF_PROJECT/sdkconfig"
+        exit 1
+    fi
+fi
+
+echo
 echo "============================================================"
-echo " Flashing AI backend: $BACKEND"
+echo " ESP32-P4 AI build / flash"
+echo "============================================================"
+echo "Backend : $LABEL"
+echo "Port    : $PORT"
+echo "Project : $IDF_PROJECT"
 echo "============================================================"
 
-# Full clean is deliberate: the backend is a compile-time choice and A/B
-# measurements should never reuse stale objects from the other backend.
-idf.py fullclean
 idf.py reconfigure
 idf.py build
 
-if [[ -n "$PORT" ]]; then
-    idf.py -p "$PORT" flash monitor
-else
-    idf.py flash monitor
+if [[ "$CANONICAL" == "tflm-int8" ]]; then
+    map_file="$(find build -maxdepth 1 -type f -name '*.map' -print -quit)"
+    if [[ -z "$map_file" ]]; then
+        echo "[ERROR] Build map not found; cannot verify ESP-NN linkage."
+        exit 1
+    fi
+
+    if ! grep -q 'esp-nn' "$map_file"; then
+        echo "[ERROR] INT8 build completed but esp-nn was not found in:"
+        echo "  $map_file"
+        exit 1
+    fi
+
+    echo
+    echo "[OK] ESP-NN linkage found in $(basename "$map_file")"
 fi
+
+idf.py -p "$PORT" flash
+
+if [[ "${NO_MONITOR:-0}" == "1" ]]; then
+    echo
+    echo "[OK] Flash complete. Monitor skipped because NO_MONITOR=1."
+    exit 0
+fi
+
+echo
+echo "Starting monitor. Press Ctrl+] to exit."
+exec idf.py -p "$PORT" monitor
