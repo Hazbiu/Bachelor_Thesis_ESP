@@ -11,9 +11,18 @@ idf_component_register(
         # Camera platform
         "platform/camera/video_capture.c"
 
-        # Vision services
+        # Vision public dispatchers
         "services/vision/face_detection/face_detector.cpp"
         "services/vision/face_recognition/face_recognizer.cpp"
+
+        # ESP-DL reference backend
+        "services/vision/face_detection/face_detector_espdl.cpp"
+        "services/vision/face_recognition/face_recognizer_espdl.cpp"
+
+        # TensorFlow Lite Micro FP32 comparison backend
+        "services/vision/tflm/tflm_model_runner.cpp"
+        "services/vision/face_detection/face_detector_tflm_fp32.cpp"
+        "services/vision/face_recognition/face_recognizer_tflm_fp32.cpp"
 
         # Power management and sleep modes
         "power/app_sleep.c"

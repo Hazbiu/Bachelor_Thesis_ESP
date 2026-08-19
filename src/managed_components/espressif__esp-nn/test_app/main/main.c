@@ -84,6 +84,7 @@ void app_main()
     print_profile("fc_s8");
     esp_nn_fully_connected_per_ch_s8_test();
     print_profile("fc_per_ch_s8");
+    esp_nn_fully_connected_align_s8_test();
     esp_nn_softmax_s8_test();
     print_profile("softmax_s8");
     esp_nn_hard_swish_s8_test();

@@ -4,8 +4,18 @@ dependencies:
   esp_video:
     version: 0.8.*
     public: true
+
   waveshare/esp32_p4_platform: '*'
+
+  # ESP-DL reference backend
   espressif/esp-dl: ^3.3.5
   espressif/human_face_detect: ^0.4.2
   espressif/human_face_recognition: '*'
-  espressif/esp-nn: '*'
+
+  # TensorFlow Lite Micro comparison backend.
+  # The selected BlazeFace and MobileFaceNet files are FP32 models.
+  espressif/esp-tflite-micro: ^1.3.7
+
+  # Kept available for a later true INT8/ESP-NN experiment.
+  # The FP32 backend in this update must not be described as an ESP-NN benchmark.
+  espressif/esp-nn: '>=1.1.1'

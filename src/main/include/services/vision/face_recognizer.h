@@ -12,9 +12,14 @@ extern "C" {
 #define FACE_RECOG_MAX_NAME_LEN 32
 
 /*
- * Initializes recognition from one shared /sdcard/FACE.DB database.
- * The database is rebuilt automatically when the RGB enrollment dataset under
- * /sdcard/enroll/<person-name>/ changes.
+ * Public recognition API used by app_main.c.
+ *
+ * ESP-DL backend:
+ *   keeps the existing /sdcard/FACE.DB behavior.
+ *
+ * TFLM-FP32 backend:
+ *   uses /sdcard/FACE_TFLM_FP32.DB and the same RGB enrollment folders under
+ *   /sdcard/enroll/<person-name>/.
  */
 esp_err_t face_recognition_init(void);
 
@@ -29,6 +34,7 @@ esp_err_t face_recognition_recognize(
 );
 
 int face_recognition_get_count(void);
+const char *face_recognition_backend_name(void);
 
 #ifdef __cplusplus
 }

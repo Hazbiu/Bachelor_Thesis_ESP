@@ -181,7 +181,12 @@ static void conv_1x1_batch16(const int8_t *pixel_ptrs[16],
             "mv     s7,  %[cnt]                  \n\t"  /* in_ch count */
             "1:                                  \n\t"
             "esp.vld.128.ip  q0, x30, 16         \n\t"  /* load 16 pixel values, advance by 16 */
-            "esp.vldbc.8.ip  q1, x31, 1          \n\t"  /* broadcast filter[ch], advance by 1 */
+            /* Broadcast filter[ch], then advance the filter pointer by 1 byte
+             * with a separate addi. The fused "esp.vldbc.8.ip q1, x31, 1" is
+             * valid but some assemblers reject a step-1 immediate (their range
+             * check assumes a 4-byte step), so use the step-0 form + addi. */
+            "esp.vldbc.8.ip  q1, x31, 0          \n\t"
+            "addi   x31, x31, 1                  \n\t"
             "esp.vmulas.s8.qacc q0, q1           \n\t"
             "addi   s7, s7, -1                   \n\t"
             "bnez   s7, 1b                       \n\t"

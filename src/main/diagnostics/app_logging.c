@@ -64,6 +64,9 @@ void app_logging_init(void)
 #if APP_LOG_ENABLE_AI
     ENABLE_INFO("face_detect_wrapper");
     ENABLE_INFO("face_recognition_wrapper");
+    ENABLE_INFO("face_detect_tflm_fp32");
+    ENABLE_INFO("face_recog_tflm_fp32");
+    ENABLE_INFO("tflm_model_runner");
     ENABLE_INFO("FbsLoader");
     ENABLE_INFO("dl::Model");
 #endif

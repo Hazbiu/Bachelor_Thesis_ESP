@@ -17,6 +17,7 @@ typedef struct {
     int keypoint_count;
 } face_box_t;
 
+/* Public API used by app_main.c. The selected backend is hidden underneath. */
 esp_err_t face_detect_init(void);
 
 int face_detect_run_rgb565(
@@ -34,6 +35,8 @@ int face_detect_run_rgb888(
     face_box_t *boxes,
     int max_boxes
 );
+
+const char *face_detect_backend_name(void);
 
 #ifdef __cplusplus
 }

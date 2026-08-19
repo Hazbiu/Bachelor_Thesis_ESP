@@ -172,8 +172,10 @@ void esp_nn_avg_pool_s8_esp32s3(const int8_t *input,
  * @note        inputs type: int8_t, output: int8_t
  *              input offsets: although int32_t, they are contained in 8 bits [-128, 127]
  *
- *              Current version works only on aligned input.
- *              row_len and channels should both be multiple of 8.
+ *              Any row_len and out_channels are accepted, and input_data and
+ *              filter_data may be arbitrarily aligned. Alignment and remainders
+ *              only select which internal path runs, not whether the result is
+ *              correct.
  */
 void esp_nn_fully_connected_s8_esp32s3(const int8_t *input_data,
                                        const int32_t input_offset,
@@ -196,8 +198,10 @@ void esp_nn_fully_connected_s8_esp32s3(const int8_t *input_data,
  *              input offsets: although int32_t, they are contained in 8 bits [-128, 127]
  *              out_mult, out_shift: int32_t* containing per-channel data
  *
- *              Current version works only on aligned input.
- *              row_len and channels should both be multiple of 8.
+ *              Any row_len and out_channels are accepted, and input_data and
+ *              filter_data may be arbitrarily aligned. Alignment and remainders
+ *              only select which internal path runs, not whether the result is
+ *              correct.
  */
 void esp_nn_fully_connected_per_ch_s8_esp32s3(const int8_t *input_data,
                                        const int32_t input_offset,
