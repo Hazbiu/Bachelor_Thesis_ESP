@@ -316,13 +316,8 @@ esp_err_t component_display_disable_for_deep_sleep(void)
     esp_err_t ret = ESP_OK;
 
     /*
-     * 1. Optional GPIO backlight hold.
-     *
-     * The stock ESP32-P4-NANO BSP intentionally defines BSP_LCD_BACKLIGHT as
-     * GPIO_NUM_NC and controls brightness through the display-side I2C device
-     * instead. Therefore no GPIO hold is required on the stock board; the BSP
-     * display shutdown has already switched the backlight off before this
-     * component-level cleanup runs.
+     * 1. Backlight first. The panel driver may still hold charge; removing the
+     *    backlight enable is the single largest display-side saving.
      */
 #if APP_PWR_DISPLAY_BACKLIGHT_GPIO >= 0
     ret = drive_and_hold(
@@ -336,9 +331,10 @@ esp_err_t component_display_disable_for_deep_sleep(void)
         first_error = ret;
     }
 #else
-    ESP_LOGI(TAG,
-             "No dedicated backlight GPIO on ESP32-P4-NANO; "
-             "BSP I2C backlight control already handled display-off");
+    ESP_LOGW(TAG,
+             "APP_PWR_DISPLAY_BACKLIGHT_GPIO is unset; the backlight-enable "
+             "pad is left floating during Deep-sleep. Fill it in from the "
+             "Waveshare schematic.");
 #endif
 
     /*

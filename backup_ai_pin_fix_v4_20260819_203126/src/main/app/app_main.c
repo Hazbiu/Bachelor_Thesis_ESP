@@ -402,14 +402,6 @@ typedef struct {
 static uint8_t *ai_snapshot_buffer = NULL;
 static size_t ai_snapshot_capacity = 0;
 static TaskHandle_t ai_worker_task_handle = NULL;
-/*
- * Serialize the complete detector -> recognizer inference chain.
- *
- * Both AI backends (ESP-DL and TFLM-FP32) enter through the same public
- * face_detect_* / face_recognition_* APIs below, so one mutex guarantees that
- * detector and recognizer can never overlap or be invoked out of order.
- */
-static SemaphoreHandle_t ai_inference_mutex = NULL;
 static portMUX_TYPE ai_worker_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE ai_result_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool ai_job_pending = false;
@@ -624,14 +616,8 @@ static void camera_resume_task(void *arg)
         return;
     }
 
-    /*
-     * The camera stream is genuinely stopped for the PIN screen. Restore LVGL
-     * ownership first, then restart capture while authentication still blocks
-     * frame callbacks. Only after the stream is healthy do we reopen the
-     * camera/display path to normal frames.
-     */
     pin_screen_hide();
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(30));
 
     esp_err_t ret = esp_lv_adapter_set_dummy_draw(disp, true);
     if (ret != ESP_OK) {
@@ -644,19 +630,8 @@ static void camera_resume_task(void *arg)
     }
 
     ai_results_clear();
-    display_buffer_index = 0;
-    dummy_draw_enabled = true;
 
-    ret = app_video_stream_task_restart(video_cam_fd0);
-    if (ret != ESP_OK) {
-        dummy_draw_enabled = false;
-        ESP_LOGE(TAG,
-                 "Could not restart camera after PIN screen: %s",
-                 esp_err_to_name(ret));
-        xSemaphoreGive(display_mode_mutex);
-        vTaskDelete(NULL);
-        return;
-    }
+    dummy_draw_enabled = true;
 
     portENTER_CRITICAL(&authentication_state_lock);
     pin_transition_pending = false;
@@ -666,7 +641,7 @@ static void camera_resume_task(void *arg)
     app_sleep_notify_face_detected();
     xSemaphoreGive(display_mode_mutex);
 
-    ESP_LOGI(TAG, "PIN accepted; camera stream and display mode restored");
+    ESP_LOGI(TAG, "PIN accepted; camera display mode restored");
     vTaskDelete(NULL);
 }
 
@@ -711,32 +686,11 @@ static void pin_screen_transition_task(void *arg)
         return;
     }
 
-    /*
-     * Stop the actual V4L2 stream for the PIN screen instead of merely ignoring
-     * frame callbacks. This removes camera/ISP work while LVGL handles touch
-     * input and prevents an old camera framebuffer/face box from being scanned
-     * out underneath the PIN UI.
-     */
-    esp_err_t ret = app_video_stream_task_stop(video_cam_fd0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "Could not pause camera for PIN screen: %s",
-                 esp_err_to_name(ret));
-        authentication_mark_transition_failed();
-        xSemaphoreGive(display_mode_mutex);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ai_results_clear();
-    display_buffer_index = 0;
-
-    ret = esp_lv_adapter_set_dummy_draw(disp, false);
+    esp_err_t ret = esp_lv_adapter_set_dummy_draw(disp, false);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG,
                  "Could not enable LVGL PIN-screen mode: %s",
                  esp_err_to_name(ret));
-        (void)app_video_stream_task_restart(video_cam_fd0);
         authentication_mark_transition_failed();
         xSemaphoreGive(display_mode_mutex);
         vTaskDelete(NULL);
@@ -744,6 +698,7 @@ static void pin_screen_transition_task(void *arg)
     }
 
     dummy_draw_enabled = false;
+    vTaskDelay(pdMS_TO_TICKS(30));
 
     ret = pin_screen_show(pending_identity, pin_accepted_callback, NULL);
     if (ret != ESP_OK) {
@@ -752,7 +707,6 @@ static void pin_screen_transition_task(void *arg)
         esp_err_t restore_ret = esp_lv_adapter_set_dummy_draw(disp, true);
         if (restore_ret == ESP_OK) {
             dummy_draw_enabled = true;
-            (void)app_video_stream_task_restart(video_cam_fd0);
         } else {
             ESP_LOGE(TAG,
                      "Could not recover camera display mode: %s",
@@ -770,33 +724,18 @@ static void pin_screen_transition_task(void *arg)
     pin_screen_active = true;
     portEXIT_CRITICAL(&authentication_state_lock);
 
-    /*
-     * pin_screen_show() performs a synchronous full-screen LVGL refresh before
-     * returning. Keep the 360 MHz AI boost through that refresh, then return to
-     * the normal 180 MHz baseline exactly as before.
-     */
+    /* The requested high-performance window ends once the PIN UI is visible. */
     const esp_err_t boost_release_ret =
-        face_boost_release("PIN screen fully rendered");
+        face_boost_release("PIN screen visible");
 
     xSemaphoreGive(display_mode_mutex);
     ESP_LOGI(
         TAG,
-        "Camera stream paused; PIN screen is active; CPU baseline release=%s",
+        "Camera paused; PIN screen is active; CPU baseline release=%s",
         esp_err_to_name(boost_release_ret));
     vTaskDelete(NULL);
 }
 
-/*
- * Reserve the authentication transition and copy the identity only.
- *
- * The AI worker deliberately launches the PIN task AFTER releasing the AI
- * inference mutex. That creates a strict ordering:
- *
- *     detector -> recognizer -> unlock AI -> PIN transition
- *
- * and prevents the high-priority PIN task from pre-empting the recognizer
- * while the detector/recognizer chain still owns the inference lock.
- */
 static bool authentication_request_pin(const char *recognized_name)
 {
     if (!recognized_name || recognized_name[0] == '\0' ||
@@ -830,11 +769,6 @@ static bool authentication_request_pin(const char *recognized_name)
     memcpy(pending_identity, recognized_name, identity_length);
     pending_identity[identity_length] = '\0';
 
-    return true;
-}
-
-static bool authentication_launch_pin_transition(void)
-{
     BaseType_t created = xTaskCreatePinnedToCore(
         pin_screen_transition_task,
         "pin_screen",
@@ -852,6 +786,7 @@ static bool authentication_launch_pin_transition(void)
 
     return true;
 }
+
 
 static size_t ai_snapshot_bytes_per_pixel(void)
 {
@@ -1120,31 +1055,6 @@ static void ai_worker_task(void *arg)
             continue;
         }
 
-        /*
-         * One mutex owns the complete detector -> recognizer chain. The shared
-         * public APIs below dispatch to either ESP-DL or TFLM-FP32, therefore
-         * this ordering and high-performance policy applies identically to both
-         * backend selections.
-         */
-        if (ai_inference_mutex == NULL ||
-            xSemaphoreTake(ai_inference_mutex, portMAX_DELAY) != pdTRUE) {
-            ESP_LOGE(TAG, "Could not acquire AI inference mutex");
-            ai_worker_mark_idle();
-            continue;
-        }
-
-        /*
-         * Request 360 MHz BEFORE the detector starts. The previous code waited
-         * for a positive detection before boosting, which meant the detector
-         * itself ran at the 180 MHz baseline. Keep the same PM lock through the
-         * recognizer when recognition follows.
-         */
-        esp_err_t boost_ret = cpu_power_face_boost_begin();
-        if (boost_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Could not request AI high-performance CPU lock: %s",
-                     esp_err_to_name(boost_ret));
-        }
-
         if (data_cache_line_size > 0 && job.data_size > 0) {
             const size_t sync_size = ALIGN_UP(job.data_size, data_cache_line_size);
             (void)esp_cache_msync(
@@ -1180,10 +1090,14 @@ static void ai_worker_task(void *arg)
 
         if (face_count <= 0) {
             publish_no_face_result();
-            face_boost_release("detector completed with no face");
-            xSemaphoreGive(ai_inference_mutex);
             ai_worker_mark_idle();
             continue;
+        }
+
+        esp_err_t boost_ret = cpu_power_face_boost_begin();
+        if (boost_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Could not request face CPU boost: %s",
+                     esp_err_to_name(boost_ret));
         }
 
         /* A positive detector result is real activity even if recognition fails. */
@@ -1218,8 +1132,6 @@ static void ai_worker_task(void *arg)
         if (job.idle_scan_frame || idle_scan_display_is_suspended()) {
             ESP_LOGI(TAG,
                      "IDLE-SCAN face detected; recognition deferred until display restore");
-            face_boost_release("IDLE-SCAN detector completed");
-            xSemaphoreGive(ai_inference_mutex);
             ai_worker_mark_idle();
             continue;
         }
@@ -1229,11 +1141,6 @@ static void ai_worker_task(void *arg)
         bool pin_transition_requested = false;
 
         if (run_recognition) {
-            /*
-             * Do not release either the inference mutex or the 360 MHz PM lock
-             * between detection and recognition. This guarantees the requested
-             * DET -> REC serial execution at maximum CPU frequency.
-             */
             for (int i = 0; i < update_count; i++) {
                 if (snapshot_boxes[i].score <= APP_FACE_RECOG_MIN_SCORE) {
                     continue;
@@ -1274,26 +1181,11 @@ static void ai_worker_task(void *arg)
             }
         }
 
-        /*
-         * Every AI model call is finished at this point. Release the inference
-         * mutex before the PIN task is allowed to start. If authentication was
-         * accepted, keep the 360 MHz PM lock only through the PIN screen's
-         * synchronous first full render; pin_screen_transition_task() releases
-         * it immediately afterwards.
-         */
-        if (!pin_transition_requested) {
-            face_boost_release(
-                run_recognition
-                    ? "detector/recognizer chain completed without PIN transition"
-                    : "detector completed without recognition");
+        if (run_recognition && !pin_transition_requested) {
+            face_boost_release("recognition completed without PIN transition");
         }
 
-        xSemaphoreGive(ai_inference_mutex);
         ai_worker_mark_idle();
-
-        if (pin_transition_requested) {
-            (void)authentication_launch_pin_transition();
-        }
     }
 }
 
@@ -2017,14 +1909,6 @@ static void camera_application_start_task(void *arg)
         return;
     }
 
-    ai_inference_mutex = xSemaphoreCreateMutex();
-    if (ai_inference_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create AI inference mutex");
-        app_ui_show_error("AI synchronization failed. Restart the device.");
-        vTaskDelete(NULL);
-        return;
-    }
-
     BaseType_t ai_created = xTaskCreatePinnedToCore(
         ai_worker_task,
         "ai_worker",
@@ -2476,3 +2360,4 @@ static void camera_video_frame_process(
             idle_scan_frame);
     }
 }
+

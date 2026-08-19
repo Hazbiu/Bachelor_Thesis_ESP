@@ -71,15 +71,6 @@
 #define APP_LIGHT_SLEEP_BUTTON_POLL_MS              5U
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
 
-/*
- * esp_light_sleep_start() may return a few hundred microseconds before the
- * requested timer deadline because of timer/clock quantization and software
- * overhead. Treat only a materially early return as abnormal. This prevents
- * normal ~249.4 ms returns for a 250 ms slice from being reported as a
- * Light-sleep failure.
- */
-#define APP_LIGHT_SLEEP_EARLY_RETURN_TOLERANCE_US   5000LL
-
 /* Deep-sleep configuration */
 #define APP_DEEP_SLEEP_TIMEOUT_MS                   30000U
 #define APP_DEEP_SLEEP_INACTIVITY_POLL_MS           100U
@@ -149,33 +140,58 @@
  * Display / touch Deep-sleep configuration
  * ---------------------------------------------------------------------
  *
- * Waveshare's ESP32-P4-NANO BSP defines the LCD backlight GPIO, LCD reset,
- * GT911 reset and GT911 interrupt pins as GPIO_NUM_NC. The backlight is
- * controlled by the display-side I2C controller (address 0x45), not by a
- * dedicated ESP32-P4 GPIO. Therefore -1 below is intentional for this board.
+ * The GT911 touch controller keeps actively scanning (roughly 5..10 mA)
+ * unless it is explicitly told to sleep over I2C. The command must be sent
+ * AFTER the BSP has released its own touch handle and BEFORE the shared I2C
+ * pins are isolated in enter_deep_sleep().
  *
- * The GT911 can be commanded into sleep over I2C, but a sleeping GT911 needs
- * a hardware INT pulse or RESET toggle to wake reliably. Because the stock BSP
- * exposes neither pin, GT911 sleep must remain disabled unless the hardware is
- * modified or a specific display revision exposes a verified wake pin.
+ * ---------------------------------------------------------------------
+ * READ THIS BEFORE SETTING APP_PWR_GT911_SLEEP_ENABLED BACK TO 1
+ * ---------------------------------------------------------------------
+ *
+ * The GT911 sleep command is NOT cleared by an ESP32-P4 reset. The touch
+ * controller is powered from the display module's own always-on 3.3 V rail,
+ * so it stays asleep across a Deep-sleep wake, an EN-pin reset and a reflash.
+ * Its I2C interface is off while it sleeps, so the next boot fails in
+ *
+ *     bsp_display_indev_init -> bsp_touch_new() -> ESP_ERR_NOT_FOUND
+ *
+ * which the Waveshare BSP wraps in ESP_ERROR_CHECK, aborting into a reboot
+ * loop that only a full power cycle clears.
+ *
+ * The controller can only be woken by hardware: an INT pulse held HIGH for
+ * more than ~2 ms, or a RESET toggle. Sleeping it without owning one of those
+ * pins is therefore a one-way trip, which is why this defaults to 0 and why
+ * the build now refuses the combination outright (see the #error below).
+ *
+ * To recover the ~5..10 mA saving:
+ *   1. find the GT911 INT pin, or better its RESET pin, in the Waveshare
+ *      schematic for your display and set it below;
+ *   2. set APP_PWR_GT911_SLEEP_ENABLED back to 1.
+ * component_display.c then wakes the controller automatically on every boot,
+ * before the BSP probes it.
+ *
+ *   -1 disables the corresponding step.
  */
 #define APP_PWR_GT911_SLEEP_ENABLED                 0
 #define APP_PWR_GT911_PRIMARY_ADDRESS               0x5D
 #define APP_PWR_GT911_SECONDARY_ADDRESS             0x14
 
-/* GT911 timings used only if a real wake pin is added/configured. */
+/* GT911 timings used by the boot-time wake sequence. */
 #define APP_PWR_GT911_RESET_ASSERT_MS               20
 #define APP_PWR_GT911_INT_PULSE_MS                  5
 #define APP_PWR_GT911_BOOT_MS                       60
 
-/* No dedicated backlight GPIO on the stock ESP32-P4-NANO BSP. */
+/* Set to the real backlight-enable pin, e.g. GPIO_NUM_23. -1 = skip. */
 #define APP_PWR_DISPLAY_BACKLIGHT_GPIO              (-1)
 #define APP_PWR_DISPLAY_BACKLIGHT_OFF_LEVEL         0
 
-/* Stock BSP: GT911 INT is GPIO_NUM_NC. Keep -1 unless hardware is verified. */
+/* Set to the real GT911 INT pin. -1 = skip. Driving it LOW keeps the */
+/* controller from waking itself out of the sleep state.              */
 #define APP_PWR_TOUCH_INT_GPIO                      (-1)
 
-/* Stock BSP: GT911 RESET is GPIO_NUM_NC. Keep -1 unless hardware is verified. */
+/* Set to the real GT911 RESET pin. -1 = skip. Holding reset asserted */
+/* is even lower than the sleep command when the pin is available.    */
 #define APP_PWR_TOUCH_RESET_GPIO                    (-1)
 #define APP_PWR_TOUCH_RESET_ACTIVE_LEVEL            0
 
@@ -186,16 +202,24 @@
  */
 
 /*
- * Do not request VDD_SPI power-down in this build. The boot log confirms that
- * .text/.rodata execute in place from PSRAM, and PSRAM shares the VDD_SPI
- * domain with flash. Requesting ESP_PD_DOMAIN_VDDSDIO=OFF therefore produces
- * ESP-IDF's noisy "Domain is already in ESP_PD_OPTION_OFF" / invalid-state
- * diagnostic without providing a usable saving.
+ * Ask ESP-IDF to power the SPI flash rail (VDD_SPI) down during Deep-sleep.
  *
- * Re-enable only if XIP-from-PSRAM is disabled and the rail can be switched
- * independently in a future build.
+ * On this board the request is REJECTED with ESP_ERR_INVALID_STATE, and that
+ * is expected rather than a fault: the boot log shows
+ *
+ *     mmu_psram: .rodata xip on psram
+ *     mmu_psram: .text   xip on psram
+ *
+ * so application code and constants are executed in place from the 32 MB PSRAM
+ * that shares the VDD_SPI rail with the flash. IDF will not let that rail be
+ * switched off. The rejection is handled and logged as information, not as a
+ * warning, and Deep-sleep continues normally.
+ *
+ * Leave this enabled: it costs nothing, it is self-documenting in the log, and
+ * it starts working automatically if XIP-from-PSRAM is ever disabled. The
+ * saving would be a few tens of microamps - far below this board's floor.
  */
-#define APP_PWR_DEEP_SLEEP_POWER_DOWN_FLASH         0
+#define APP_PWR_DEEP_SLEEP_POWER_DOWN_FLASH         1
 
 /*
  * Print the level of every controlled rail immediately before entering

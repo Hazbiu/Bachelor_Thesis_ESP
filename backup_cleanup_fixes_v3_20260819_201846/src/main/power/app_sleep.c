@@ -784,41 +784,29 @@ static void inactivity_power_policy_task(void *arg)
              * cadence stays at APP_LIGHT_SLEEP_TOUCH_POLL_MS either way.
              */
             const int64_t requested_us = (int64_t)poll_slice_ms * 1000LL;
-            const int64_t tolerance_us =
-                (int64_t)APP_LIGHT_SLEEP_EARLY_RETURN_TOLERANCE_US;
 
-            /*
-             * Timer quantization routinely returns a 250 ms request a few
-             * hundred microseconds early (for example ~249.4 ms). That is a
-             * normal Light-sleep interval, not evidence that the RTC failed to
-             * sleep. Only treat a return as materially short when it exceeds
-             * the configured tolerance.
-             */
-            if (slice_elapsed_us + tolerance_us < requested_us) {
-                const int64_t shortfall_us = requested_us - slice_elapsed_us;
+            if (slice_elapsed_us < requested_us) {
                 const uint32_t shortfall_ms =
-                    (uint32_t)((shortfall_us + 999LL) / 1000LL);
+                    (uint32_t)((requested_us - slice_elapsed_us) / 1000LL);
 
                 short_slice_count++;
 
                 if (short_slice_count == 1) {
                     ESP_LOGW(
                         POWER_TAG,
-                        "event=LIGHT_SLEEP_SLICE_MATERIALLY_SHORT "
+                        "event=LIGHT_SLEEP_SLICE_TOO_SHORT "
                         "requested_ms=%" PRIu32 " actual_us=%" PRId64
-                        " tolerance_us=%" PRId64 " action=PAD_WITH_DELAY",
+                        " action=PAD_WITH_DELAY",
                         poll_slice_ms,
-                        slice_elapsed_us,
-                        tolerance_us);
+                        slice_elapsed_us);
                     ESP_LOGW(
                         TAG,
-                        "Light-sleep timer returned materially early: actual=%"
-                        PRId64 " us requested=%" PRIu32
-                        " ms. Padding the %" PRIu32
-                        " ms shortfall so the inactivity deadline follows wall time.",
+                        "Light-sleep returned after %" PRId64 " us instead of "
+                        "%" PRIu32 " ms; the RTC is not actually sleeping, so "
+                        "this window saves no power. Padding with a blocked "
+                        "delay to keep the inactivity timer honest.",
                         slice_elapsed_us,
-                        poll_slice_ms,
-                        shortfall_ms);
+                        poll_slice_ms);
                 }
 
                 if (shortfall_ms > 0) {

@@ -383,17 +383,6 @@ esp_err_t pin_screen_show(
         create_key(s_keypad, keys[i], secondary);
     }
 
-    /*
-     * Dummy-draw camera mode leaves the last camera image in the panel's
-     * framebuffer. Force one complete LVGL render before returning so every
-     * pixel is overwritten by the opaque PIN screen immediately. This removes
-     * the stale face box that could remain visible below the PIN layout and
-     * ensures the keypad is fully rendered before the CPU returns to baseline.
-     */
-    lv_obj_update_layout(screen);
-    lv_obj_invalidate(screen);
-    lv_refr_now(lv_display_get_default());
-
     s_visible = true;
     bsp_display_unlock();
 
@@ -432,3 +421,4 @@ bool pin_screen_is_visible(void)
 {
     return s_visible;
 }
+
