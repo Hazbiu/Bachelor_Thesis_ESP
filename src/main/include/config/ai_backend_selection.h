@@ -5,5 +5,5 @@
  * Re-run the script instead of editing this file during A/B measurements.
  */
 #ifndef APP_AI_BACKEND
-#define APP_AI_BACKEND APP_AI_BACKEND_TFLM_FP32
+#define APP_AI_BACKEND APP_AI_BACKEND_ESPDL
 #endif

@@ -3,3 +3,4 @@ build/
 src/dependencies.lock
 /ai_backend_backup_20260818_214816
 /backup_ai_backend_20260818_222402
+/tools/.venv-tflite-int8
