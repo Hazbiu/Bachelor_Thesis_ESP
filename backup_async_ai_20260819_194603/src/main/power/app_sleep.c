@@ -165,35 +165,6 @@ void app_sleep_notify_face_detected(void)
     }
 }
 
-bool app_sleep_light_sleep_is_due(void)
-{
-    const int64_t now_us = esp_timer_get_time();
-    const int64_t light_timeout_us =
-        (int64_t)APP_LIGHT_SLEEP_TIMEOUT_MS * 1000LL;
-    const int64_t deep_timeout_us =
-        (int64_t)APP_DEEP_SLEEP_TIMEOUT_MS * 1000LL;
-    bool due = false;
-
-    portENTER_CRITICAL(&s_sleep_request_lock);
-    const int64_t inactive_us = now_us - s_last_face_detected_us;
-    due = s_inactivity_monitor_started &&
-          !s_sleep_requested &&
-          s_light_sleep_in_progress &&
-          !s_light_sleep_failed_until_activity &&
-          inactive_us >= light_timeout_us &&
-          inactive_us < deep_timeout_us;
-    portEXIT_CRITICAL(&s_sleep_request_lock);
-
-    return due;
-}
-
-static void cancel_light_sleep_claim(void)
-{
-    portENTER_CRITICAL(&s_sleep_request_lock);
-    s_light_sleep_in_progress = false;
-    portEXIT_CRITICAL(&s_sleep_request_lock);
-}
-
 static uint32_t get_inactivity_ms(void)
 {
     const int64_t now_us = esp_timer_get_time();
@@ -659,25 +630,8 @@ static void inactivity_power_policy_task(void *arg)
             esp_restart();
         }
 
-        if (!app_sleep_light_sleep_is_due()) {
-            cancel_light_sleep_claim();
-            ESP_LOGI(
-                POWER_TAG,
-                "event=LIGHT_SLEEP_CANCELED reason=ACTIVITY_BEFORE_SUSPEND");
-            continue;
-        }
-
         esp_err_t suspend_ret =
             s_light_suspend_callback(s_light_transition_user_data);
-
-        if (suspend_ret == ESP_ERR_INVALID_STATE &&
-            !app_sleep_light_sleep_is_due()) {
-            cancel_light_sleep_claim();
-            ESP_LOGI(
-                POWER_TAG,
-                "event=LIGHT_SLEEP_CANCELED reason=ACTIVITY_DURING_AI_DRAIN");
-            continue;
-        }
 
         if (suspend_ret != ESP_OK) {
             ESP_LOGE(

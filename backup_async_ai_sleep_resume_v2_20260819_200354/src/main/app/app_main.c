@@ -365,7 +365,6 @@ static size_t data_cache_line_size = 0;
 static void *display_buffer[APP_DISPLAY_BUFFER_COUNT];
 static size_t lcd_fb_size = 0;
 static uint8_t display_buffer_index = 0;
-static uint8_t active_display_buffer_count = 0;
 static bool display_backlight_enabled = false;
 static lv_display_t *disp;
 static lv_indev_t *launcher_touch_indev = NULL;
@@ -429,96 +428,49 @@ static bool pin_rearm_required;
 static int pin_rearm_no_face_passes;
 static char pending_identity[FACE_RECOG_MAX_NAME_LEN];
 
-static void log_psram_state(const char *stage)
-{
-    const size_t free_bytes = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    const size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-
-    ESP_LOGI(
-        TAG,
-        "PSRAM stage=%s free=%u largest=%u display_active=%u",
-        stage ? stage : "unknown",
-        (unsigned)free_bytes,
-        (unsigned)largest_block,
-        (unsigned)active_display_buffer_count);
-}
-
 static esp_err_t allocate_display_buffers(void)
 {
     if (data_cache_line_size == 0 || lcd_fb_size == 0) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint8_t available = 0;
-
     for (int i = 0; i < APP_DISPLAY_BUFFER_COUNT; i++) {
-        if (display_buffer[i] == NULL) {
-            display_buffer[i] = heap_caps_aligned_calloc(
-                data_cache_line_size,
-                1,
-                lcd_fb_size,
-                MALLOC_CAP_SPIRAM);
+        if (display_buffer[i] != NULL) {
+            continue;
         }
 
+        display_buffer[i] = heap_caps_aligned_calloc(
+            data_cache_line_size,
+            1,
+            lcd_fb_size,
+            MALLOC_CAP_SPIRAM);
+
         if (display_buffer[i] == NULL) {
-            if (i == 0) {
-                active_display_buffer_count = 0;
-                ESP_LOGE(TAG, "Failed to allocate required display buffer 0");
-                log_psram_state("display_alloc_failed_required");
-                return ESP_ERR_NO_MEM;
+            ESP_LOGE(TAG, "Failed to allocate display buffer %d", i);
+            for (int j = 0; j < APP_DISPLAY_BUFFER_COUNT; j++) {
+                if (display_buffer[j] != NULL) {
+                    heap_caps_free(display_buffer[j]);
+                    display_buffer[j] = NULL;
+                }
             }
-
-            /*
-             * A second application ping-pong buffer is desirable but not
-             * required for correctness because dummy_draw_blit() is called
-             * with wait=true. After MIPI-DSI recreation PSRAM can be highly
-             * fragmented, so keep the live preview running with one source
-             * buffer instead of rebooting.
-             */
-            ESP_LOGW(
-                TAG,
-                "Display buffer %d unavailable after resume; continuing with %u buffer(s)",
-                i,
-                (unsigned)available);
-            break;
+            return ESP_ERR_NO_MEM;
         }
-
-        available++;
     }
 
-    if (available == 0) {
-        active_display_buffer_count = 0;
-        return ESP_ERR_NO_MEM;
-    }
-
-    active_display_buffer_count = available;
     display_buffer_index = 0;
-    log_psram_state("display_buffers_ready");
     return ESP_OK;
 }
 
-static void trim_display_buffers_for_sleep(void)
+static void free_display_buffers(void)
 {
-    /*
-     * Retain buffer 0 across display teardown so wake-up never needs to find
-     * the first full-screen application framebuffer in a fragmented heap.
-     * Release every secondary buffer only after DSI/LVGL is stopped. The BSP
-     * is configured by the installer for two DPI framebuffers rather than its
-     * memory-heavy triple-buffer default, leaving enough headroom to recreate
-     * DSI while this one application buffer remains reserved.
-     */
-    for (int i = 1; i < APP_DISPLAY_BUFFER_COUNT; i++) {
+    for (int i = 0; i < APP_DISPLAY_BUFFER_COUNT; i++) {
         if (display_buffer[i] != NULL) {
             heap_caps_free(display_buffer[i]);
             display_buffer[i] = NULL;
         }
     }
-
-    active_display_buffer_count = display_buffer[0] != NULL ? 1U : 0U;
     display_buffer_index = 0;
-    log_psram_state("display_buffers_trimmed_for_sleep");
 }
-
 
 static void ai_results_clear(void)
 {
@@ -1428,7 +1380,7 @@ static esp_err_t suspend_display_for_idle_scan(void *user_data)
      * owned by hardware. Free them before the later DSI recreation. This gives
      * the panel driver a large contiguous PSRAM block even with TFLM loaded.
      */
-    trim_display_buffers_for_sleep();
+    free_display_buffers();
 
     /* The BSP invalidates all LVGL display and input handles. */
     disp = NULL;
@@ -1510,7 +1462,6 @@ static void resume_display_from_idle_scan_task(void *arg)
         esp_restart();
     }
 
-    log_psram_state("before_bsp_display_resume");
     disp = bsp_display_resume_from_light_sleep();
     if (disp == NULL) {
         ESP_LOGE(TAG, "ACTIVE display restoration failed");
@@ -1518,7 +1469,6 @@ static void resume_display_from_idle_scan_task(void *arg)
         esp_restart();
     }
 
-    log_psram_state("after_bsp_display_resume");
     vTaskDelay(pdMS_TO_TICKS(150));
     launcher_touch_indev = bsp_display_get_input_dev();
 
@@ -1680,7 +1630,7 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
         }
         ret = bsp_display_suspend_for_light_sleep();
         if (ret == ESP_OK) {
-            trim_display_buffers_for_sleep();
+            free_display_buffers();
         }
     }
 
@@ -1730,7 +1680,6 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
 
     ESP_LOGI(TAG, "Restoring MIPI-DSI and camera after Light-sleep activity");
 
-    log_psram_state("before_bsp_display_resume");
     disp = bsp_display_resume_from_light_sleep();
     if (disp == NULL) {
         ESP_LOGE(TAG, "Display reinitialization after Light-sleep failed");
@@ -1738,7 +1687,6 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
         return ESP_FAIL;
     }
 
-    log_psram_state("after_bsp_display_resume");
     vTaskDelay(pdMS_TO_TICKS(150));
     launcher_touch_indev = bsp_display_get_input_dev();
 
@@ -1859,10 +1807,8 @@ static void camera_application_start_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "Using independent buffers, display_buf_active=%u display_buf_max=%d camera_buf=%d",
-             (unsigned)active_display_buffer_count,
-             APP_DISPLAY_BUFFER_COUNT,
-             APP_CAMERA_BUFFER_COUNT);
+    ESP_LOGI(TAG, "Using independent buffers, display_buf=%d camera_buf=%d",
+             APP_DISPLAY_BUFFER_COUNT, APP_CAMERA_BUFFER_COUNT);
 
     void *camera_buf[APP_CAMERA_BUFFER_COUNT];
     for (int i = 0; i < APP_CAMERA_BUFFER_COUNT; i++) {
@@ -2199,13 +2145,6 @@ static void camera_video_frame_process(
      * the frame, and returns. AI runs independently on CPU1.
      */
     if (!idle_scan_frame) {
-        if (active_display_buffer_count == 0) {
-            ESP_LOGE(TAG, "No active display buffer");
-            return;
-        }
-        if (display_buffer_index >= active_display_buffer_count) {
-            display_buffer_index = 0;
-        }
         target_fb = display_buffer[display_buffer_index];
         if (target_fb == NULL) {
             ESP_LOGE(TAG, "display buffer is NULL");
@@ -2320,7 +2259,7 @@ static void camera_video_frame_process(
             }
 
             display_buffer_index =
-                (display_buffer_index + 1) % active_display_buffer_count;
+                (display_buffer_index + 1) % APP_DISPLAY_BUFFER_COUNT;
 
             if (!display_backlight_enabled) {
                 bsp_display_backlight_on();

@@ -70,14 +70,6 @@ esp_err_t app_sleep_start_timeout(void);
  */
 void app_sleep_notify_face_detected(void);
 
-/**
- * Return true only while the currently claimed automatic Light-sleep window
- * is still justified by the inactivity timer. A long AI inference may finish
- * after the Light-sleep deadline and report activity; callers use this check
- * before destructively suspending camera/display hardware.
- */
-bool app_sleep_light_sleep_is_due(void);
-
 /** Request the existing ordered Deep-sleep shutdown sequence. */
 void app_sleep_request(const char *reason);
 

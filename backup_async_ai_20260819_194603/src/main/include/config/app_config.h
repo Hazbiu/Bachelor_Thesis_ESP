@@ -10,22 +10,12 @@
 #define APP_FACE_DETECT_INTERVAL_FRAMES             2U
 #define APP_FACE_DETECT_IDLE_180_INTERVAL_FRAMES    8U
 #define APP_FACE_DETECT_IDLE_90_INTERVAL_FRAMES     16U
-#define APP_FACE_RECOG_INTERVAL_FRAMES              2U
+#define APP_FACE_RECOG_INTERVAL_FRAMES              10U
 #define APP_MAX_FACE_BOXES                          5
 #define APP_FACE_BOX_HOLD_MISSES                    5
 #define APP_FACE_RECOG_MIN_SCORE                    0.70f
 #define APP_FACE_BOX_THICKNESS                      3
 #define APP_FACE_LABEL_FONT_SCALE                   3
-
-/*
- * Asynchronous AI worker. The live preview stays on CPU0; CPU1 receives only
- * one latest-frame snapshot and never builds a backlog of stale frames.
- */
-#define APP_AI_SNAPSHOT_MAX_EDGE                    320U
-#define APP_AI_WORKER_CORE                          1
-#define APP_AI_WORKER_STACK_SIZE                    (12 * 1024)
-#define APP_AI_WORKER_PRIORITY                      5
-#define APP_AI_WORKER_DRAIN_TIMEOUT_MS              18000U
 
 /*
  * Adaptive active-power policy.

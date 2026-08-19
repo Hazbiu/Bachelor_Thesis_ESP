@@ -1,5 +1,5 @@
 Complete project export
-Generated on: Wed Aug 19 05:42:27 PM CEST 2026
+Generated on: Wed Aug 19 07:35:06 PM CEST 2026
 Project: /home/admin/Programming/Bachelor_Thesis_ESP
 Included: every file under src/main
 Included: every CMakeLists.txt and *.cmake file under src
@@ -3095,15 +3095,15 @@ FILE: src/main/include/config/app_features.h
  *   input  : [1,112,112,3] float32
  *   output0: [1,192]       float32  embedding
  */
-#define APP_TFLM_FACE_DETECT_MODEL_PATH "/sdcard/models/face_detector_fp32.tflite"
-#define APP_TFLM_FACE_RECOG_MODEL_PATH  "/sdcard/models/face_embedding_fp32.tflite"
+#define APP_TFLM_FACE_DETECT_MODEL_PATH "/sdcard/models/FDET32.TFL"
+#define APP_TFLM_FACE_RECOG_MODEL_PATH  "/sdcard/models/FREC.TFL"
 
 /*
  * Tensor arenas are in PSRAM. These are intentionally conservative defaults.
  * The TFLM runner reports arena_used_bytes() when AI logging is enabled.
  */
-#define APP_TFLM_DETECT_TENSOR_ARENA_BYTES (4U * 1024U * 1024U)
-#define APP_TFLM_RECOG_TENSOR_ARENA_BYTES  (8U * 1024U * 1024U)
+#define APP_TFLM_DETECT_TENSOR_ARENA_BYTES (2U * 1024U * 1024U)
+#define APP_TFLM_RECOG_TENSOR_ARENA_BYTES  (7U * 1024U * 1024U)
 
 /* BlazeFace front-camera model constants. */
 #define APP_TFLM_BLAZEFACE_INPUT_SIZE             128
@@ -3140,7 +3140,7 @@ FILE: src/main/include/config/app_features.h
 #define APP_TFLM_RECOG_EYE_CENTER_DOWN_SHIFT       0.15f
 
 /* Separate database: never overwrite the ESP-DL /sdcard/FACE.DB. */
-#define APP_TFLM_RECOG_DATABASE_PATH "/sdcard/FACE_TFLM_FP32.DB"
+#define APP_TFLM_RECOG_DATABASE_PATH "/sdcard/TFLMFP32.DB"
 
 /* Existing raw RGB888 enrollment dataset. */
 #define APP_FACE_ENROLL_ROOT          "/sdcard/enroll"
@@ -3165,17 +3165,17 @@ FILE: src/main/include/config/log_config.h
 #define APP_LOG_ENABLE_CPU_POWER             1
 #define APP_LOG_ENABLE_ESP_PM                0
 #define APP_LOG_ENABLE_POWER_SLEEP 1
-#define APP_LOG_ENABLE_APPLICATION           0
+#define APP_LOG_ENABLE_APPLICATION           1
 #define APP_LOG_ENABLE_CAMERA                0
 #define APP_LOG_ENABLE_DISPLAY               0
-#define APP_LOG_ENABLE_AI                    0
+#define APP_LOG_ENABLE_AI                    1
 #define APP_LOG_ENABLE_UI                    0
 
 /*
  * When enabled, unselected components may still print ESP_LOGE messages.
  * Keep this at 0 for strict CPU-only output; set it to 1 for safer debugging.
  */
-#define APP_LOG_KEEP_UNSELECTED_ERRORS       0
+#define APP_LOG_KEEP_UNSELECTED_ERRORS       1
 
 /* These monitors use printf(), so ESP-IDF tag filtering cannot silence them. */
 #define APP_DIAGNOSTICS_CPU_STATS_ENABLED    0
@@ -3745,7 +3745,7 @@ class MicroInterpreter;
 struct Model;
 }
 
-using AppTflmOpResolver = tflite::MicroMutableOpResolver<32>;
+using AppTflmOpResolver = tflite::MicroMutableOpResolver<48>;
 
 class TflmModelRunner {
 public:
@@ -11480,6 +11480,13 @@ static esp_err_t rebuild_database(
 
         heap_caps_free(rgb);
 
+        /*
+         * TFLM-FP32 MobileFaceNet can monopolize CPU1 for several seconds.
+         * Yield between enrollment samples so the CPU1 idle task can run
+         * and service the Task Watchdog.
+         */
+        vTaskDelay(pdMS_TO_TICKS(10));
+
         if (embedding_ret != ESP_OK ||
             embedding.size() != s_embedding_dim) {
             ESP_LOGW(
@@ -11783,6 +11790,7 @@ static esp_err_t register_model_ops(AppTflmOpResolver *resolver)
     ADD_TFLM_OP(resolver->AddAdd());
     ADD_TFLM_OP(resolver->AddMul());
     ADD_TFLM_OP(resolver->AddSub());
+    ADD_TFLM_OP(resolver->AddAbs());
     ADD_TFLM_OP(resolver->AddRelu());
     ADD_TFLM_OP(resolver->AddRelu6());
     ADD_TFLM_OP(resolver->AddPrelu());
