@@ -842,29 +842,11 @@ static esp_err_t video_receive_video_frame(int video_fd)
             video_fd,
             VIDIOC_DQBUF,
             &app_camera_video.v4l2_buf) != 0) {
-        const int dq_errno = errno;
-
-        /*
-         * A controller task requests a persistent camera pause by setting
-         * video_task_delete BEFORE issuing VIDIOC_STREAMOFF. If the capture
-         * task is inside/non-blockingly entering VIDIOC_DQBUF at exactly that
-         * moment, ESP-Video can return EPERM/EIO from DQBUF because STREAMOFF
-         * has already invalidated the capture queue.
-         *
-         * That is an expected stop race, not a camera failure. Return the same
-         * transient state used by the task loop so it observes
-         * video_task_delete and enters the controlled paused state without
-         * printing a false error.
-         */
-        if (app_camera_video.video_task_delete) {
-            return ESP_ERR_INVALID_STATE;
-        }
-
         /*
          * O_NONBLOCK makes EAGAIN/EWOULDBLOCK the normal "no completed frame
          * yet" condition. It is not a camera failure.
          */
-        if (dq_errno == EAGAIN || dq_errno == EWOULDBLOCK) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return ESP_ERR_NOT_FOUND;
         }
 
@@ -872,11 +854,11 @@ static esp_err_t video_receive_video_frame(int video_fd)
          * A signal/interruption is transient. Let the task retry unless a
          * shutdown request is already pending.
          */
-        if (dq_errno == EINTR) {
+        if (errno == EINTR) {
             return ESP_ERR_INVALID_STATE;
         }
 
-        ESP_LOGE(TAG, "VIDIOC_DQBUF failed, errno=%d", dq_errno);
+        ESP_LOGE(TAG, "VIDIOC_DQBUF failed, errno=%d", errno);
         return ESP_FAIL;
     }
 
