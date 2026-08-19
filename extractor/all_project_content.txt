@@ -1,5 +1,5 @@
 Complete project export
-Generated on: Wed Aug 19 10:10:33 PM CEST 2026
+Generated on: Wed Aug 19 10:31:01 PM CEST 2026
 Project: /home/admin/Programming/Bachelor_Thesis_ESP
 Included: every file under src/main
 Included: every CMakeLists.txt and *.cmake file under src
@@ -1727,6 +1727,16 @@ static void ai_worker_task(void *arg)
 
         /* A positive detector result is real activity even if recognition fails. */
         app_sleep_notify_face_detected();
+
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+        printf(
+            "[INT8-POSITIVE-PATH] frame=%" PRIu32
+            " faces=%d idle_scan=%d display_suspended=%d\n",
+            job.frame_id,
+            face_count,
+            job.idle_scan_frame ? 1 : 0,
+            idle_scan_display_is_suspended() ? 1 : 0);
+#endif
 
         int update_count = face_count;
         if (update_count > APP_MAX_FACE_BOXES) update_count = APP_MAX_FACE_BOXES;
@@ -3889,7 +3899,7 @@ FILE: src/main/include/config/app_features.h
  * This is UI-only: detector coordinates/keypoints used by MobileFaceNet stay
  * unchanged, so recognition geometry is not distorted.
  */
-#define APP_TFLM_INT8_DISPLAY_BOX_MARGIN_RATIO      0.20f
+#define APP_TFLM_INT8_DISPLAY_BOX_MARGIN_RATIO      0.30f
 #define APP_TFLM_BLAZEFACE_X_SCALE                128.0f
 #define APP_TFLM_BLAZEFACE_Y_SCALE                128.0f
 #define APP_TFLM_BLAZEFACE_W_SCALE                128.0f
@@ -11203,6 +11213,66 @@ static int model_y_to_source(
         std::min(static_cast<int>(source_height) - 1, rounded));
 }
 
+/*
+ * Door-access live view policy for the INT8 detector.
+ *
+ * At q=122 (0.50), the coarse detector score grid can produce several
+ * unrelated candidates with exactly the same confidence.  Showing all of
+ * those as "faces" creates multiple boxes even when one person is present.
+ *
+ * For LIVE RGB565 frames only, keep one candidate:
+ *   1. highest detector score,
+ *   2. if tied, largest positive box area,
+ *   3. if still tied, closest to the image center.
+ *
+ * Enrollment uses RGB888 and is intentionally left unchanged.
+ */
+static blaze_candidate_t select_best_live_candidate(
+    const std::vector<blaze_candidate_t> &detections)
+{
+    blaze_candidate_t best = detections.front();
+
+    auto area_of = [](const blaze_candidate_t &d) {
+        const float w = std::max(0.0f, d.xmax - d.xmin);
+        const float h = std::max(0.0f, d.ymax - d.ymin);
+        return w * h;
+    };
+
+    auto center_distance_sq = [](const blaze_candidate_t &d) {
+        const float cx = (d.xmin + d.xmax) * 0.5f;
+        const float cy = (d.ymin + d.ymax) * 0.5f;
+        const float dx = cx - 0.5f;
+        const float dy = cy - 0.5f;
+        return dx * dx + dy * dy;
+    };
+
+    for (size_t i = 1; i < detections.size(); ++i) {
+        const blaze_candidate_t &candidate = detections[i];
+
+        if (candidate.score > best.score + 1.0e-6f) {
+            best = candidate;
+            continue;
+        }
+
+        if (fabsf(candidate.score - best.score) <= 1.0e-6f) {
+            const float candidate_area = area_of(candidate);
+            const float best_area = area_of(best);
+
+            if (candidate_area > best_area + 1.0e-6f) {
+                best = candidate;
+                continue;
+            }
+
+            if (fabsf(candidate_area - best_area) <= 1.0e-6f &&
+                center_distance_sq(candidate) < center_distance_sq(best)) {
+                best = candidate;
+            }
+        }
+    }
+
+    return best;
+}
+
 static int write_face_boxes(
     const std::vector<blaze_candidate_t> &detections,
     uint32_t source_width,
@@ -11317,6 +11387,16 @@ static int run_common(
     std::vector<blaze_candidate_t> filtered =
         weighted_nms(decoded, max_boxes);
 
+    const unsigned filtered_before_live_limit =
+        static_cast<unsigned>(filtered.size());
+
+    if (rgb565 && filtered.size() > 1U) {
+        const blaze_candidate_t best =
+            select_best_live_candidate(filtered);
+        filtered.clear();
+        filtered.push_back(best);
+    }
+
     const int count = write_face_boxes(
         filtered, width, height, transform, boxes, max_boxes);
 
@@ -11330,7 +11410,8 @@ static int run_common(
         if (count > 0 || (s_live_detector_diag_calls % 8U) == 1U) {
             printf(
                 "[INT8-LIVE-DETECT] call=%u max_q=%d max_prob=%.6f "
-                "threshold_q=%d threshold_prob=%.6f candidates=%u faces=%d\n",
+                "threshold_q=%d threshold_prob=%.6f candidates=%u "
+                "nms=%u live_faces=%d\n",
                 (unsigned)s_live_detector_diag_calls,
                 max_score_q,
                 (double)max_score,
@@ -11339,6 +11420,7 @@ static int run_common(
                     score_tensor,
                     quantized_score_threshold_q(score_tensor)),
                 (unsigned)decoded.size(),
+                filtered_before_live_limit,
                 count);
         }
     }
