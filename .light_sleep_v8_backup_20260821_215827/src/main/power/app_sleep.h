@@ -53,16 +53,13 @@ esp_err_t app_sleep_start_button_monitor(
 /**
  * Start the two-stage face-inactivity power policy.
  *
- * Stage 1: APP_LIGHT_SLEEP_TIMEOUT_MS without activity -> Light-sleep.
- * Camera/AI/display work is suspended and unused external board peripherals
- * (audio amplifier, microSD rail and Ethernet PHY) are also quiesced. Because
+ * Stage 1: APP_LIGHT_SLEEP_TIMEOUT_MS without activity -> Light-sleep. Because
  * this display exposes GT911 only through I2C, the RTC wakes for short polling
- * slices; GT911 itself intentionally stays awake. A qualified touch or GPIO3
- * restores the reversible resources without rebooting.
+ * slices. A detected touch restores display/camera without rebooting.
+ * Stage 2: APP_DEEP_SLEEP_TIMEOUT_MS total inactivity -> Deep-sleep.
  *
- * Stage 2: APP_DEEP_SLEEP_TIMEOUT_MS total inactivity -> Deep-sleep. If no user
- * wake occurred, already-quiesced Light-sleep resources remain off and the
- * destructive Deep-sleep sequence continues without powering them back up.
+ * GPIO3 also wakes Light-sleep back into the running application. If neither a
+ * touch nor GPIO3 occurs, the polling slices end at the Deep-sleep deadline.
  */
 esp_err_t app_sleep_start_timeout(void);
 

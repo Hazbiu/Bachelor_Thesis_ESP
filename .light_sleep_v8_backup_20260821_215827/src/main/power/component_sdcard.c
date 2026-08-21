@@ -88,16 +88,8 @@ static esp_err_t remount_after_shutdown_error(void)
 
 esp_err_t component_sdcard_disable_for_deep_sleep(void)
 {
-    /*
-     * Reused by Light-sleep. If the card rail is already held OFF, preserve
-     * s_was_mounted so a later Light-sleep wake can remount it, and let the
-     * destructive Deep-sleep path call this function again safely.
-     */
-    if (s_power_disabled) {
-        return ESP_OK;
-    }
-
     s_was_mounted = (bsp_sdcard != NULL);
+    s_power_disabled = false;
 
     /*
      * Never remove card power while FATFS is still mounted. The Waveshare BSP
@@ -265,7 +257,7 @@ esp_err_t component_sdcard_restore_after_failed_sleep(void)
                 first_error = ret;
             }
         } else {
-            ESP_LOGI(TAG, "microSD power restored after sleep");
+            ESP_LOGW(TAG, "Deep sleep failed; microSD power restored");
         }
 
         s_power_disabled = false;
@@ -285,7 +277,7 @@ esp_err_t component_sdcard_restore_after_failed_sleep(void)
                 first_error = mount_ret;
             }
         } else {
-            ESP_LOGI(TAG, "microSD remounted after sleep");
+            ESP_LOGW(TAG, "microSD remounted after failed sleep");
         }
     }
 

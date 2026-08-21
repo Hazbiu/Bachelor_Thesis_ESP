@@ -41,15 +41,6 @@ static int wait_for_pad_level(gpio_num_t gpio_num, int expected_level,
 
 esp_err_t component_audio_disable_for_deep_sleep(void)
 {
-    /*
-     * This low-level rail operation is also reused by the reversible
-     * Light-sleep path. Keep it idempotent so the later Deep-sleep sequence can
-     * call it again without disturbing an already-held LOW pad.
-     */
-    if (s_audio_amp_disabled) {
-        return ESP_OK;
-    }
-
     gpio_config_t io_config = {
         .pin_bit_mask = 1ULL << AUDIO_POWER_AMP_GPIO,
         /* INPUT_OUTPUT so the pre-sleep rail audit can read the pad back. */
@@ -169,7 +160,9 @@ esp_err_t component_audio_restore_after_failed_sleep(void)
             first_error = ret;
         }
     } else {
-        ESP_LOGI(TAG, "Audio amplifier restored after sleep");
+        ESP_LOGW(
+            TAG,
+            "Deep sleep failed; audio amplifier restored");
     }
 
     s_audio_amp_disabled = false;

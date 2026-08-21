@@ -92,25 +92,7 @@
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
 
 /*
- * Documentation-aligned external-peripheral Light-sleep policy (V8).
- *
- * ESP-IDF automatically clock-gates/reduces the ESP32-P4 internal domains that
- * are not required by the configured wake sources. External board devices are
- * outside the SoC power-domain controller, so the application must quiesce them
- * explicitly if they are not needed while sleeping.
- *
- * GT911 is intentionally NOT powered down here because this board does not
- * expose a verified GT911 INT/RESET wake pin; touchscreen wake is implemented
- * by the existing 250 ms RTC/I2C polling path.
- *
- * The ESP32-C6 is already held disabled from boot.
- */
-#define APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP            1
-#define APP_LIGHT_SLEEP_POWER_DOWN_SDCARD            1
-#define APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET          1
-
-/*
- * GT911 Light-sleep false-wake filter (V8, preserving the proven V6 driver fix).
+ * GT911 Light-sleep false-wake filter (V6).
  *
  * Root cause:
  *   esp_lcd_touch_gt911_read_data() can return with the controller's DATA_READY

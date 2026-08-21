@@ -73,128 +73,6 @@ static void power_profile_stage_delay(void)
 #endif
 }
 
-/*
- * External board peripherals are not controlled by the ESP32-P4's internal
- * Light-sleep power-domain state machine. Quiesce the peripherals that are not
- * needed for wake detection. GT911 and the shared I2C bus deliberately remain
- * active because touchscreen wake is implemented by timed I2C polling.
- */
-static void record_first_light_sleep_error(
-    esp_err_t ret,
-    esp_err_t *first_error)
-{
-    if (ret != ESP_OK && *first_error == ESP_OK) {
-        *first_error = ret;
-    }
-}
-
-static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
-{
-    esp_err_t first_error = ESP_OK;
-
-#if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
-    record_first_light_sleep_error(
-        component_audio_disable_for_deep_sleep(),
-        &first_error);
-#endif
-
-#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
-    record_first_light_sleep_error(
-        component_sdcard_disable_for_deep_sleep(),
-        &first_error);
-#endif
-
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
-    record_first_light_sleep_error(
-        component_ethernet_disable_for_deep_sleep(),
-        &first_error);
-#endif
-
-    if (first_error == ESP_OK) {
-#if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
-        const char *audio_state = "OFF";
-#else
-        const char *audio_state = "UNCHANGED";
-#endif
-#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
-        const char *sdcard_state = "OFF";
-#else
-        const char *sdcard_state = "UNCHANGED";
-#endif
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
-        const char *ethernet_state = "RESET";
-#else
-        const char *ethernet_state = "UNCHANGED";
-#endif
-
-        ESP_LOGI(
-            POWER_TAG,
-            "event=LIGHT_SLEEP_AUX_SUSPENDED "
-            "audio=%s sdcard=%s ethernet=%s c6=OFF gt911=POLLING",
-            audio_state,
-            sdcard_state,
-            ethernet_state);
-    }
-
-    return first_error;
-}
-
-static esp_err_t restore_aux_peripherals_after_light_sleep(void)
-{
-    esp_err_t first_error = ESP_OK;
-
-    /*
-     * Reverse the suspend order. component_*_restore_after_failed_sleep() are
-     * reversible low-level rail helpers; V8 makes their logging generic because
-     * they are now intentionally shared with Light-sleep.
-     */
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
-    record_first_light_sleep_error(
-        component_ethernet_restore_after_failed_sleep(),
-        &first_error);
-#endif
-
-#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
-    record_first_light_sleep_error(
-        component_sdcard_restore_after_failed_sleep(),
-        &first_error);
-#endif
-
-#if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
-    record_first_light_sleep_error(
-        component_audio_restore_after_failed_sleep(),
-        &first_error);
-#endif
-
-    if (first_error == ESP_OK) {
-#if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
-        const char *audio_state = "ON";
-#else
-        const char *audio_state = "UNCHANGED";
-#endif
-#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
-        const char *sdcard_state = "ON";
-#else
-        const char *sdcard_state = "UNCHANGED";
-#endif
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
-        const char *ethernet_state = "RELEASED";
-#else
-        const char *ethernet_state = "UNCHANGED";
-#endif
-
-        ESP_LOGI(
-            POWER_TAG,
-            "event=LIGHT_SLEEP_AUX_RESTORED "
-            "audio=%s sdcard=%s ethernet=%s",
-            audio_state,
-            sdcard_state,
-            ethernet_state);
-    }
-
-    return first_error;
-}
-
 esp_err_t app_sleep_register_light_sleep_callbacks(
     app_sleep_light_transition_callback_t suspend_callback,
     app_sleep_light_transition_callback_t resume_callback,
@@ -712,8 +590,8 @@ static void inactivity_power_policy_task(void *arg)
 
     ESP_LOGI(
         POWER_TAG,
-        "event=LIGHT_SLEEP_TOUCH_FIX version=8 "
-        "mode=DOC_ALIGNED_GT911_POLLING_AUX_POWERDOWN");
+        "event=LIGHT_SLEEP_TOUCH_FIX version=6 "
+        "mode=GT911_FRESH_DATA_CACHE_FIX");
 
     ESP_LOGI(
         POWER_TAG,
@@ -819,26 +697,10 @@ static void inactivity_power_policy_task(void *arg)
             esp_restart();
         }
 
-        esp_err_t aux_suspend_ret =
-            suspend_aux_peripherals_for_light_sleep();
-
-        if (aux_suspend_ret != ESP_OK) {
-            ESP_LOGE(
-                POWER_TAG,
-                "event=LIGHT_SLEEP_FAILED phase=AUX_SUSPEND "
-                "error=%s action=RESTORE_AND_RESTART",
-                esp_err_to_name(aux_suspend_ret));
-
-            (void)restore_aux_peripherals_after_light_sleep();
-            (void)s_light_resume_callback(s_light_transition_user_data);
-            esp_restart();
-        }
-
         ESP_LOGI(
             POWER_TAG,
             "event=LIGHT_SLEEP_HARDWARE_SUSPENDED "
-            "camera=OFF display=OFF audio=OFF sdcard=OFF "
-            "ethernet=RESET c6=OFF gt911=POLLING");
+            "camera=OFF display=OFF");
 
         /*
          * PRE-SLEEP CHECK
@@ -907,18 +769,6 @@ static void inactivity_power_policy_task(void *arg)
                 ESP_OK,
                 ESP_SLEEP_WAKEUP_UNDEFINED,
                 true);
-
-            esp_err_t aux_restore_ret =
-                restore_aux_peripherals_after_light_sleep();
-
-            if (aux_restore_ret != ESP_OK) {
-                ESP_LOGE(
-                    POWER_TAG,
-                    "event=LIGHT_SLEEP_FAILED phase=AUX_RESTORE "
-                    "error=%s action=RESTART",
-                    esp_err_to_name(aux_restore_ret));
-                esp_restart();
-            }
 
             esp_err_t resume_ret =
                 s_light_resume_callback(s_light_transition_user_data);
@@ -1065,13 +915,13 @@ static void inactivity_power_policy_task(void *arg)
             }
 
             /*
-             * V8 TIME-QUALIFIED TOUCH GATE (PRESERVED FROM V6)
+             * V6 TIME-QUALIFIED TOUCH GATE (SECONDARY FILTER)
              *
              * V4 proved that counting a few consecutive RELEASED samples was
              * insufficient: the GT911 could emit PRESSED -> RELEASED -> PRESSED
              * during the display/DSI power transition and satisfy the old gate.
              *
-             * The V6/V8 managed-driver patch fixes the GT911 stale-point cache. This elapsed-time gate remains as a secondary filter:
+             * V6 first fixes the GT911 driver's stale-point cache. This elapsed-time gate remains as a secondary filter:
              *
              *   startup quarantine
              *       ignore every GT911 PRESSED/RELEASED value
@@ -1205,19 +1055,6 @@ static void inactivity_power_policy_task(void *arg)
                 POWER_TAG,
                 "event=LIGHT_SLEEP_EXIT reason=%s action=RESTORE_ACTIVE",
                 touchscreen_touched ? "TOUCHSCREEN" : "GPIO3");
-
-            esp_err_t aux_restore_ret =
-                restore_aux_peripherals_after_light_sleep();
-
-            if (aux_restore_ret != ESP_OK) {
-                ESP_LOGE(
-                    POWER_TAG,
-                    "event=LIGHT_SLEEP_FAILED phase=AUX_RESTORE "
-                    "error=%s action=RESTART",
-                    esp_err_to_name(aux_restore_ret));
-                esp_restart();
-            }
-
             esp_err_t resume_ret =
                 s_light_resume_callback(s_light_transition_user_data);
 

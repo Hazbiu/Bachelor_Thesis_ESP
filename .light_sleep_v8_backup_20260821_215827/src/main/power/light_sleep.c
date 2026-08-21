@@ -4,7 +4,6 @@
 #include <stdio.h>
 
 #include "config/app_config.h"
-#include "sdkconfig.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -12,95 +11,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-
-/*
- * ESP-IDF v5.5 ESP32-P4 documented Light-sleep policy used by this project:
- *
- * - Flash is NOT supply-power-gated because PSRAM is enabled and shares the
- *   memory power domain.
- * - Flash and PSRAM CS leakage workarounds are required.
- * - PM support is required by the application's 180..360 MHz DFS policy.
- *
- * The installer writes these values into sdkconfig and sdkconfig.defaults.
- * Keep compile-time guards here so a future configuration change cannot
- * silently undo the low-power/safety assumptions.
- */
-#ifndef CONFIG_PM_ENABLE
-#error "V8 Light-sleep requires CONFIG_PM_ENABLE=y"
-#endif
-
-#ifndef CONFIG_ESP_SLEEP_FLASH_LEAKAGE_WORKAROUND
-#error "V8 Light-sleep requires CONFIG_ESP_SLEEP_FLASH_LEAKAGE_WORKAROUND=y"
-#endif
-
-#if defined(CONFIG_SPIRAM) && !defined(CONFIG_ESP_SLEEP_PSRAM_LEAKAGE_WORKAROUND)
-#error "V8 Light-sleep requires CONFIG_ESP_SLEEP_PSRAM_LEAKAGE_WORKAROUND=y with PSRAM"
-#endif
-
-#ifdef CONFIG_ESP_SLEEP_POWER_DOWN_FLASH
-#error "Do not power down Flash supply in Light-sleep while this ESP32-P4 build uses PSRAM"
-#endif
-
 static const char *TAG = "light_sleep";
 
 static esp_sleep_wakeup_cause_t s_last_wakeup_cause =
     ESP_SLEEP_WAKEUP_UNDEFINED;
-
-static esp_err_t configure_documented_light_sleep_domains(void)
-{
-    /*
-     * Keep the shared flash/PSRAM supply domain ON. This follows the ESP-IDF
-     * warning for applications using SPIRAM and avoids the unsafe Flash
-     * supply-power-down path. The leakage workarounds above reduce CS leakage
-     * while the rail remains powered.
-     */
-    esp_err_t ret = esp_sleep_pd_config(
-        ESP_PD_DOMAIN_VDDSDIO,
-        ESP_PD_OPTION_ON);
-    if (ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "Could not keep VDD_SPI/PSRAM domain ON for Light-sleep: %s",
-            esp_err_to_name(ret));
-        return ret;
-    }
-
-    /*
-     * Let IDF automatically power RTC peripherals according to the selected
-     * wake sources. This is the documented default strategy and avoids forcing
-     * an otherwise-unused RTC peripheral domain ON.
-     */
-    ret = esp_sleep_pd_config(
-        ESP_PD_DOMAIN_RTC_PERIPH,
-        ESP_PD_OPTION_AUTO);
-    if (ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "Could not set RTC_PERIPH Light-sleep domain to AUTO: %s",
-            esp_err_to_name(ret));
-        return ret;
-    }
-
-    return ESP_OK;
-}
-
-static void restore_light_sleep_domain_defaults(void)
-{
-    /*
-     * Do not leave a manual VDD_SPI ON request behind for the later
-     * Deep-sleep path. AUTO still keeps the rail powered in ACTIVE mode; it
-     * only lets ESP-IDF choose the correct state at the next sleep entry.
-     */
-    esp_err_t ret = esp_sleep_pd_config(
-        ESP_PD_DOMAIN_VDDSDIO,
-        ESP_PD_OPTION_AUTO);
-    if (ret != ESP_OK) {
-        ESP_LOGW(
-            TAG,
-            "Could not restore VDD_SPI/PSRAM sleep domain to AUTO: %s",
-            esp_err_to_name(ret));
-    }
-}
 
 static esp_err_t disable_sleep_source_if_enabled(esp_sleep_source_t source)
 {
@@ -146,26 +60,7 @@ static esp_err_t enter_light_sleep_internal(
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t ret = configure_documented_light_sleep_domains();
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    /*
-     * Wake sources remain enabled after wake according to ESP-IDF. The normal
-     * cleanup below removes the sources configured by this function; clearing
-     * all sources here as well makes every 250 ms polling slice deterministic
-     * even after an earlier rejected sleep request.
-     */
-    ret = disable_sleep_source_if_enabled(ESP_SLEEP_WAKEUP_ALL);
-    if (ret != ESP_OK) {
-        restore_light_sleep_domain_defaults();
-        ESP_LOGE(
-            TAG,
-            "Could not clear stale sleep wake sources: %s",
-            esp_err_to_name(ret));
-        return ret;
-    }
+    esp_err_t ret = ESP_OK;
 
     if (enable_gpio_wakeup) {
         gpio_config_t wake_gpio_config = {
@@ -184,7 +79,6 @@ static esp_err_t enter_light_sleep_internal(
                 "GPIO%d configuration failed: %s",
                 wake_gpio,
                 esp_err_to_name(ret));
-            restore_light_sleep_domain_defaults();
             return ret;
         }
 
@@ -214,7 +108,6 @@ static esp_err_t enter_light_sleep_internal(
                 "Could not enable GPIO%d Light-sleep wake-up: %s",
                 wake_gpio,
                 esp_err_to_name(ret));
-            restore_light_sleep_domain_defaults();
             return ret;
         }
 
@@ -225,7 +118,6 @@ static esp_err_t enter_light_sleep_internal(
                 "Could not enable GPIO Light-sleep wake source: %s",
                 esp_err_to_name(ret));
             (void)gpio_wakeup_disable(wake_gpio);
-            restore_light_sleep_domain_defaults();
             return ret;
         }
     }
@@ -243,7 +135,6 @@ static esp_err_t enter_light_sleep_internal(
                 (void)disable_sleep_source_if_enabled(ESP_SLEEP_WAKEUP_GPIO);
                 (void)gpio_wakeup_disable(wake_gpio);
             }
-            restore_light_sleep_domain_defaults();
             return ret;
         }
 
@@ -273,14 +164,8 @@ static esp_err_t enter_light_sleep_internal(
     ret = esp_light_sleep_start();
     if (ret == ESP_OK) {
         s_last_wakeup_cause = esp_sleep_get_wakeup_cause();
-        const uint32_t wake_causes = esp_sleep_get_wakeup_causes();
-
         if (verbose) {
             log_wakeup_cause(s_last_wakeup_cause);
-            ESP_LOGI(
-                TAG,
-                "Light-sleep wake bitmap=0x%08" PRIx32,
-                wake_causes);
         }
     } else {
         s_last_wakeup_cause = ESP_SLEEP_WAKEUP_UNDEFINED;
@@ -335,8 +220,6 @@ static esp_err_t enter_light_sleep_internal(
         }
     }
 
-    restore_light_sleep_domain_defaults();
-
     if (ret != ESP_OK) {
         return ret;
     }
@@ -366,3 +249,4 @@ esp_sleep_wakeup_cause_t light_sleep_get_last_wakeup_cause(void)
 {
     return s_last_wakeup_cause;
 }
+

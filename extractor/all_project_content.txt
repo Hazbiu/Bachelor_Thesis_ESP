@@ -1,5 +1,5 @@
 Complete project export
-Generated on: Fri Aug 21 08:52:22 PM CEST 2026
+Generated on: Fri Aug 21 09:43:49 PM CEST 2026
 Project: /home/hazbiu/Programming/Bachelor_Thesis_ESP
 Included: every file under src/main
 Included: every CMakeLists.txt and *.cmake file under src
@@ -3520,7 +3520,7 @@ FILE: src/main/include/config/ai_backend_selection.h
  * Do not edit manually during A/B measurements.
  */
 #ifndef APP_AI_BACKEND
-#define APP_AI_BACKEND APP_AI_BACKEND_TFLM_INT8
+#define APP_AI_BACKEND APP_AI_BACKEND_ESPDL
 #endif
 
 
@@ -3621,18 +3621,36 @@ FILE: src/main/include/config/app_config.h
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
 
 /*
- * GT911 Light-sleep false-wake filter (V4).
+ * GT911 Light-sleep false-wake filter (V6).
  *
- * The controller can report a sustained pressed state immediately after the
- * camera/MIPI-DSI teardown even though the panel was released before sleep.
- * Therefore a touch is not allowed to wake the application until the GT911 has
- * first been observed RELEASED again after at least one Light-sleep slice.
+ * Root cause:
+ *   esp_lcd_touch_gt911_read_data() can return with the controller's DATA_READY
+ *   bit clear without invalidating the driver's cached tp->data.points value.
+ *   A previous one-frame touch can therefore be returned again by
+ *   esp_lcd_touch_get_coordinates() even though no new GT911 touch packet exists.
+ *
+ * The V6 installer patches that managed GT911 driver in place so DATA_READY=0
+ * invalidates cached points. The time-qualified filter below remains as a
+ * secondary guard against a genuine one-frame electrical/transient touch packet:
+ *
+ *   1. Ignore every touch sample during the startup quarantine.
+ *   2. Require a continuous RELEASED window before touch wake is armed.
+ *   3. After arming, require a continuous PRESSED window before restoring
+ *      camera/display.
+ *
+ * With the 250 ms poll interval below, the defaults mean:
+ *   startup ignored : 1000 ms
+ *   stable release  : 1000 ms
+ *   stable press    :  500 ms
+ *
+ * GPIO3 remains available as an immediate Light-sleep wake source.
  */
-#define APP_LIGHT_SLEEP_TOUCH_PRE_RELEASE_SAMPLES   3U
-#define APP_LIGHT_SLEEP_TOUCH_PRECHECK_MAX_SAMPLES  12U
-#define APP_LIGHT_SLEEP_TOUCH_POST_RELEASE_SAMPLES  3U
-#define APP_LIGHT_SLEEP_TOUCH_SAMPLE_DELAY_MS       15U
-#define APP_LIGHT_SLEEP_TOUCH_CONFIRM_DELAY_MS      15U
+#define APP_LIGHT_SLEEP_TOUCH_PRE_RELEASE_SAMPLES    3U
+#define APP_LIGHT_SLEEP_TOUCH_PRECHECK_MAX_SAMPLES   12U
+#define APP_LIGHT_SLEEP_TOUCH_SAMPLE_DELAY_MS        15U
+#define APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS      1000U
+#define APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS      1000U
+#define APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS        500U
 
 /*
  * esp_light_sleep_start() may return a few hundred microseconds before the
@@ -6808,8 +6826,8 @@ static void inactivity_power_policy_task(void *arg)
 
     ESP_LOGI(
         POWER_TAG,
-        "event=LIGHT_SLEEP_TOUCH_FIX version=4 "
-        "mode=POST_SLEEP_RELEASE_GATE");
+        "event=LIGHT_SLEEP_TOUCH_FIX version=6 "
+        "mode=GT911_FRESH_DATA_CACHE_FIX");
 
     ESP_LOGI(
         POWER_TAG,
@@ -7029,7 +7047,11 @@ static void inactivity_power_policy_task(void *arg)
         bool touchscreen_touched = false;
         bool touch_wake_armed = false;
         bool startup_press_logged = false;
-        uint32_t post_release_samples = 0;
+        bool release_window_logged = false;
+        bool press_candidate_logged = false;
+        uint32_t light_sleep_elapsed_ms = 0;
+        uint32_t release_stable_ms = 0;
+        uint32_t press_stable_ms = 0;
         uint32_t short_slice_count = 0;
 
         while (remaining_ms > 0 && !touchscreen_touched) {
@@ -7067,15 +7089,10 @@ static void inactivity_power_policy_task(void *arg)
             }
 
             /*
-             * The RTC does not always sleep for the whole requested slice: a
-             * call can return in a couple of milliseconds and still report a
-             * TIMER wake. Charging the inactivity budget with the REQUESTED
-             * slice in that case makes the countdown run far faster than real
-             * time.
-             *
-             * Spend the remainder of the slice in a blocked delay so one loop
-             * iteration still costs one requested slice from the application
-             * scheduler's point of view.
+             * The RTC can occasionally return materially before the requested
+             * timer slice. Pad that shortfall while the application remains
+             * suspended so the inactivity and touch qualification windows are
+             * based on real scheduler time rather than a tight polling loop.
              */
             const int64_t requested_us = (int64_t)poll_slice_ms * 1000LL;
             const int64_t tolerance_us =
@@ -7114,6 +7131,7 @@ static void inactivity_power_policy_task(void *arg)
             }
 
             remaining_ms -= poll_slice_ms;
+            light_sleep_elapsed_ms += poll_slice_ms;
 
             bool touched_now = false;
             touch_ret =
@@ -7133,87 +7151,120 @@ static void inactivity_power_policy_task(void *arg)
             }
 
             /*
-             * V4 POST-SLEEP RELEASE GATE
+             * V6 TIME-QUALIFIED TOUCH GATE (SECONDARY FILTER)
              *
-             * Never wake from the first "pressed" values seen after the DSI
-             * teardown.  The GT911 must first prove that it can report a stable
-             * RELEASED state after the system has actually entered Light-sleep.
+             * V4 proved that counting a few consecutive RELEASED samples was
+             * insufficient: the GT911 could emit PRESSED -> RELEASED -> PRESSED
+             * during the display/DSI power transition and satisfy the old gate.
              *
-             * This directly handles the measured sequence:
+             * V6 first fixes the GT911 driver's stale-point cache. This elapsed-time gate remains as a secondary filter:
              *
-             *     pre-sleep:  RELEASED RELEASED RELEASED
-             *     post-sleep: PRESSED  PRESSED  ... false startup state
+             *   startup quarantine
+             *       ignore every GT911 PRESSED/RELEASED value
              *
-             * A sustained startup press is suppressed until a release streak
-             * appears.  Only a later RELEASED -> PRESSED transition can wake.
+             *   stable release window
+             *       require continuously RELEASED for a configured duration
+             *
+             *   stable press window
+             *       after arming, require continuously PRESSED for a configured
+             *       duration before restoring the camera/display
+             *
+             * Any opposite sample resets the corresponding stability timer.
+             * GPIO3 is independent and still wakes immediately.
              */
+            if (light_sleep_elapsed_ms <
+                APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS) {
+                release_stable_ms = 0;
+                press_stable_ms = 0;
+
+                if (touched_now && !startup_press_logged) {
+                    startup_press_logged = true;
+                    ESP_LOGW(
+                        POWER_TAG,
+                        "event=LIGHT_SLEEP_TOUCH_STARTUP_PRESS_SUPPRESSED "
+                        "elapsed_ms=%" PRIu32
+                        " ignore_until_ms=%u action=CONTINUE_SLEEP",
+                        light_sleep_elapsed_ms,
+                        (unsigned)APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS);
+                }
+
+                continue;
+            }
+
             if (!touch_wake_armed) {
+                press_stable_ms = 0;
+                press_candidate_logged = false;
+
                 if (touched_now) {
-                    post_release_samples = 0;
-
-                    if (!startup_press_logged) {
-                        startup_press_logged = true;
-                        ESP_LOGW(
-                            POWER_TAG,
-                            "event=LIGHT_SLEEP_TOUCH_STARTUP_PRESS_SUPPRESSED "
-                            "action=WAIT_FOR_POST_SLEEP_RELEASE");
-                    }
-
+                    release_stable_ms = 0;
+                    release_window_logged = false;
                     continue;
                 }
 
-                post_release_samples++;
+                if (!release_window_logged) {
+                    release_window_logged = true;
+                    ESP_LOGI(
+                        POWER_TAG,
+                        "event=LIGHT_SLEEP_TOUCH_RELEASE_WINDOW_STARTED "
+                        "required_ms=%u",
+                        (unsigned)APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS);
+                }
 
-                if (post_release_samples >=
-                    APP_LIGHT_SLEEP_TOUCH_POST_RELEASE_SAMPLES) {
+                if (UINT32_MAX - release_stable_ms < poll_slice_ms) {
+                    release_stable_ms = UINT32_MAX;
+                } else {
+                    release_stable_ms += poll_slice_ms;
+                }
+
+                if (release_stable_ms >=
+                    APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS) {
                     touch_wake_armed = true;
+                    press_stable_ms = 0;
 
                     ESP_LOGI(
                         POWER_TAG,
                         "event=LIGHT_SLEEP_TOUCH_POST_ARMED "
-                        "released_samples=%" PRIu32,
-                        post_release_samples);
+                        "stable_release_ms=%" PRIu32
+                        " elapsed_ms=%" PRIu32,
+                        release_stable_ms,
+                        light_sleep_elapsed_ms);
                 }
 
                 continue;
             }
 
             if (!touched_now) {
+                press_stable_ms = 0;
+                press_candidate_logged = false;
                 continue;
             }
 
-            /*
-             * Once post-sleep arming is complete, require one additional fresh
-             * hardware read after a short delay.  A single transient status
-             * value therefore cannot restore the expensive camera/display
-             * pipeline.
-             */
-            vTaskDelay(
-                pdMS_TO_TICKS(APP_LIGHT_SLEEP_TOUCH_CONFIRM_DELAY_MS));
-
-            bool touch_confirmed = false;
-            touch_ret =
-                bsp_touch_poll_for_light_sleep(&touch_confirmed);
-
-            if (touch_ret != ESP_OK) {
-                ESP_LOGE(
+            if (!press_candidate_logged) {
+                press_candidate_logged = true;
+                ESP_LOGI(
                     POWER_TAG,
-                    "event=LIGHT_SLEEP_FAILED phase=TOUCH_CONFIRM "
-                    "error=%s action=RESTART",
-                    esp_err_to_name(touch_ret));
-                esp_restart();
+                    "event=LIGHT_SLEEP_TOUCH_PRESS_CANDIDATE "
+                    "required_ms=%u",
+                    (unsigned)APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS);
             }
 
-            if (touch_confirmed) {
+            if (UINT32_MAX - press_stable_ms < poll_slice_ms) {
+                press_stable_ms = UINT32_MAX;
+            } else {
+                press_stable_ms += poll_slice_ms;
+            }
+
+            if (press_stable_ms >=
+                APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS) {
                 touchscreen_touched = true;
                 ESP_LOGI(
                     POWER_TAG,
-                    "event=LIGHT_SLEEP_TOUCH_CONFIRMED action=RESTORE_ACTIVE");
-            } else {
-                ESP_LOGW(
-                    POWER_TAG,
-                    "event=LIGHT_SLEEP_TOUCH_GLITCH_REJECTED "
-                    "action=CONTINUE_SLEEP");
+                    "event=LIGHT_SLEEP_TOUCH_CONFIRMED "
+                    "stable_press_ms=%" PRIu32
+                    " elapsed_ms=%" PRIu32
+                    " action=RESTORE_ACTIVE",
+                    press_stable_ms,
+                    light_sleep_elapsed_ms);
             }
         }
 

@@ -64,15 +64,10 @@ do
   }
 done
 
-# Kconfig does not guarantee that a disabled boolean is emitted as
-# "# CONFIG_... is not set" in sdkconfig.  On some ESP-IDF/target combinations
-# the symbol is simply absent.  The only unsafe state for this project is y.
-if grep -q '^CONFIG_ESP_SLEEP_POWER_DOWN_FLASH=y$' "$SRC_DIR/sdkconfig"; then
-  echo "[ERROR] CONFIG_ESP_SLEEP_POWER_DOWN_FLASH=y is unsafe while PSRAM is used."
+grep -q '^# CONFIG_ESP_SLEEP_POWER_DOWN_FLASH is not set$' "$SRC_DIR/sdkconfig" || {
+  echo "[ERROR] Flash supply power-down must stay disabled because PSRAM is used."
   exit 1
-else
-  echo "  Flash supply power-down: disabled/not enabled (OK)"
-fi
+}
 
 if [[ -z "${IDF_PATH:-}" || ! -f "${IDF_PATH}/tools/idf.py" ]]; then
   ACTIVATE="$HOME/.espressif/tools/activate_idf_v5.5.4.sh"

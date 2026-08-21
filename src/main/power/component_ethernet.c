@@ -41,6 +41,14 @@ static int wait_for_pad_level(gpio_num_t gpio_num, int expected_level,
 
 esp_err_t component_ethernet_disable_for_deep_sleep(void)
 {
+    /*
+     * Reused by Light-sleep. A second call from the destructive Deep-sleep
+     * sequence must be harmless if the PHY is already held in reset.
+     */
+    if (s_phy_held_in_reset) {
+        return ESP_OK;
+    }
+
     gpio_config_t io_config = {
         .pin_bit_mask = 1ULL << ETHERNET_PHY_RESET_GPIO,
         /* INPUT_OUTPUT so the pre-sleep rail audit can read the pad back. */
@@ -164,9 +172,7 @@ esp_err_t component_ethernet_restore_after_failed_sleep(void)
 
     s_phy_held_in_reset = false;
 
-    ESP_LOGW(
-        TAG,
-        "Deep sleep failed; IP101GRI Ethernet PHY released");
+    ESP_LOGI(TAG, "IP101GRI Ethernet PHY released after sleep");
 
     return ESP_OK;
 }

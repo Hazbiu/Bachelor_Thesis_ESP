@@ -111,29 +111,26 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
 #endif
 
     if (first_error == ESP_OK) {
-#if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
-        const char *audio_state = "OFF";
-#else
-        const char *audio_state = "UNCHANGED";
-#endif
-#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
-        const char *sdcard_state = "OFF";
-#else
-        const char *sdcard_state = "UNCHANGED";
-#endif
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
-        const char *ethernet_state = "RESET";
-#else
-        const char *ethernet_state = "UNCHANGED";
-#endif
-
         ESP_LOGI(
             POWER_TAG,
             "event=LIGHT_SLEEP_AUX_SUSPENDED "
             "audio=%s sdcard=%s ethernet=%s c6=OFF gt911=POLLING",
-            audio_state,
-            sdcard_state,
-            ethernet_state);
+#if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
+            "OFF",
+#else
+            "UNCHANGED",
+#endif
+#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
+            "OFF",
+#else
+            "UNCHANGED",
+#endif
+#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
+            "RESET",
+#else
+            "UNCHANGED"
+#endif
+        );
     }
 
     return first_error;
@@ -167,29 +164,26 @@ static esp_err_t restore_aux_peripherals_after_light_sleep(void)
 #endif
 
     if (first_error == ESP_OK) {
-#if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
-        const char *audio_state = "ON";
-#else
-        const char *audio_state = "UNCHANGED";
-#endif
-#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
-        const char *sdcard_state = "ON";
-#else
-        const char *sdcard_state = "UNCHANGED";
-#endif
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
-        const char *ethernet_state = "RELEASED";
-#else
-        const char *ethernet_state = "UNCHANGED";
-#endif
-
         ESP_LOGI(
             POWER_TAG,
             "event=LIGHT_SLEEP_AUX_RESTORED "
             "audio=%s sdcard=%s ethernet=%s",
-            audio_state,
-            sdcard_state,
-            ethernet_state);
+#if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
+            "ON",
+#else
+            "UNCHANGED",
+#endif
+#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
+            "ON",
+#else
+            "UNCHANGED",
+#endif
+#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
+            "RELEASED"
+#else
+            "UNCHANGED"
+#endif
+        );
     }
 
     return first_error;

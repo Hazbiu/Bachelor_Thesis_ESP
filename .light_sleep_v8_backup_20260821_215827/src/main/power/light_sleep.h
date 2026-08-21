@@ -17,10 +17,8 @@ extern "C" {
  * active-low wake source. If timeout_ms is greater than zero, the RTC timer is
  * enabled as another wake source. At least one wake source must be requested.
  *
- * This low-level helper configures the documented ESP-IDF power-domain policy,
- * wake sources, enters Light-sleep, records the wake cause, and removes those
- * wake sources again after wake. The application owns reversible board-level
- * camera/display/audio/SD/Ethernet suspend-resume policy.
+ * This low-level helper only configures wake sources and enters Light-sleep.
+ * The application owns the reversible camera/display suspend-resume policy.
  *
  * @param timeout_ms Optional timer wake-up in milliseconds; 0 disables it.
  * @param enable_gpio_wakeup Enable active-low GPIO wake-up when true.
