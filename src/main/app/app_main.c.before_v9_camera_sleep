@@ -1873,16 +1873,6 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
         return ret;
     }
 
-    ret = app_video_prepare_sensor_for_light_sleep();
-    if (ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "OV5647 sensor standby failed before Light-sleep: %s",
-            esp_err_to_name(ret));
-        xSemaphoreGive(display_mode_mutex);
-        return ret;
-    }
-
     display_backlight_enabled = false;
 
     if (idle_scan_display_is_suspended()) {
@@ -1982,16 +1972,6 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
     dummy_draw_enabled = true;
     display_buffer_index = 0;
     display_disable_lvgl_overlays();
-
-    ret = app_video_restore_sensor_after_light_sleep();
-    if (ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "OV5647 sensor restore after Light-sleep failed: %s",
-            esp_err_to_name(ret));
-        xSemaphoreGive(display_mode_mutex);
-        return ret;
-    }
 
     ret = app_video_stream_task_restart(video_cam_fd0);
     if (ret != ESP_OK) {

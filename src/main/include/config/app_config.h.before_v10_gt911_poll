@@ -87,7 +87,7 @@
 /* Light-sleep configuration */
 #define APP_LIGHT_SLEEP_WAKE_GPIO                   GPIO_NUM_3
 #define APP_LIGHT_SLEEP_TIMEOUT_MS                  15000U
-#define APP_LIGHT_SLEEP_TOUCH_POLL_MS               1000U
+#define APP_LIGHT_SLEEP_TOUCH_POLL_MS               250U
 #define APP_LIGHT_SLEEP_BUTTON_POLL_MS              5U
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
 

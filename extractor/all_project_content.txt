@@ -1,5 +1,5 @@
 Complete project export
-Generated on: Fri Aug 21 09:43:49 PM CEST 2026
+Generated on: Fri Aug 21 10:35:19 PM CEST 2026
 Project: /home/hazbiu/Programming/Bachelor_Thesis_ESP
 Included: every file under src/main
 Included: every CMakeLists.txt and *.cmake file under src
@@ -3621,7 +3621,25 @@ FILE: src/main/include/config/app_config.h
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
 
 /*
- * GT911 Light-sleep false-wake filter (V6).
+ * Documentation-aligned external-peripheral Light-sleep policy (V8).
+ *
+ * ESP-IDF automatically clock-gates/reduces the ESP32-P4 internal domains that
+ * are not required by the configured wake sources. External board devices are
+ * outside the SoC power-domain controller, so the application must quiesce them
+ * explicitly if they are not needed while sleeping.
+ *
+ * GT911 is intentionally NOT powered down here because this board does not
+ * expose a verified GT911 INT/RESET wake pin; touchscreen wake is implemented
+ * by the existing 250 ms RTC/I2C polling path.
+ *
+ * The ESP32-C6 is already held disabled from boot.
+ */
+#define APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP            1
+#define APP_LIGHT_SLEEP_POWER_DOWN_SDCARD            1
+#define APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET          1
+
+/*
+ * GT911 Light-sleep false-wake filter (V8, preserving the proven V6 driver fix).
  *
  * Root cause:
  *   esp_lcd_touch_gt911_read_data() can return with the controller's DATA_READY
@@ -6309,6 +6327,128 @@ static void power_profile_stage_delay(void)
 #endif
 }
 
+/*
+ * External board peripherals are not controlled by the ESP32-P4's internal
+ * Light-sleep power-domain state machine. Quiesce the peripherals that are not
+ * needed for wake detection. GT911 and the shared I2C bus deliberately remain
+ * active because touchscreen wake is implemented by timed I2C polling.
+ */
+static void record_first_light_sleep_error(
+    esp_err_t ret,
+    esp_err_t *first_error)
+{
+    if (ret != ESP_OK && *first_error == ESP_OK) {
+        *first_error = ret;
+    }
+}
+
+static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
+{
+    esp_err_t first_error = ESP_OK;
+
+#if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
+    record_first_light_sleep_error(
+        component_audio_disable_for_deep_sleep(),
+        &first_error);
+#endif
+
+#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
+    record_first_light_sleep_error(
+        component_sdcard_disable_for_deep_sleep(),
+        &first_error);
+#endif
+
+#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
+    record_first_light_sleep_error(
+        component_ethernet_disable_for_deep_sleep(),
+        &first_error);
+#endif
+
+    if (first_error == ESP_OK) {
+#if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
+        const char *audio_state = "OFF";
+#else
+        const char *audio_state = "UNCHANGED";
+#endif
+#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
+        const char *sdcard_state = "OFF";
+#else
+        const char *sdcard_state = "UNCHANGED";
+#endif
+#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
+        const char *ethernet_state = "RESET";
+#else
+        const char *ethernet_state = "UNCHANGED";
+#endif
+
+        ESP_LOGI(
+            POWER_TAG,
+            "event=LIGHT_SLEEP_AUX_SUSPENDED "
+            "audio=%s sdcard=%s ethernet=%s c6=OFF gt911=POLLING",
+            audio_state,
+            sdcard_state,
+            ethernet_state);
+    }
+
+    return first_error;
+}
+
+static esp_err_t restore_aux_peripherals_after_light_sleep(void)
+{
+    esp_err_t first_error = ESP_OK;
+
+    /*
+     * Reverse the suspend order. component_*_restore_after_failed_sleep() are
+     * reversible low-level rail helpers; V8 makes their logging generic because
+     * they are now intentionally shared with Light-sleep.
+     */
+#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
+    record_first_light_sleep_error(
+        component_ethernet_restore_after_failed_sleep(),
+        &first_error);
+#endif
+
+#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
+    record_first_light_sleep_error(
+        component_sdcard_restore_after_failed_sleep(),
+        &first_error);
+#endif
+
+#if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
+    record_first_light_sleep_error(
+        component_audio_restore_after_failed_sleep(),
+        &first_error);
+#endif
+
+    if (first_error == ESP_OK) {
+#if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
+        const char *audio_state = "ON";
+#else
+        const char *audio_state = "UNCHANGED";
+#endif
+#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
+        const char *sdcard_state = "ON";
+#else
+        const char *sdcard_state = "UNCHANGED";
+#endif
+#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
+        const char *ethernet_state = "RELEASED";
+#else
+        const char *ethernet_state = "UNCHANGED";
+#endif
+
+        ESP_LOGI(
+            POWER_TAG,
+            "event=LIGHT_SLEEP_AUX_RESTORED "
+            "audio=%s sdcard=%s ethernet=%s",
+            audio_state,
+            sdcard_state,
+            ethernet_state);
+    }
+
+    return first_error;
+}
+
 esp_err_t app_sleep_register_light_sleep_callbacks(
     app_sleep_light_transition_callback_t suspend_callback,
     app_sleep_light_transition_callback_t resume_callback,
@@ -6826,8 +6966,8 @@ static void inactivity_power_policy_task(void *arg)
 
     ESP_LOGI(
         POWER_TAG,
-        "event=LIGHT_SLEEP_TOUCH_FIX version=6 "
-        "mode=GT911_FRESH_DATA_CACHE_FIX");
+        "event=LIGHT_SLEEP_TOUCH_FIX version=8 "
+        "mode=DOC_ALIGNED_GT911_POLLING_AUX_POWERDOWN");
 
     ESP_LOGI(
         POWER_TAG,
@@ -6933,10 +7073,26 @@ static void inactivity_power_policy_task(void *arg)
             esp_restart();
         }
 
+        esp_err_t aux_suspend_ret =
+            suspend_aux_peripherals_for_light_sleep();
+
+        if (aux_suspend_ret != ESP_OK) {
+            ESP_LOGE(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_FAILED phase=AUX_SUSPEND "
+                "error=%s action=RESTORE_AND_RESTART",
+                esp_err_to_name(aux_suspend_ret));
+
+            (void)restore_aux_peripherals_after_light_sleep();
+            (void)s_light_resume_callback(s_light_transition_user_data);
+            esp_restart();
+        }
+
         ESP_LOGI(
             POWER_TAG,
             "event=LIGHT_SLEEP_HARDWARE_SUSPENDED "
-            "camera=OFF display=OFF");
+            "camera=OFF display=OFF audio=OFF sdcard=OFF "
+            "ethernet=RESET c6=OFF gt911=POLLING");
 
         /*
          * PRE-SLEEP CHECK
@@ -7005,6 +7161,18 @@ static void inactivity_power_policy_task(void *arg)
                 ESP_OK,
                 ESP_SLEEP_WAKEUP_UNDEFINED,
                 true);
+
+            esp_err_t aux_restore_ret =
+                restore_aux_peripherals_after_light_sleep();
+
+            if (aux_restore_ret != ESP_OK) {
+                ESP_LOGE(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_FAILED phase=AUX_RESTORE "
+                    "error=%s action=RESTART",
+                    esp_err_to_name(aux_restore_ret));
+                esp_restart();
+            }
 
             esp_err_t resume_ret =
                 s_light_resume_callback(s_light_transition_user_data);
@@ -7151,13 +7319,13 @@ static void inactivity_power_policy_task(void *arg)
             }
 
             /*
-             * V6 TIME-QUALIFIED TOUCH GATE (SECONDARY FILTER)
+             * V8 TIME-QUALIFIED TOUCH GATE (PRESERVED FROM V6)
              *
              * V4 proved that counting a few consecutive RELEASED samples was
              * insufficient: the GT911 could emit PRESSED -> RELEASED -> PRESSED
              * during the display/DSI power transition and satisfy the old gate.
              *
-             * V6 first fixes the GT911 driver's stale-point cache. This elapsed-time gate remains as a secondary filter:
+             * The V6/V8 managed-driver patch fixes the GT911 stale-point cache. This elapsed-time gate remains as a secondary filter:
              *
              *   startup quarantine
              *       ignore every GT911 PRESSED/RELEASED value
@@ -7291,6 +7459,19 @@ static void inactivity_power_policy_task(void *arg)
                 POWER_TAG,
                 "event=LIGHT_SLEEP_EXIT reason=%s action=RESTORE_ACTIVE",
                 touchscreen_touched ? "TOUCHSCREEN" : "GPIO3");
+
+            esp_err_t aux_restore_ret =
+                restore_aux_peripherals_after_light_sleep();
+
+            if (aux_restore_ret != ESP_OK) {
+                ESP_LOGE(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_FAILED phase=AUX_RESTORE "
+                    "error=%s action=RESTART",
+                    esp_err_to_name(aux_restore_ret));
+                esp_restart();
+            }
+
             esp_err_t resume_ret =
                 s_light_resume_callback(s_light_transition_user_data);
 
@@ -7475,13 +7656,16 @@ esp_err_t app_sleep_start_button_monitor(
 /**
  * Start the two-stage face-inactivity power policy.
  *
- * Stage 1: APP_LIGHT_SLEEP_TIMEOUT_MS without activity -> Light-sleep. Because
+ * Stage 1: APP_LIGHT_SLEEP_TIMEOUT_MS without activity -> Light-sleep.
+ * Camera/AI/display work is suspended and unused external board peripherals
+ * (audio amplifier, microSD rail and Ethernet PHY) are also quiesced. Because
  * this display exposes GT911 only through I2C, the RTC wakes for short polling
- * slices. A detected touch restores display/camera without rebooting.
- * Stage 2: APP_DEEP_SLEEP_TIMEOUT_MS total inactivity -> Deep-sleep.
+ * slices; GT911 itself intentionally stays awake. A qualified touch or GPIO3
+ * restores the reversible resources without rebooting.
  *
- * GPIO3 also wakes Light-sleep back into the running application. If neither a
- * touch nor GPIO3 occurs, the polling slices end at the Deep-sleep deadline.
+ * Stage 2: APP_DEEP_SLEEP_TIMEOUT_MS total inactivity -> Deep-sleep. If no user
+ * wake occurred, already-quiesced Light-sleep resources remain off and the
+ * destructive Deep-sleep sequence continues without powering them back up.
  */
 esp_err_t app_sleep_start_timeout(void);
 
@@ -7557,6 +7741,15 @@ static int wait_for_pad_level(gpio_num_t gpio_num, int expected_level,
 
 esp_err_t component_audio_disable_for_deep_sleep(void)
 {
+    /*
+     * This low-level rail operation is also reused by the reversible
+     * Light-sleep path. Keep it idempotent so the later Deep-sleep sequence can
+     * call it again without disturbing an already-held LOW pad.
+     */
+    if (s_audio_amp_disabled) {
+        return ESP_OK;
+    }
+
     gpio_config_t io_config = {
         .pin_bit_mask = 1ULL << AUDIO_POWER_AMP_GPIO,
         /* INPUT_OUTPUT so the pre-sleep rail audit can read the pad back. */
@@ -7676,9 +7869,7 @@ esp_err_t component_audio_restore_after_failed_sleep(void)
             first_error = ret;
         }
     } else {
-        ESP_LOGW(
-            TAG,
-            "Deep sleep failed; audio amplifier restored");
+        ESP_LOGI(TAG, "Audio amplifier restored after sleep");
     }
 
     s_audio_amp_disabled = false;
@@ -8177,6 +8368,14 @@ static int wait_for_pad_level(gpio_num_t gpio_num, int expected_level,
 
 esp_err_t component_ethernet_disable_for_deep_sleep(void)
 {
+    /*
+     * Reused by Light-sleep. A second call from the destructive Deep-sleep
+     * sequence must be harmless if the PHY is already held in reset.
+     */
+    if (s_phy_held_in_reset) {
+        return ESP_OK;
+    }
+
     gpio_config_t io_config = {
         .pin_bit_mask = 1ULL << ETHERNET_PHY_RESET_GPIO,
         /* INPUT_OUTPUT so the pre-sleep rail audit can read the pad back. */
@@ -8300,9 +8499,7 @@ esp_err_t component_ethernet_restore_after_failed_sleep(void)
 
     s_phy_held_in_reset = false;
 
-    ESP_LOGW(
-        TAG,
-        "Deep sleep failed; IP101GRI Ethernet PHY released");
+    ESP_LOGI(TAG, "IP101GRI Ethernet PHY released after sleep");
 
     return ESP_OK;
 }
@@ -8401,8 +8598,16 @@ static esp_err_t remount_after_shutdown_error(void)
 
 esp_err_t component_sdcard_disable_for_deep_sleep(void)
 {
+    /*
+     * Reused by Light-sleep. If the card rail is already held OFF, preserve
+     * s_was_mounted so a later Light-sleep wake can remount it, and let the
+     * destructive Deep-sleep path call this function again safely.
+     */
+    if (s_power_disabled) {
+        return ESP_OK;
+    }
+
     s_was_mounted = (bsp_sdcard != NULL);
-    s_power_disabled = false;
 
     /*
      * Never remove card power while FATFS is still mounted. The Waveshare BSP
@@ -8570,7 +8775,7 @@ esp_err_t component_sdcard_restore_after_failed_sleep(void)
                 first_error = ret;
             }
         } else {
-            ESP_LOGW(TAG, "Deep sleep failed; microSD power restored");
+            ESP_LOGI(TAG, "microSD power restored after sleep");
         }
 
         s_power_disabled = false;
@@ -8590,7 +8795,7 @@ esp_err_t component_sdcard_restore_after_failed_sleep(void)
                 first_error = mount_ret;
             }
         } else {
-            ESP_LOGW(TAG, "microSD remounted after failed sleep");
+            ESP_LOGI(TAG, "microSD remounted after sleep");
         }
     }
 
@@ -9686,6 +9891,7 @@ FILE: src/main/power/light_sleep.c
 #include <stdio.h>
 
 #include "config/app_config.h"
+#include "sdkconfig.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -9693,10 +9899,95 @@ FILE: src/main/power/light_sleep.c
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+
+/*
+ * ESP-IDF v5.5 ESP32-P4 documented Light-sleep policy used by this project:
+ *
+ * - Flash is NOT supply-power-gated because PSRAM is enabled and shares the
+ *   memory power domain.
+ * - Flash and PSRAM CS leakage workarounds are required.
+ * - PM support is required by the application's 180..360 MHz DFS policy.
+ *
+ * The installer writes these values into sdkconfig and sdkconfig.defaults.
+ * Keep compile-time guards here so a future configuration change cannot
+ * silently undo the low-power/safety assumptions.
+ */
+#ifndef CONFIG_PM_ENABLE
+#error "V8 Light-sleep requires CONFIG_PM_ENABLE=y"
+#endif
+
+#ifndef CONFIG_ESP_SLEEP_FLASH_LEAKAGE_WORKAROUND
+#error "V8 Light-sleep requires CONFIG_ESP_SLEEP_FLASH_LEAKAGE_WORKAROUND=y"
+#endif
+
+#if defined(CONFIG_SPIRAM) && !defined(CONFIG_ESP_SLEEP_PSRAM_LEAKAGE_WORKAROUND)
+#error "V8 Light-sleep requires CONFIG_ESP_SLEEP_PSRAM_LEAKAGE_WORKAROUND=y with PSRAM"
+#endif
+
+#ifdef CONFIG_ESP_SLEEP_POWER_DOWN_FLASH
+#error "Do not power down Flash supply in Light-sleep while this ESP32-P4 build uses PSRAM"
+#endif
+
 static const char *TAG = "light_sleep";
 
 static esp_sleep_wakeup_cause_t s_last_wakeup_cause =
     ESP_SLEEP_WAKEUP_UNDEFINED;
+
+static esp_err_t configure_documented_light_sleep_domains(void)
+{
+    /*
+     * Keep the shared flash/PSRAM supply domain ON. This follows the ESP-IDF
+     * warning for applications using SPIRAM and avoids the unsafe Flash
+     * supply-power-down path. The leakage workarounds above reduce CS leakage
+     * while the rail remains powered.
+     */
+    esp_err_t ret = esp_sleep_pd_config(
+        ESP_PD_DOMAIN_VDDSDIO,
+        ESP_PD_OPTION_ON);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not keep VDD_SPI/PSRAM domain ON for Light-sleep: %s",
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    /*
+     * Let IDF automatically power RTC peripherals according to the selected
+     * wake sources. This is the documented default strategy and avoids forcing
+     * an otherwise-unused RTC peripheral domain ON.
+     */
+    ret = esp_sleep_pd_config(
+        ESP_PD_DOMAIN_RTC_PERIPH,
+        ESP_PD_OPTION_AUTO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not set RTC_PERIPH Light-sleep domain to AUTO: %s",
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    return ESP_OK;
+}
+
+static void restore_light_sleep_domain_defaults(void)
+{
+    /*
+     * Do not leave a manual VDD_SPI ON request behind for the later
+     * Deep-sleep path. AUTO still keeps the rail powered in ACTIVE mode; it
+     * only lets ESP-IDF choose the correct state at the next sleep entry.
+     */
+    esp_err_t ret = esp_sleep_pd_config(
+        ESP_PD_DOMAIN_VDDSDIO,
+        ESP_PD_OPTION_AUTO);
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Could not restore VDD_SPI/PSRAM sleep domain to AUTO: %s",
+            esp_err_to_name(ret));
+    }
+}
 
 static esp_err_t disable_sleep_source_if_enabled(esp_sleep_source_t source)
 {
@@ -9742,7 +10033,26 @@ static esp_err_t enter_light_sleep_internal(
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t ret = ESP_OK;
+    esp_err_t ret = configure_documented_light_sleep_domains();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /*
+     * Wake sources remain enabled after wake according to ESP-IDF. The normal
+     * cleanup below removes the sources configured by this function; clearing
+     * all sources here as well makes every 250 ms polling slice deterministic
+     * even after an earlier rejected sleep request.
+     */
+    ret = disable_sleep_source_if_enabled(ESP_SLEEP_WAKEUP_ALL);
+    if (ret != ESP_OK) {
+        restore_light_sleep_domain_defaults();
+        ESP_LOGE(
+            TAG,
+            "Could not clear stale sleep wake sources: %s",
+            esp_err_to_name(ret));
+        return ret;
+    }
 
     if (enable_gpio_wakeup) {
         gpio_config_t wake_gpio_config = {
@@ -9761,6 +10071,7 @@ static esp_err_t enter_light_sleep_internal(
                 "GPIO%d configuration failed: %s",
                 wake_gpio,
                 esp_err_to_name(ret));
+            restore_light_sleep_domain_defaults();
             return ret;
         }
 
@@ -9790,6 +10101,7 @@ static esp_err_t enter_light_sleep_internal(
                 "Could not enable GPIO%d Light-sleep wake-up: %s",
                 wake_gpio,
                 esp_err_to_name(ret));
+            restore_light_sleep_domain_defaults();
             return ret;
         }
 
@@ -9800,6 +10112,7 @@ static esp_err_t enter_light_sleep_internal(
                 "Could not enable GPIO Light-sleep wake source: %s",
                 esp_err_to_name(ret));
             (void)gpio_wakeup_disable(wake_gpio);
+            restore_light_sleep_domain_defaults();
             return ret;
         }
     }
@@ -9817,6 +10130,7 @@ static esp_err_t enter_light_sleep_internal(
                 (void)disable_sleep_source_if_enabled(ESP_SLEEP_WAKEUP_GPIO);
                 (void)gpio_wakeup_disable(wake_gpio);
             }
+            restore_light_sleep_domain_defaults();
             return ret;
         }
 
@@ -9846,8 +10160,14 @@ static esp_err_t enter_light_sleep_internal(
     ret = esp_light_sleep_start();
     if (ret == ESP_OK) {
         s_last_wakeup_cause = esp_sleep_get_wakeup_cause();
+        const uint32_t wake_causes = esp_sleep_get_wakeup_causes();
+
         if (verbose) {
             log_wakeup_cause(s_last_wakeup_cause);
+            ESP_LOGI(
+                TAG,
+                "Light-sleep wake bitmap=0x%08" PRIx32,
+                wake_causes);
         }
     } else {
         s_last_wakeup_cause = ESP_SLEEP_WAKEUP_UNDEFINED;
@@ -9902,6 +10222,8 @@ static esp_err_t enter_light_sleep_internal(
         }
     }
 
+    restore_light_sleep_domain_defaults();
+
     if (ret != ESP_OK) {
         return ret;
     }
@@ -9933,7 +10255,6 @@ esp_sleep_wakeup_cause_t light_sleep_get_last_wakeup_cause(void)
 }
 
 
-
 ==================================================
 FILE: src/main/power/light_sleep.h
 ==================================================
@@ -9956,8 +10277,10 @@ extern "C" {
  * active-low wake source. If timeout_ms is greater than zero, the RTC timer is
  * enabled as another wake source. At least one wake source must be requested.
  *
- * This low-level helper only configures wake sources and enters Light-sleep.
- * The application owns the reversible camera/display suspend-resume policy.
+ * This low-level helper configures the documented ESP-IDF power-domain policy,
+ * wake sources, enters Light-sleep, records the wake cause, and removes those
+ * wake sources again after wake. The application owns reversible board-level
+ * camera/display/audio/SD/Ethernet suspend-resume policy.
  *
  * @param timeout_ms Optional timer wake-up in milliseconds; 0 disables it.
  * @param enable_gpio_wakeup Enable active-low GPIO wake-up when true.
