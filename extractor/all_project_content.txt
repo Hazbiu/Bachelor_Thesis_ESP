@@ -1,6 +1,6 @@
 Complete project export
-Generated on: Wed Aug 19 10:31:01 PM CEST 2026
-Project: /home/admin/Programming/Bachelor_Thesis_ESP
+Generated on: Fri Aug 21 07:20:33 PM CEST 2026
+Project: /home/hazbiu/Programming/Bachelor_Thesis_ESP
 Included: every file under src/main
 Included: every CMakeLists.txt and *.cmake file under src
 Excluded from CMake search: src/managed_components

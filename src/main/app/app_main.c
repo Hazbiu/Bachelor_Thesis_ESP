@@ -39,6 +39,7 @@
 #include "config/app_features.h"
 #include "config/log_config.h"
 #include "app_sleep.h"
+#include "power_save/component_wifi.h"
 
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 
@@ -2244,6 +2245,13 @@ static void launcher_start_requested(void *user_data)
 void app_main(void)
 {
     app_logging_init();
+    /* ESP32-C6 is unused: keep CHIP_PU LOW permanently. */
+    esp_err_t c6_ret = component_wifi_disable_for_deep_sleep();
+    if (c6_ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "Failed to disable ESP32-C6: %s",
+                 esp_err_to_name(c6_ret));
+    }
 
     report_wake_reason();
     core_trace(TAG, "APP_MAIN_START");
