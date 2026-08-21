@@ -92,38 +92,6 @@
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
 
 /*
- * GT911 Light-sleep false-wake filter (V6).
- *
- * Root cause:
- *   esp_lcd_touch_gt911_read_data() can return with the controller's DATA_READY
- *   bit clear without invalidating the driver's cached tp->data.points value.
- *   A previous one-frame touch can therefore be returned again by
- *   esp_lcd_touch_get_coordinates() even though no new GT911 touch packet exists.
- *
- * The V6 installer patches that managed GT911 driver in place so DATA_READY=0
- * invalidates cached points. The time-qualified filter below remains as a
- * secondary guard against a genuine one-frame electrical/transient touch packet:
- *
- *   1. Ignore every touch sample during the startup quarantine.
- *   2. Require a continuous RELEASED window before touch wake is armed.
- *   3. After arming, require a continuous PRESSED window before restoring
- *      camera/display.
- *
- * With the 250 ms poll interval below, the defaults mean:
- *   startup ignored : 1000 ms
- *   stable release  : 1000 ms
- *   stable press    :  500 ms
- *
- * GPIO3 remains available as an immediate Light-sleep wake source.
- */
-#define APP_LIGHT_SLEEP_TOUCH_PRE_RELEASE_SAMPLES    3U
-#define APP_LIGHT_SLEEP_TOUCH_PRECHECK_MAX_SAMPLES   12U
-#define APP_LIGHT_SLEEP_TOUCH_SAMPLE_DELAY_MS        15U
-#define APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS      1000U
-#define APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS      1000U
-#define APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS        500U
-
-/*
  * esp_light_sleep_start() may return a few hundred microseconds before the
  * requested timer deadline because of timer/clock quantization and software
  * overhead. Treat only a materially early return as abnormal. This prevents

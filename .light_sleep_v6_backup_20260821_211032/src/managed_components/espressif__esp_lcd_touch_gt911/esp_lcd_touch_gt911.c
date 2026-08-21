@@ -233,12 +233,6 @@ static esp_err_t esp_lcd_touch_gt911_read_data(esp_lcd_touch_handle_t tp)
 
     /* Any touch data? */
     if ((buf[0] & 0x80) == 0x00) {
-        /* LIGHT_SLEEP_GT911_INVALIDATE_STALE_POINTS_V6: DATA_READY=0 means there is no fresh touch packet.
-         * Invalidate cached coordinates before any getter can reuse them. */
-        portENTER_CRITICAL(&tp->data.lock);
-        tp->data.points = 0;
-        portEXIT_CRITICAL(&tp->data.lock);
-
         touch_gt911_i2c_write(tp, ESP_LCD_TOUCH_GT911_READ_XY_REG, clear);
 #if (CONFIG_ESP_LCD_TOUCH_MAX_BUTTONS > 0)
     } else if ((buf[0] & 0x10) == 0x10) {

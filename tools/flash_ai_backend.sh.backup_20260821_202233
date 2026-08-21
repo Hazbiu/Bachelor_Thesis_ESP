@@ -6,7 +6,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 IDF_PROJECT="$PROJECT_ROOT/src"
 
 MODE="${1:-}"
-PORT="${2:-}"
+PORT="${2:-/dev/ttyACM0}"
 
 case "$MODE" in
     dl|espdl|esp-dl)
@@ -23,10 +23,7 @@ case "$MODE" in
         ;;
     *)
         echo "Usage: $0 {dl|fp32|nn} [PORT]"
-        echo "Examples:"
-        echo "  $0 dl"
-        echo "  $0 fp32 /dev/ttyACM0"
-        echo "  $0 nn"
+        echo "Example: $0 nn /dev/ttyACM0"
         exit 2
         ;;
 esac
@@ -113,101 +110,16 @@ echo "  AI high-performance: 360 MHz"
 echo "  DET -> REC mutex   : present"
 echo "  sleep/PIN pipeline : shared app_main path"
 
-# ---------------------------------------------------------------------------
-# ESP-IDF 5.5.4 activation
-#
-# This installation uses:
-#   ~/.espressif/tools/activate_idf_v5.5.4.sh
-#
-# Do NOT assume ~/esp/esp-idf-v5.5.4/export.sh exists.
-# ---------------------------------------------------------------------------
-ensure_idf() {
-    # If the current shell is already activated, keep it.
-    if [[ -n "${IDF_PATH:-}" && -f "${IDF_PATH}/tools/idf.py" ]]; then
-        return 0
-    fi
-
-    if command -v idf.py >/dev/null 2>&1; then
-        return 0
-    fi
-
-    local candidates=(
-        "${IDF_ACTIVATE:-}"
-        "$HOME/.espressif/tools/activate_idf_v5.5.4.sh"
-        "$HOME/.espressif/v5.5.4/esp-idf/export.sh"
-        "$HOME/esp/esp-idf-v5.5.4/export.sh"
-    )
-
-    local activation=""
-    for candidate in "${candidates[@]}"; do
-        if [[ -n "$candidate" && -f "$candidate" ]]; then
-            activation="$candidate"
-            break
-        fi
-    done
-
-    if [[ -z "$activation" ]]; then
-        echo "[ERROR] ESP-IDF 5.5.4 activation script was not found."
-        echo
-        echo "Checked:"
-        printf '  %s\n' \
-            "$HOME/.espressif/tools/activate_idf_v5.5.4.sh" \
-            "$HOME/.espressif/v5.5.4/esp-idf/export.sh" \
-            "$HOME/esp/esp-idf-v5.5.4/export.sh"
-        echo
-        echo "You can override it with:"
-        echo "  IDF_ACTIVATE=/path/to/activate_or_export.sh $0 $MODE"
+# Load ESP-IDF 5.5.4 when idf.py is not already in the shell environment.
+if ! command -v idf.py >/dev/null 2>&1; then
+    IDF_EXPORT="${IDF_EXPORT:-$HOME/esp/esp-idf-v5.5.4/export.sh}"
+    if [[ ! -f "$IDF_EXPORT" ]]; then
+        echo "[ERROR] idf.py is unavailable and ESP-IDF export script was not found:"
+        echo "  $IDF_EXPORT"
         exit 1
     fi
-
-    echo
-    echo "[INFO] Activating ESP-IDF with:"
-    echo "  $activation"
-
     # shellcheck disable=SC1090
-    source "$activation"
-
-    if [[ -z "${IDF_PATH:-}" || ! -f "${IDF_PATH}/tools/idf.py" ]]; then
-        if ! command -v idf.py >/dev/null 2>&1; then
-            echo "[ERROR] ESP-IDF activation completed, but idf.py is still unavailable."
-            exit 1
-        fi
-    fi
-}
-
-ensure_idf
-
-# Prefer the interpreter from the activated ESP-IDF environment and call idf.py
-# by its absolute path. This is more reliable than depending on shell PATH.
-if [[ -n "${IDF_PATH:-}" && -f "${IDF_PATH}/tools/idf.py" ]]; then
-    PYTHON_BIN="$(command -v python || command -v python3)"
-    IDF_CMD=("$PYTHON_BIN" "$IDF_PATH/tools/idf.py")
-else
-    IDF_CMD=("idf.py")
-fi
-
-echo
-echo "========== ESP-IDF ENVIRONMENT =========="
-echo "  IDF_PATH : ${IDF_PATH:-<not set>}"
-echo "  Python   : ${PYTHON_BIN:-PATH idf.py}"
-echo "  idf.py   : ${IDF_PATH:+$IDF_PATH/tools/idf.py}"
-
-# Auto-detect a serial port when one was not supplied.
-if [[ -z "$PORT" ]]; then
-    PORT="$(find /dev -maxdepth 1 \( -name 'ttyACM*' -o -name 'ttyUSB*' \) \
-        -print 2>/dev/null | sort | head -n1 || true)"
-fi
-
-if [[ -z "$PORT" ]]; then
-    echo "[ERROR] No serial device found under /dev/ttyACM* or /dev/ttyUSB*."
-    echo "        Connect/reconnect the ESP32-P4 and run:"
-    echo "        ls -l /dev/ttyACM* /dev/ttyUSB* 2>/dev/null"
-    exit 1
-fi
-
-if [[ ! -e "$PORT" ]]; then
-    echo "[ERROR] Flash port does not exist: $PORT"
-    exit 1
+    source "$IDF_EXPORT"
 fi
 
 cd "$IDF_PROJECT"
@@ -230,8 +142,8 @@ echo "Port    : $PORT"
 echo "Project : $IDF_PROJECT"
 echo "============================================================"
 
-"${IDF_CMD[@]}" reconfigure
-"${IDF_CMD[@]}" build
+idf.py reconfigure
+idf.py build
 
 if [[ "$CANONICAL" == "tflm-int8" ]]; then
     map_file="$(find build -maxdepth 1 -type f -name '*.map' -print -quit)"
@@ -250,7 +162,7 @@ if [[ "$CANONICAL" == "tflm-int8" ]]; then
     echo "[OK] ESP-NN linkage found in $(basename "$map_file")"
 fi
 
-"${IDF_CMD[@]}" -p "$PORT" flash
+idf.py -p "$PORT" flash
 
 if [[ "${NO_MONITOR:-0}" == "1" ]]; then
     echo
@@ -260,4 +172,4 @@ fi
 
 echo
 echo "Starting monitor. Press Ctrl+] to exit."
-exec "${IDF_CMD[@]}" -p "$PORT" monitor
+exec idf.py -p "$PORT" monitor

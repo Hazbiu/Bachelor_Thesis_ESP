@@ -687,7 +687,7 @@ static void pin_accepted_callback(void *user_data)
         NULL,
         7,
         NULL,
-        APP_SYSTEM_WORKER_CORE);
+        1);
 
     if (created != pdPASS) {
         ESP_LOGE(TAG, "Failed to create camera-resume task");
@@ -796,8 +796,8 @@ static void pin_screen_transition_task(void *arg)
  *
  *     detector -> recognizer -> unlock AI -> PIN transition
  *
- * and prevents the UI transition from racing the detector/recognizer chain
- * while the shared inference lock is still owned by the AI worker.
+ * and prevents the high-priority PIN task from pre-empting the recognizer
+ * while the detector/recognizer chain still owns the inference lock.
  */
 static bool authentication_request_pin(const char *recognized_name)
 {
@@ -844,7 +844,7 @@ static bool authentication_launch_pin_transition(void)
         NULL,
         7,
         NULL,
-        APP_SYSTEM_WORKER_CORE);
+        1);
 
     if (created != pdPASS) {
         ESP_LOGE(TAG, "Failed to create PIN-screen transition task");
@@ -1659,14 +1659,13 @@ static esp_err_t suspend_display_for_idle_scan(void *user_data)
 
     xSemaphoreGive(display_mode_mutex);
 
-    BaseType_t created = xTaskCreatePinnedToCore(
+    BaseType_t created = xTaskCreate(
         idle_scan_touch_poll_task,
         "idle_scan_touch",
         3072,
         NULL,
         4,
-        NULL,
-        APP_SYSTEM_WORKER_CORE);
+        NULL);
 
     if (created != pdPASS) {
         ESP_LOGE(TAG, "Could not create IDLE-SCAN touch polling task");
@@ -1794,14 +1793,13 @@ static esp_err_t request_display_resume_from_idle_scan(void *user_data)
     idle_scan_resume_task_pending = true;
     portEXIT_CRITICAL(&idle_scan_state_lock);
 
-    BaseType_t created = xTaskCreatePinnedToCore(
+    BaseType_t created = xTaskCreate(
         resume_display_from_idle_scan_task,
         "idle_scan_resume",
         6144,
         NULL,
         7,
-        NULL,
-        APP_SYSTEM_WORKER_CORE);
+        NULL);
 
     if (created != pdPASS) {
         portENTER_CRITICAL(&idle_scan_state_lock);
@@ -2172,11 +2170,8 @@ static void camera_application_start_task(void *arg)
      * Start capture while dummy draw is still disabled. Any frame arriving in
      * this tiny transition window is safely ignored by the callback.
      */
-    ESP_LOGI(TAG,
-             "[CORE-PROOF] Requesting video stream task on system CPU%d",
-             APP_SYSTEM_WORKER_CORE);
-    ret = app_video_stream_task_start(
-        video_cam_fd0, APP_SYSTEM_WORKER_CORE, NULL);
+    ESP_LOGI(TAG, "[CORE-PROOF] Requesting video stream task on CPU0");
+    ret = app_video_stream_task_start(video_cam_fd0, 0, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Video stream task failed: %s", esp_err_to_name(ret));
         app_ui_show_error("Camera stream failed to start. Restart the device.");
@@ -2237,7 +2232,7 @@ static void launcher_start_requested(void *user_data)
         NULL,
         6,
         NULL,
-        APP_SYSTEM_WORKER_CORE);
+        1);
 
     if (created != pdPASS) {
         application_start_requested = false;
@@ -2257,11 +2252,6 @@ void app_main(void)
                  "Failed to disable ESP32-C6: %s",
                  esp_err_to_name(c6_ret));
     }
-
-    ESP_LOGI(TAG,
-             "[CORE-PROOF] Application split: system_cpu=%d ai_cpu=%d",
-             APP_SYSTEM_WORKER_CORE,
-             APP_AI_WORKER_CORE);
 
     report_wake_reason();
     core_trace(TAG, "APP_MAIN_START");

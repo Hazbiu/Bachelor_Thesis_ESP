@@ -590,8 +590,8 @@ static void inactivity_power_policy_task(void *arg)
 
     ESP_LOGI(
         POWER_TAG,
-        "event=LIGHT_SLEEP_TOUCH_FIX version=6 "
-        "mode=GT911_FRESH_DATA_CACHE_FIX");
+        "event=LIGHT_SLEEP_TOUCH_FIX version=5 "
+        "mode=TIME_QUALIFIED_RELEASE_PRESS_GATE");
 
     ESP_LOGI(
         POWER_TAG,
@@ -915,13 +915,13 @@ static void inactivity_power_policy_task(void *arg)
             }
 
             /*
-             * V6 TIME-QUALIFIED TOUCH GATE (SECONDARY FILTER)
+             * V5 TIME-QUALIFIED TOUCH GATE
              *
              * V4 proved that counting a few consecutive RELEASED samples was
              * insufficient: the GT911 could emit PRESSED -> RELEASED -> PRESSED
              * during the display/DSI power transition and satisfy the old gate.
              *
-             * V6 first fixes the GT911 driver's stale-point cache. This elapsed-time gate remains as a secondary filter:
+             * V5 uses elapsed poll time rather than fast sample count:
              *
              *   startup quarantine
              *       ignore every GT911 PRESSED/RELEASED value

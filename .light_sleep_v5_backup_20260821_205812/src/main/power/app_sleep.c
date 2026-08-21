@@ -590,8 +590,8 @@ static void inactivity_power_policy_task(void *arg)
 
     ESP_LOGI(
         POWER_TAG,
-        "event=LIGHT_SLEEP_TOUCH_FIX version=6 "
-        "mode=GT911_FRESH_DATA_CACHE_FIX");
+        "event=LIGHT_SLEEP_TOUCH_FIX version=4 "
+        "mode=POST_SLEEP_RELEASE_GATE");
 
     ESP_LOGI(
         POWER_TAG,
@@ -811,11 +811,7 @@ static void inactivity_power_policy_task(void *arg)
         bool touchscreen_touched = false;
         bool touch_wake_armed = false;
         bool startup_press_logged = false;
-        bool release_window_logged = false;
-        bool press_candidate_logged = false;
-        uint32_t light_sleep_elapsed_ms = 0;
-        uint32_t release_stable_ms = 0;
-        uint32_t press_stable_ms = 0;
+        uint32_t post_release_samples = 0;
         uint32_t short_slice_count = 0;
 
         while (remaining_ms > 0 && !touchscreen_touched) {
@@ -853,10 +849,15 @@ static void inactivity_power_policy_task(void *arg)
             }
 
             /*
-             * The RTC can occasionally return materially before the requested
-             * timer slice. Pad that shortfall while the application remains
-             * suspended so the inactivity and touch qualification windows are
-             * based on real scheduler time rather than a tight polling loop.
+             * The RTC does not always sleep for the whole requested slice: a
+             * call can return in a couple of milliseconds and still report a
+             * TIMER wake. Charging the inactivity budget with the REQUESTED
+             * slice in that case makes the countdown run far faster than real
+             * time.
+             *
+             * Spend the remainder of the slice in a blocked delay so one loop
+             * iteration still costs one requested slice from the application
+             * scheduler's point of view.
              */
             const int64_t requested_us = (int64_t)poll_slice_ms * 1000LL;
             const int64_t tolerance_us =
@@ -895,7 +896,6 @@ static void inactivity_power_policy_task(void *arg)
             }
 
             remaining_ms -= poll_slice_ms;
-            light_sleep_elapsed_ms += poll_slice_ms;
 
             bool touched_now = false;
             touch_ret =
@@ -915,120 +915,87 @@ static void inactivity_power_policy_task(void *arg)
             }
 
             /*
-             * V6 TIME-QUALIFIED TOUCH GATE (SECONDARY FILTER)
+             * V4 POST-SLEEP RELEASE GATE
              *
-             * V4 proved that counting a few consecutive RELEASED samples was
-             * insufficient: the GT911 could emit PRESSED -> RELEASED -> PRESSED
-             * during the display/DSI power transition and satisfy the old gate.
+             * Never wake from the first "pressed" values seen after the DSI
+             * teardown.  The GT911 must first prove that it can report a stable
+             * RELEASED state after the system has actually entered Light-sleep.
              *
-             * V6 first fixes the GT911 driver's stale-point cache. This elapsed-time gate remains as a secondary filter:
+             * This directly handles the measured sequence:
              *
-             *   startup quarantine
-             *       ignore every GT911 PRESSED/RELEASED value
+             *     pre-sleep:  RELEASED RELEASED RELEASED
+             *     post-sleep: PRESSED  PRESSED  ... false startup state
              *
-             *   stable release window
-             *       require continuously RELEASED for a configured duration
-             *
-             *   stable press window
-             *       after arming, require continuously PRESSED for a configured
-             *       duration before restoring the camera/display
-             *
-             * Any opposite sample resets the corresponding stability timer.
-             * GPIO3 is independent and still wakes immediately.
+             * A sustained startup press is suppressed until a release streak
+             * appears.  Only a later RELEASED -> PRESSED transition can wake.
              */
-            if (light_sleep_elapsed_ms <
-                APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS) {
-                release_stable_ms = 0;
-                press_stable_ms = 0;
-
-                if (touched_now && !startup_press_logged) {
-                    startup_press_logged = true;
-                    ESP_LOGW(
-                        POWER_TAG,
-                        "event=LIGHT_SLEEP_TOUCH_STARTUP_PRESS_SUPPRESSED "
-                        "elapsed_ms=%" PRIu32
-                        " ignore_until_ms=%u action=CONTINUE_SLEEP",
-                        light_sleep_elapsed_ms,
-                        (unsigned)APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS);
-                }
-
-                continue;
-            }
-
             if (!touch_wake_armed) {
-                press_stable_ms = 0;
-                press_candidate_logged = false;
-
                 if (touched_now) {
-                    release_stable_ms = 0;
-                    release_window_logged = false;
+                    post_release_samples = 0;
+
+                    if (!startup_press_logged) {
+                        startup_press_logged = true;
+                        ESP_LOGW(
+                            POWER_TAG,
+                            "event=LIGHT_SLEEP_TOUCH_STARTUP_PRESS_SUPPRESSED "
+                            "action=WAIT_FOR_POST_SLEEP_RELEASE");
+                    }
+
                     continue;
                 }
 
-                if (!release_window_logged) {
-                    release_window_logged = true;
-                    ESP_LOGI(
-                        POWER_TAG,
-                        "event=LIGHT_SLEEP_TOUCH_RELEASE_WINDOW_STARTED "
-                        "required_ms=%u",
-                        (unsigned)APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS);
-                }
+                post_release_samples++;
 
-                if (UINT32_MAX - release_stable_ms < poll_slice_ms) {
-                    release_stable_ms = UINT32_MAX;
-                } else {
-                    release_stable_ms += poll_slice_ms;
-                }
-
-                if (release_stable_ms >=
-                    APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS) {
+                if (post_release_samples >=
+                    APP_LIGHT_SLEEP_TOUCH_POST_RELEASE_SAMPLES) {
                     touch_wake_armed = true;
-                    press_stable_ms = 0;
 
                     ESP_LOGI(
                         POWER_TAG,
                         "event=LIGHT_SLEEP_TOUCH_POST_ARMED "
-                        "stable_release_ms=%" PRIu32
-                        " elapsed_ms=%" PRIu32,
-                        release_stable_ms,
-                        light_sleep_elapsed_ms);
+                        "released_samples=%" PRIu32,
+                        post_release_samples);
                 }
 
                 continue;
             }
 
             if (!touched_now) {
-                press_stable_ms = 0;
-                press_candidate_logged = false;
                 continue;
             }
 
-            if (!press_candidate_logged) {
-                press_candidate_logged = true;
-                ESP_LOGI(
+            /*
+             * Once post-sleep arming is complete, require one additional fresh
+             * hardware read after a short delay.  A single transient status
+             * value therefore cannot restore the expensive camera/display
+             * pipeline.
+             */
+            vTaskDelay(
+                pdMS_TO_TICKS(APP_LIGHT_SLEEP_TOUCH_CONFIRM_DELAY_MS));
+
+            bool touch_confirmed = false;
+            touch_ret =
+                bsp_touch_poll_for_light_sleep(&touch_confirmed);
+
+            if (touch_ret != ESP_OK) {
+                ESP_LOGE(
                     POWER_TAG,
-                    "event=LIGHT_SLEEP_TOUCH_PRESS_CANDIDATE "
-                    "required_ms=%u",
-                    (unsigned)APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS);
+                    "event=LIGHT_SLEEP_FAILED phase=TOUCH_CONFIRM "
+                    "error=%s action=RESTART",
+                    esp_err_to_name(touch_ret));
+                esp_restart();
             }
 
-            if (UINT32_MAX - press_stable_ms < poll_slice_ms) {
-                press_stable_ms = UINT32_MAX;
-            } else {
-                press_stable_ms += poll_slice_ms;
-            }
-
-            if (press_stable_ms >=
-                APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS) {
+            if (touch_confirmed) {
                 touchscreen_touched = true;
                 ESP_LOGI(
                     POWER_TAG,
-                    "event=LIGHT_SLEEP_TOUCH_CONFIRMED "
-                    "stable_press_ms=%" PRIu32
-                    " elapsed_ms=%" PRIu32
-                    " action=RESTORE_ACTIVE",
-                    press_stable_ms,
-                    light_sleep_elapsed_ms);
+                    "event=LIGHT_SLEEP_TOUCH_CONFIRMED action=RESTORE_ACTIVE");
+            } else {
+                ESP_LOGW(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_TOUCH_GLITCH_REJECTED "
+                    "action=CONTINUE_SLEEP");
             }
         }
 

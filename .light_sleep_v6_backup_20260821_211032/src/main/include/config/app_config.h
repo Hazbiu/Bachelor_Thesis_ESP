@@ -92,17 +92,13 @@
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
 
 /*
- * GT911 Light-sleep false-wake filter (V6).
+ * GT911 Light-sleep false-wake filter (V5).
  *
- * Root cause:
- *   esp_lcd_touch_gt911_read_data() can return with the controller's DATA_READY
- *   bit clear without invalidating the driver's cached tp->data.points value.
- *   A previous one-frame touch can therefore be returned again by
- *   esp_lcd_touch_get_coordinates() even though no new GT911 touch packet exists.
+ * The GT911 can oscillate between false PRESSED/RELEASED states for a short
+ * period after camera/MIPI-DSI teardown. Counting a few fast samples is not
+ * enough because that startup oscillation can look exactly like a real touch.
  *
- * The V6 installer patches that managed GT911 driver in place so DATA_READY=0
- * invalidates cached points. The time-qualified filter below remains as a
- * secondary guard against a genuine one-frame electrical/transient touch packet:
+ * V5 therefore qualifies touchscreen wake by elapsed Light-sleep poll time:
  *
  *   1. Ignore every touch sample during the startup quarantine.
  *   2. Require a continuous RELEASED window before touch wake is armed.

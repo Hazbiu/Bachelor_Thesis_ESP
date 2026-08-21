@@ -1,5 +1,5 @@
 Complete project export
-Generated on: Fri Aug 21 07:20:33 PM CEST 2026
+Generated on: Fri Aug 21 08:52:22 PM CEST 2026
 Project: /home/hazbiu/Programming/Bachelor_Thesis_ESP
 Included: every file under src/main
 Included: every CMakeLists.txt and *.cmake file under src
@@ -517,6 +517,7 @@ FILE: src/main/app/app_main.c
 #include "config/app_features.h"
 #include "config/log_config.h"
 #include "app_sleep.h"
+#include "power_save/component_wifi.h"
 
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 
@@ -1164,7 +1165,7 @@ static void pin_accepted_callback(void *user_data)
         NULL,
         7,
         NULL,
-        1);
+        APP_SYSTEM_WORKER_CORE);
 
     if (created != pdPASS) {
         ESP_LOGE(TAG, "Failed to create camera-resume task");
@@ -1273,8 +1274,8 @@ static void pin_screen_transition_task(void *arg)
  *
  *     detector -> recognizer -> unlock AI -> PIN transition
  *
- * and prevents the high-priority PIN task from pre-empting the recognizer
- * while the detector/recognizer chain still owns the inference lock.
+ * and prevents the UI transition from racing the detector/recognizer chain
+ * while the shared inference lock is still owned by the AI worker.
  */
 static bool authentication_request_pin(const char *recognized_name)
 {
@@ -1321,7 +1322,7 @@ static bool authentication_launch_pin_transition(void)
         NULL,
         7,
         NULL,
-        1);
+        APP_SYSTEM_WORKER_CORE);
 
     if (created != pdPASS) {
         ESP_LOGE(TAG, "Failed to create PIN-screen transition task");
@@ -2136,13 +2137,14 @@ static esp_err_t suspend_display_for_idle_scan(void *user_data)
 
     xSemaphoreGive(display_mode_mutex);
 
-    BaseType_t created = xTaskCreate(
+    BaseType_t created = xTaskCreatePinnedToCore(
         idle_scan_touch_poll_task,
         "idle_scan_touch",
         3072,
         NULL,
         4,
-        NULL);
+        NULL,
+        APP_SYSTEM_WORKER_CORE);
 
     if (created != pdPASS) {
         ESP_LOGE(TAG, "Could not create IDLE-SCAN touch polling task");
@@ -2270,13 +2272,14 @@ static esp_err_t request_display_resume_from_idle_scan(void *user_data)
     idle_scan_resume_task_pending = true;
     portEXIT_CRITICAL(&idle_scan_state_lock);
 
-    BaseType_t created = xTaskCreate(
+    BaseType_t created = xTaskCreatePinnedToCore(
         resume_display_from_idle_scan_task,
         "idle_scan_resume",
         6144,
         NULL,
         7,
-        NULL);
+        NULL,
+        APP_SYSTEM_WORKER_CORE);
 
     if (created != pdPASS) {
         portENTER_CRITICAL(&idle_scan_state_lock);
@@ -2647,8 +2650,11 @@ static void camera_application_start_task(void *arg)
      * Start capture while dummy draw is still disabled. Any frame arriving in
      * this tiny transition window is safely ignored by the callback.
      */
-    ESP_LOGI(TAG, "[CORE-PROOF] Requesting video stream task on CPU0");
-    ret = app_video_stream_task_start(video_cam_fd0, 0, NULL);
+    ESP_LOGI(TAG,
+             "[CORE-PROOF] Requesting video stream task on system CPU%d",
+             APP_SYSTEM_WORKER_CORE);
+    ret = app_video_stream_task_start(
+        video_cam_fd0, APP_SYSTEM_WORKER_CORE, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Video stream task failed: %s", esp_err_to_name(ret));
         app_ui_show_error("Camera stream failed to start. Restart the device.");
@@ -2709,7 +2715,7 @@ static void launcher_start_requested(void *user_data)
         NULL,
         6,
         NULL,
-        1);
+        APP_SYSTEM_WORKER_CORE);
 
     if (created != pdPASS) {
         application_start_requested = false;
@@ -2722,6 +2728,18 @@ static void launcher_start_requested(void *user_data)
 void app_main(void)
 {
     app_logging_init();
+    /* ESP32-C6 is unused: keep CHIP_PU LOW permanently. */
+    esp_err_t c6_ret = component_wifi_disable_for_deep_sleep();
+    if (c6_ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "Failed to disable ESP32-C6: %s",
+                 esp_err_to_name(c6_ret));
+    }
+
+    ESP_LOGI(TAG,
+             "[CORE-PROOF] Application split: system_cpu=%d ai_cpu=%d",
+             APP_SYSTEM_WORKER_CORE,
+             APP_AI_WORKER_CORE);
 
     report_wake_reason();
     core_trace(TAG, "APP_MAIN_START");
@@ -3119,6 +3137,7 @@ FILE: src/main/diagnostics/ai_pipeline_status.c
 #include <string.h>
 #include <stdbool.h>
 
+#include "config/app_config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -3192,9 +3211,10 @@ void diagnostics_start_ai_pipeline_monitor(void)
         NULL,
         tskIDLE_PRIORITY + 1,
         NULL,
-        tskNO_AFFINITY
+        APP_SYSTEM_WORKER_CORE
     );
 }
+
 
 ==================================================
 FILE: src/main/diagnostics/app_logging.c
@@ -3293,6 +3313,7 @@ FILE: src/main/diagnostics/cpu_stats.c
 #include <string.h>
 #include <inttypes.h>
 
+#include "config/app_config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
@@ -3452,9 +3473,10 @@ void diagnostics_start_cpu_stats_monitor(void)
         NULL,
         tskIDLE_PRIORITY + 1,
         NULL,
-        tskNO_AFFINITY
+        APP_SYSTEM_WORKER_CORE
     );
 }
+
 
 ==================================================
 FILE: src/main/idf_component.yml
@@ -3513,6 +3535,26 @@ FILE: src/main/include/config/app_config.h
 #define APP_CAMERA_BUFFER_COUNT             2
 #define APP_DISPLAY_BUFFER_COUNT            2
 
+/*
+ * Application task affinity on the ESP32-P4 high-performance CPU pair.
+ *
+ * CPU0 and CPU1 are equivalent HP RISC-V cores; this split is about workload
+ * isolation, not different core capabilities. Keep application-side camera,
+ * display, UI, sleep-control and diagnostic tasks on CPU0, and reserve CPU1
+ * for the asynchronous detector -> recognizer worker. ESP-IDF/library tasks
+ * still keep whatever affinity their own components configure.
+ *
+ * The CPU-frequency PM policy is shared by the HP subsystem. A 360 MHz PM
+ * lock raised by the AI worker therefore changes the HP CPU clock policy; it
+ * does not create independent 180 MHz/360 MHz clocks for CPU0 and CPU1.
+ */
+#define APP_SYSTEM_WORKER_CORE                      0
+#define APP_AI_WORKER_CORE                          1
+
+#if APP_SYSTEM_WORKER_CORE == APP_AI_WORKER_CORE
+#error "System/application tasks and AI worker must use different HP cores"
+#endif
+
 /* Face-processing configuration */
 #define APP_FACE_DETECT_INTERVAL_FRAMES             2U
 #define APP_FACE_DETECT_IDLE_180_INTERVAL_FRAMES    8U
@@ -3525,11 +3567,11 @@ FILE: src/main/include/config/app_config.h
 #define APP_FACE_LABEL_FONT_SCALE                   3
 
 /*
- * Asynchronous AI worker. The live preview stays on CPU0; CPU1 receives only
- * one latest-frame snapshot and never builds a backlog of stale frames.
+ * Asynchronous AI worker. CPU1 receives only one latest-frame snapshot and
+ * never builds a backlog of stale frames. All application-created non-AI
+ * tasks are kept on APP_SYSTEM_WORKER_CORE.
  */
 #define APP_AI_SNAPSHOT_MAX_EDGE                    320U
-#define APP_AI_WORKER_CORE                          1
 #define APP_AI_WORKER_STACK_SIZE                    (12 * 1024)
 #define APP_AI_WORKER_PRIORITY                      5
 #define APP_AI_WORKER_DRAIN_TIMEOUT_MS              18000U
@@ -3577,6 +3619,20 @@ FILE: src/main/include/config/app_config.h
 #define APP_LIGHT_SLEEP_TOUCH_POLL_MS               250U
 #define APP_LIGHT_SLEEP_BUTTON_POLL_MS              5U
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
+
+/*
+ * GT911 Light-sleep false-wake filter (V4).
+ *
+ * The controller can report a sustained pressed state immediately after the
+ * camera/MIPI-DSI teardown even though the panel was released before sleep.
+ * Therefore a touch is not allowed to wake the application until the GT911 has
+ * first been observed RELEASED again after at least one Light-sleep slice.
+ */
+#define APP_LIGHT_SLEEP_TOUCH_PRE_RELEASE_SAMPLES   3U
+#define APP_LIGHT_SLEEP_TOUCH_PRECHECK_MAX_SAMPLES  12U
+#define APP_LIGHT_SLEEP_TOUCH_POST_RELEASE_SAMPLES  3U
+#define APP_LIGHT_SLEEP_TOUCH_SAMPLE_DELAY_MS       15U
+#define APP_LIGHT_SLEEP_TOUCH_CONFIRM_DELAY_MS      15U
 
 /*
  * esp_light_sleep_start() may return a few hundred microseconds before the
@@ -4376,7 +4432,9 @@ FILE: src/main/include/power_save/component_wifi.h
 #include "esp_err.h"
 
 /**
- * Disable the external ESP32-C6 Wi-Fi coprocessor before ESP32-P4 deep sleep.
+ * Disable the external ESP32-C6 Wi-Fi coprocessor by driving CHIP_PU LOW and
+ * holding the GPIO configuration. The call is idempotent, so it is safe to
+ * call once during boot and again from the Deep-sleep shutdown sequence.
  *
  * Waveshare ESP32-P4-NANO:
  * ESP32-P4 GPIO54 -> ESP32-C6 CHIP_PU
@@ -4384,7 +4442,8 @@ FILE: src/main/include/power_save/component_wifi.h
 esp_err_t component_wifi_disable_for_deep_sleep(void);
 
 /**
- * Re-enable the ESP32-C6 only if entering deep sleep unexpectedly fails.
+ * Deep-sleep failure hook. In this build the ESP32-C6 intentionally remains
+ * disabled, so this function does not release CHIP_PU or re-enable the C6.
  */
 esp_err_t component_wifi_restore_after_failed_sleep(void);
 
@@ -6749,6 +6808,11 @@ static void inactivity_power_policy_task(void *arg)
 
     ESP_LOGI(
         POWER_TAG,
+        "event=LIGHT_SLEEP_TOUCH_FIX version=4 "
+        "mode=POST_SLEEP_RELEASE_GATE");
+
+    ESP_LOGI(
+        POWER_TAG,
         "event=INACTIVITY_POLICY_STARTED idle_180_after_ms=%u "
         "idle_90_after_ms=%u light_sleep_after_ms=%u "
         "deep_sleep_after_ms=%u",
@@ -6857,17 +6921,47 @@ static void inactivity_power_policy_task(void *arg)
             "camera=OFF display=OFF");
 
         /*
-         * Flush any coordinate that LVGL consumed immediately before the
-         * adapter was stopped. It must not be mistaken for a new wake touch.
+         * PRE-SLEEP CHECK
+         *
+         * The old code consumed just one GT911 sample here.  The V2 filter
+         * proved that the controller is genuinely released before sleep, but
+         * the hardware can still report a sustained false press immediately
+         * after the first sleep slice.  Keep this pre-check as a sanity guard,
+         * but DO NOT use it to arm touchscreen wake.
+         *
+         * Touch wake is armed only after a fresh post-sleep release streak.
          */
-        bool stale_touch = false;
-        esp_err_t touch_ret =
-            bsp_touch_poll_for_light_sleep(&stale_touch);
+        esp_err_t touch_ret = ESP_OK;
+        uint32_t pre_release_samples = 0;
+
+        for (uint32_t attempt = 0;
+             attempt < APP_LIGHT_SLEEP_TOUCH_PRECHECK_MAX_SAMPLES &&
+             pre_release_samples < APP_LIGHT_SLEEP_TOUCH_PRE_RELEASE_SAMPLES;
+             ++attempt) {
+            bool touched_now = false;
+            touch_ret = bsp_touch_poll_for_light_sleep(&touched_now);
+
+            if (touch_ret != ESP_OK) {
+                break;
+            }
+
+            if (touched_now) {
+                pre_release_samples = 0;
+            } else {
+                pre_release_samples++;
+            }
+
+            if (pre_release_samples <
+                APP_LIGHT_SLEEP_TOUCH_PRE_RELEASE_SAMPLES) {
+                vTaskDelay(
+                    pdMS_TO_TICKS(APP_LIGHT_SLEEP_TOUCH_SAMPLE_DELAY_MS));
+            }
+        }
 
         if (touch_ret != ESP_OK) {
             ESP_LOGE(
                 POWER_TAG,
-                "event=LIGHT_SLEEP_FAILED phase=TOUCH_PREPARE "
+                "event=LIGHT_SLEEP_FAILED phase=TOUCH_PRECHECK "
                 "error=%s action=RESTART",
                 esp_err_to_name(touch_ret));
             ESP_LOGE(
@@ -6877,11 +6971,51 @@ static void inactivity_power_policy_task(void *arg)
             esp_restart();
         }
 
+        if (pre_release_samples <
+            APP_LIGHT_SLEEP_TOUCH_PRE_RELEASE_SAMPLES) {
+            /*
+             * A real finger may have arrived while the hardware was being
+             * suspended.  Restore ACTIVE instead of entering a sleep window
+             * with an ambiguous precondition.
+             */
+            ESP_LOGI(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_EXIT reason=TOUCHSCREEN_PRECHECK "
+                "action=RESTORE_ACTIVE");
+
+            finish_light_sleep(
+                ESP_OK,
+                ESP_SLEEP_WAKEUP_UNDEFINED,
+                true);
+
+            esp_err_t resume_ret =
+                s_light_resume_callback(s_light_transition_user_data);
+
+            if (resume_ret != ESP_OK) {
+                ESP_LOGE(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_FAILED phase=HARDWARE_RESUME "
+                    "error=%s action=RESTART",
+                    esp_err_to_name(resume_ret));
+                esp_restart();
+            }
+
+            continue;
+        }
+
+        ESP_LOGI(
+            POWER_TAG,
+            "event=LIGHT_SLEEP_TOUCH_PRECHECK "
+            "released_samples=%" PRIu32,
+            pre_release_samples);
+
         ESP_LOGI(
             TAG,
-            "GT911 polling armed every %d ms until the %d ms Deep-sleep deadline",
+            "GT911 polling every %d ms until the %d ms Deep-sleep deadline; "
+            "touch wake will arm only after a post-sleep release streak",
             APP_LIGHT_SLEEP_TOUCH_POLL_MS,
             APP_DEEP_SLEEP_TIMEOUT_MS);
+
         ESP_LOGI(
             POWER_TAG,
             "event=LIGHT_SLEEP_ENTER mode=TIMER_SLICED "
@@ -6893,6 +7027,9 @@ static void inactivity_power_policy_task(void *arg)
         esp_sleep_wakeup_cause_t wake_cause =
             ESP_SLEEP_WAKEUP_UNDEFINED;
         bool touchscreen_touched = false;
+        bool touch_wake_armed = false;
+        bool startup_press_logged = false;
+        uint32_t post_release_samples = 0;
         uint32_t short_slice_count = 0;
 
         while (remaining_ms > 0 && !touchscreen_touched) {
@@ -6934,25 +7071,16 @@ static void inactivity_power_policy_task(void *arg)
              * call can return in a couple of milliseconds and still report a
              * TIMER wake. Charging the inactivity budget with the REQUESTED
              * slice in that case makes the countdown run far faster than real
-             * time - observed on this board as the whole ~15 s Light-sleep
-             * window being consumed in ~96 ms of wall clock, dropping the
-             * system into Deep-sleep roughly 15 s early.
+             * time.
              *
              * Spend the remainder of the slice in a blocked delay so one loop
-             * iteration always costs one slice of real time. The touch poll
-             * cadence stays at APP_LIGHT_SLEEP_TOUCH_POLL_MS either way.
+             * iteration still costs one requested slice from the application
+             * scheduler's point of view.
              */
             const int64_t requested_us = (int64_t)poll_slice_ms * 1000LL;
             const int64_t tolerance_us =
                 (int64_t)APP_LIGHT_SLEEP_EARLY_RETURN_TOLERANCE_US;
 
-            /*
-             * Timer quantization routinely returns a 250 ms request a few
-             * hundred microseconds early (for example ~249.4 ms). That is a
-             * normal Light-sleep interval, not evidence that the RTC failed to
-             * sleep. Only treat a return as materially short when it exceeds
-             * the configured tolerance.
-             */
             if (slice_elapsed_us + tolerance_us < requested_us) {
                 const int64_t shortfall_us = requested_us - slice_elapsed_us;
                 const uint32_t shortfall_ms =
@@ -6987,8 +7115,9 @@ static void inactivity_power_policy_task(void *arg)
 
             remaining_ms -= poll_slice_ms;
 
-            touch_ret = bsp_touch_poll_for_light_sleep(
-                &touchscreen_touched);
+            bool touched_now = false;
+            touch_ret =
+                bsp_touch_poll_for_light_sleep(&touched_now);
 
             if (touch_ret != ESP_OK) {
                 ESP_LOGE(
@@ -7001,6 +7130,90 @@ static void inactivity_power_policy_task(void *arg)
                     "GT911 Light-sleep poll failed: %s; restarting safely",
                     esp_err_to_name(touch_ret));
                 esp_restart();
+            }
+
+            /*
+             * V4 POST-SLEEP RELEASE GATE
+             *
+             * Never wake from the first "pressed" values seen after the DSI
+             * teardown.  The GT911 must first prove that it can report a stable
+             * RELEASED state after the system has actually entered Light-sleep.
+             *
+             * This directly handles the measured sequence:
+             *
+             *     pre-sleep:  RELEASED RELEASED RELEASED
+             *     post-sleep: PRESSED  PRESSED  ... false startup state
+             *
+             * A sustained startup press is suppressed until a release streak
+             * appears.  Only a later RELEASED -> PRESSED transition can wake.
+             */
+            if (!touch_wake_armed) {
+                if (touched_now) {
+                    post_release_samples = 0;
+
+                    if (!startup_press_logged) {
+                        startup_press_logged = true;
+                        ESP_LOGW(
+                            POWER_TAG,
+                            "event=LIGHT_SLEEP_TOUCH_STARTUP_PRESS_SUPPRESSED "
+                            "action=WAIT_FOR_POST_SLEEP_RELEASE");
+                    }
+
+                    continue;
+                }
+
+                post_release_samples++;
+
+                if (post_release_samples >=
+                    APP_LIGHT_SLEEP_TOUCH_POST_RELEASE_SAMPLES) {
+                    touch_wake_armed = true;
+
+                    ESP_LOGI(
+                        POWER_TAG,
+                        "event=LIGHT_SLEEP_TOUCH_POST_ARMED "
+                        "released_samples=%" PRIu32,
+                        post_release_samples);
+                }
+
+                continue;
+            }
+
+            if (!touched_now) {
+                continue;
+            }
+
+            /*
+             * Once post-sleep arming is complete, require one additional fresh
+             * hardware read after a short delay.  A single transient status
+             * value therefore cannot restore the expensive camera/display
+             * pipeline.
+             */
+            vTaskDelay(
+                pdMS_TO_TICKS(APP_LIGHT_SLEEP_TOUCH_CONFIRM_DELAY_MS));
+
+            bool touch_confirmed = false;
+            touch_ret =
+                bsp_touch_poll_for_light_sleep(&touch_confirmed);
+
+            if (touch_ret != ESP_OK) {
+                ESP_LOGE(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_FAILED phase=TOUCH_CONFIRM "
+                    "error=%s action=RESTART",
+                    esp_err_to_name(touch_ret));
+                esp_restart();
+            }
+
+            if (touch_confirmed) {
+                touchscreen_touched = true;
+                ESP_LOGI(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_TOUCH_CONFIRMED action=RESTORE_ACTIVE");
+            } else {
+                ESP_LOGW(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_TOUCH_GLITCH_REJECTED "
+                    "action=CONTINUE_SLEEP");
             }
         }
 
@@ -7085,6 +7298,7 @@ static void inactivity_power_policy_task(void *arg)
     vTaskDelete(NULL);
 }
 
+
 esp_err_t app_sleep_start_button_monitor(
     app_sleep_prepare_callback_t prepare_callback,
     void *user_data)
@@ -7099,7 +7313,7 @@ esp_err_t app_sleep_start_button_monitor(
         NULL,
         APP_DEEP_SLEEP_BUTTON_PRIORITY,
         NULL,
-        1);
+        APP_SYSTEM_WORKER_CORE);
 
     if (created != pdPASS) {
         ESP_LOGE(TAG, "Failed to create deep-sleep button task");
@@ -7130,13 +7344,14 @@ esp_err_t app_sleep_start_timeout(void)
 
     cpu_power_notify_activity();
 
-    BaseType_t created = xTaskCreate(
+    BaseType_t created = xTaskCreatePinnedToCore(
         inactivity_power_policy_task,
         "inactivity_power",
         APP_INACTIVITY_POWER_TASK_STACK_SIZE,
         NULL,
         5,
-        NULL);
+        NULL,
+        APP_SYSTEM_WORKER_CORE);
 
     if (created != pdPASS) {
         portENTER_CRITICAL(&s_sleep_request_lock);
@@ -8398,34 +8613,66 @@ static int wait_for_pad_level(gpio_num_t gpio_num, int expected_level,
 
 esp_err_t component_wifi_disable_for_deep_sleep(void)
 {
+    if (s_c6_disabled) {
+        return ESP_OK;
+    }
+    const gpio_num_t pin = WIFI_C6_CHIP_PU_GPIO;
+
+    /*
+     * Make sure GPIO54 is not carrying an old hold state.
+     */
+    esp_err_t ret = gpio_hold_dis(pin);
+    if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGE(
+            TAG,
+            "Could not release previous GPIO%d hold: %s",
+            pin,
+            esp_err_to_name(ret));
+        return ret;
+    }
+
     gpio_config_t io_config = {
-        .pin_bit_mask = 1ULL << WIFI_C6_CHIP_PU_GPIO,
+        .pin_bit_mask = 1ULL << pin,
+
         /*
-         * INPUT_OUTPUT instead of OUTPUT so the pad can be read back after the
-         * hold is applied. The pre-sleep rail audit in deep_sleep.c relies on
-         * this to prove that CHIP_PU really stays LOW; a plain OUTPUT pad has
-         * its input path disabled and always reads 0.
+         * Keep input enabled so gpio_get_level() and the
+         * pre-Deep-sleep audit can still measure the pad.
          */
         .mode = GPIO_MODE_INPUT_OUTPUT,
+
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
 
-    esp_err_t ret = gpio_config(&io_config);
+    ret = gpio_config(&io_config);
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
             "GPIO%d configuration failed: %s",
-            WIFI_C6_CHIP_PU_GPIO,
+            pin,
             esp_err_to_name(ret));
         return ret;
     }
 
     /*
-     * LOW holds the external ESP32-C6 in reset.
+     * Use maximum output drive strength.
      */
-    ret = gpio_set_level(WIFI_C6_CHIP_PU_GPIO, WIFI_C6_DISABLED_LEVEL);
+    ret = gpio_set_drive_capability(pin, GPIO_DRIVE_CAP_3);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not set GPIO%d drive strength: %s",
+            pin,
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    /*
+     * C6 CHIP_PU:
+     * LOW = C6 disabled
+     */
+    ret = gpio_set_level(pin, WIFI_C6_DISABLED_LEVEL);
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -8435,62 +8682,54 @@ esp_err_t component_wifi_disable_for_deep_sleep(void)
     }
 
     /*
-     * ESP-IDF normally switches GPIO54 to its sleep configuration.
-     * The board's external pull-up then raises CHIP_PU to 3.3 V and
-     * starts the ESP32-C6 again.
-     *
-     * Disable sleep-configuration switching for GPIO54 before holding
-     * the pin, so its active OUTPUT-LOW configuration is retained.
+     * Keep the active GPIO configuration during sleep.
      */
-    ret = gpio_sleep_sel_dis(WIFI_C6_CHIP_PU_GPIO);
+    ret = gpio_sleep_sel_dis(pin);
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
             "Could not disable sleep switching for GPIO%d: %s",
-            WIFI_C6_CHIP_PU_GPIO,
+            pin,
             esp_err_to_name(ret));
         return ret;
     }
 
-    ret = gpio_hold_en(WIFI_C6_CHIP_PU_GPIO);
+    /*
+     * Latch output-enable, output level, function and drive strength.
+     */
+    ret = gpio_hold_en(pin);
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
             "Could not hold GPIO%d LOW: %s",
-            WIFI_C6_CHIP_PU_GPIO,
+            pin,
             esp_err_to_name(ret));
         return ret;
     }
 
     s_c6_disabled = true;
 
-    /*
-     * Read the pad back through the still-enabled input path. If it never
-     * settles LOW, the external pull-up has won and the ESP32-C6 is running,
-     * which is worth tens of milliamps during "Deep-sleep".
-     */
     uint32_t settle_ms = 0;
     const int level_after_hold = wait_for_pad_level(
-        WIFI_C6_CHIP_PU_GPIO,
+        pin,
         WIFI_C6_DISABLED_LEVEL,
         &settle_ms);
 
     if (level_after_hold != WIFI_C6_DISABLED_LEVEL) {
         ESP_LOGE(
             TAG,
-            "ESP32-C6 CHIP_PU still reads %d after holding for %" PRIu32
-            " ms (expected %d); the coprocessor is still powered",
+            "ESP32-C6 CHIP_PU still reads %d after %" PRIu32
+            " ms; expected LOW",
             level_after_hold,
-            settle_ms,
-            WIFI_C6_DISABLED_LEVEL);
+            settle_ms);
         return ESP_ERR_INVALID_STATE;
     }
 
     ESP_LOGI(
         TAG,
-        "ESP32-C6 disabled: GPIO%d CHIP_PU held LOW "
+        "ESP32-C6 disabled: GPIO%d CHIP_PU strongly held LOW "
         "(read-back=%d after %" PRIu32 " ms)",
-        WIFI_C6_CHIP_PU_GPIO,
+        pin,
         level_after_hold,
         settle_ms);
 
@@ -8499,36 +8738,8 @@ esp_err_t component_wifi_disable_for_deep_sleep(void)
 
 esp_err_t component_wifi_restore_after_failed_sleep(void)
 {
-    /*
-     * This function is reached only if esp_deep_sleep_start()
-     * unexpectedly returns.
-     */
-    if (!s_c6_disabled) {
-        return ESP_OK;
-    }
-
-    esp_err_t ret = gpio_hold_dis(WIFI_C6_CHIP_PU_GPIO);
-    if (ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "Could not release GPIO%d hold: %s",
-            WIFI_C6_CHIP_PU_GPIO,
-            esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = gpio_set_level(WIFI_C6_CHIP_PU_GPIO, WIFI_C6_ENABLED_LEVEL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "Could not drive ESP32-C6 CHIP_PU HIGH: %s",
-            esp_err_to_name(ret));
-        return ret;
-    }
-
-    s_c6_disabled = false;
-
-    ESP_LOGW(TAG, "Deep sleep failed; ESP32-C6 re-enabled");
+    /* C6 is intentionally kept disabled permanently. */
+    ESP_LOGI(TAG, "ESP32-C6 remains disabled");
     return ESP_OK;
 }
 

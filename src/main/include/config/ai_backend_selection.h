@@ -5,5 +5,5 @@
  * Do not edit manually during A/B measurements.
  */
 #ifndef APP_AI_BACKEND
-#define APP_AI_BACKEND APP_AI_BACKEND_TFLM_INT8
+#define APP_AI_BACKEND APP_AI_BACKEND_ESPDL
 #endif

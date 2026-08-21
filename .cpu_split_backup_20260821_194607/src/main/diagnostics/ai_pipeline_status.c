@@ -4,7 +4,6 @@
 #include <string.h>
 #include <stdbool.h>
 
-#include "config/app_config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -78,6 +77,6 @@ void diagnostics_start_ai_pipeline_monitor(void)
         NULL,
         tskIDLE_PRIORITY + 1,
         NULL,
-        APP_SYSTEM_WORKER_CORE
+        tskNO_AFFINITY
     );
 }

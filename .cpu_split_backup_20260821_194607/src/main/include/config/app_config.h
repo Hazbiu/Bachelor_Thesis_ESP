@@ -6,26 +6,6 @@
 #define APP_CAMERA_BUFFER_COUNT             2
 #define APP_DISPLAY_BUFFER_COUNT            2
 
-/*
- * Application task affinity on the ESP32-P4 high-performance CPU pair.
- *
- * CPU0 and CPU1 are equivalent HP RISC-V cores; this split is about workload
- * isolation, not different core capabilities. Keep application-side camera,
- * display, UI, sleep-control and diagnostic tasks on CPU0, and reserve CPU1
- * for the asynchronous detector -> recognizer worker. ESP-IDF/library tasks
- * still keep whatever affinity their own components configure.
- *
- * The CPU-frequency PM policy is shared by the HP subsystem. A 360 MHz PM
- * lock raised by the AI worker therefore changes the HP CPU clock policy; it
- * does not create independent 180 MHz/360 MHz clocks for CPU0 and CPU1.
- */
-#define APP_SYSTEM_WORKER_CORE                      0
-#define APP_AI_WORKER_CORE                          1
-
-#if APP_SYSTEM_WORKER_CORE == APP_AI_WORKER_CORE
-#error "System/application tasks and AI worker must use different HP cores"
-#endif
-
 /* Face-processing configuration */
 #define APP_FACE_DETECT_INTERVAL_FRAMES             2U
 #define APP_FACE_DETECT_IDLE_180_INTERVAL_FRAMES    8U
@@ -38,11 +18,11 @@
 #define APP_FACE_LABEL_FONT_SCALE                   3
 
 /*
- * Asynchronous AI worker. CPU1 receives only one latest-frame snapshot and
- * never builds a backlog of stale frames. All application-created non-AI
- * tasks are kept on APP_SYSTEM_WORKER_CORE.
+ * Asynchronous AI worker. The live preview stays on CPU0; CPU1 receives only
+ * one latest-frame snapshot and never builds a backlog of stale frames.
  */
 #define APP_AI_SNAPSHOT_MAX_EDGE                    320U
+#define APP_AI_WORKER_CORE                          1
 #define APP_AI_WORKER_STACK_SIZE                    (12 * 1024)
 #define APP_AI_WORKER_PRIORITY                      5
 #define APP_AI_WORKER_DRAIN_TIMEOUT_MS              18000U
@@ -90,38 +70,6 @@
 #define APP_LIGHT_SLEEP_TOUCH_POLL_MS               250U
 #define APP_LIGHT_SLEEP_BUTTON_POLL_MS              5U
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
-
-/*
- * GT911 Light-sleep false-wake filter (V6).
- *
- * Root cause:
- *   esp_lcd_touch_gt911_read_data() can return with the controller's DATA_READY
- *   bit clear without invalidating the driver's cached tp->data.points value.
- *   A previous one-frame touch can therefore be returned again by
- *   esp_lcd_touch_get_coordinates() even though no new GT911 touch packet exists.
- *
- * The V6 installer patches that managed GT911 driver in place so DATA_READY=0
- * invalidates cached points. The time-qualified filter below remains as a
- * secondary guard against a genuine one-frame electrical/transient touch packet:
- *
- *   1. Ignore every touch sample during the startup quarantine.
- *   2. Require a continuous RELEASED window before touch wake is armed.
- *   3. After arming, require a continuous PRESSED window before restoring
- *      camera/display.
- *
- * With the 250 ms poll interval below, the defaults mean:
- *   startup ignored : 1000 ms
- *   stable release  : 1000 ms
- *   stable press    :  500 ms
- *
- * GPIO3 remains available as an immediate Light-sleep wake source.
- */
-#define APP_LIGHT_SLEEP_TOUCH_PRE_RELEASE_SAMPLES    3U
-#define APP_LIGHT_SLEEP_TOUCH_PRECHECK_MAX_SAMPLES   12U
-#define APP_LIGHT_SLEEP_TOUCH_SAMPLE_DELAY_MS        15U
-#define APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS      1000U
-#define APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS      1000U
-#define APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS        500U
 
 /*
  * esp_light_sleep_start() may return a few hundred microseconds before the

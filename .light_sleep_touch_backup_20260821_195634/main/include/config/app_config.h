@@ -88,40 +88,23 @@
 #define APP_LIGHT_SLEEP_WAKE_GPIO                   GPIO_NUM_3
 #define APP_LIGHT_SLEEP_TIMEOUT_MS                  15000U
 #define APP_LIGHT_SLEEP_TOUCH_POLL_MS               250U
-#define APP_LIGHT_SLEEP_BUTTON_POLL_MS              5U
-#define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
 
 /*
- * GT911 Light-sleep false-wake filter (V6).
+ * GT911 Light-sleep wake filtering.
  *
- * Root cause:
- *   esp_lcd_touch_gt911_read_data() can return with the controller's DATA_READY
- *   bit clear without invalidating the driver's cached tp->data.points value.
- *   A previous one-frame touch can therefore be returned again by
- *   esp_lcd_touch_get_coordinates() even though no new GT911 touch packet exists.
- *
- * The V6 installer patches that managed GT911 driver in place so DATA_READY=0
- * invalidates cached points. The time-qualified filter below remains as a
- * secondary guard against a genuine one-frame electrical/transient touch packet:
- *
- *   1. Ignore every touch sample during the startup quarantine.
- *   2. Require a continuous RELEASED window before touch wake is armed.
- *   3. After arming, require a continuous PRESSED window before restoring
- *      camera/display.
- *
- * With the 250 ms poll interval below, the defaults mean:
- *   startup ignored : 1000 ms
- *   stable release  : 1000 ms
- *   stable press    :  500 ms
- *
- * GPIO3 remains available as an immediate Light-sleep wake source.
+ * The touch controller is polled manually after LVGL/DSI are suspended.  Arm
+ * wake detection only after several consecutive RELEASED samples, then require
+ * a second fresh sample before accepting a touch as a wake event.  This rejects
+ * a cached/stale coordinate or a single noisy sample without changing the
+ * normal 250 ms sleep slice.
  */
-#define APP_LIGHT_SLEEP_TOUCH_PRE_RELEASE_SAMPLES    3U
-#define APP_LIGHT_SLEEP_TOUCH_PRECHECK_MAX_SAMPLES   12U
-#define APP_LIGHT_SLEEP_TOUCH_SAMPLE_DELAY_MS        15U
-#define APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS      1000U
-#define APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS      1000U
-#define APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS        500U
+#define APP_LIGHT_SLEEP_TOUCH_ARM_POLL_MS           20U
+#define APP_LIGHT_SLEEP_TOUCH_ARM_RELEASE_SAMPLES   3U
+#define APP_LIGHT_SLEEP_TOUCH_ARM_TIMEOUT_MS        500U
+#define APP_LIGHT_SLEEP_TOUCH_CONFIRM_DELAY_MS      15U
+
+#define APP_LIGHT_SLEEP_BUTTON_POLL_MS              5U
+#define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
 
 /*
  * esp_light_sleep_start() may return a few hundred microseconds before the
