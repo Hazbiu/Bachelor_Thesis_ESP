@@ -88,7 +88,7 @@ dependencies:
   espressif/esp_cam_sensor:
     dependencies: []
     source:
-      path: /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/components/espressif__esp_cam_sensor
+      path: /home/admin/Programming/Bachelor_Thesis_ESP/src/components/espressif__esp_cam_sensor
       type: local
     version: 0.9.0
   espressif/esp_codec_dev:
@@ -452,7 +452,7 @@ dependencies:
   waveshare/esp32_p4_platform:
     dependencies: []
     source:
-      path: /home/hazbiu/Programming/Bachelor_Thesis_ESP/src/components/waveshare__esp32_p4_platform
+      path: /home/admin/Programming/Bachelor_Thesis_ESP/src/components/waveshare__esp32_p4_platform
       type: local
     version: 2.0.1
   waveshare/esp_lcd_dsi:
