@@ -520,35 +520,9 @@ static void run_sleep_sequence(const char *reason)
 
     power_profile_stage_delay();
 
-    /*
-     * V20 STEP 2A: the physical JD9365 must receive DISPLAY_OFF + SLEEP_IN
-     * while the BSP panel/DBI handle still exists. Deleting the MIPI-DSI
-     * objects first would make the DCS Sleep-In command impossible.
-     */
     ESP_LOGI(
         "POWER_PROFILE",
-        "STEP 2A: LCD controller DISPLAY_OFF + FULL SLEEP_IN");
-
-    esp_err_t lcd_sleep_ret = component_display_panel_enter_full_sleep();
-
-    if (lcd_sleep_ret == ESP_OK) {
-        ESP_LOGI(
-            TAG,
-            "LCD controller full Sleep-In requested successfully "
-            "before MIPI-DSI teardown");
-    } else {
-        ESP_LOGW(
-            TAG,
-            "LCD controller full Sleep-In completed with errors: %s; "
-            "continuing with display teardown",
-            esp_err_to_name(lcd_sleep_ret));
-    }
-
-    power_profile_stage_delay();
-
-    ESP_LOGI(
-        "POWER_PROFILE",
-        "STEP 2B: tearing down display, touch and MIPI-DSI");
+        "STEP 2: disabling display, touch and MIPI-DSI");
 
     esp_err_t display_ret = bsp_display_shutdown_for_deep_sleep();
 
@@ -565,7 +539,7 @@ static void run_sleep_sequence(const char *reason)
 
     /*
      * STEP 3 runs after the BSP has released its own touch handle and while
-     * the shared I2C bus is still alive. V20 retains V19's GT911
+     * the shared I2C bus is still alive. V19 deliberately uses the GT911's
      * real full-Sleep command instead of Green mode. On the stock board there
      * is no P4-controlled GT911 INT/RESET wake pin, so this is a deepest-power
      * measurement policy: after GPIO3 wakes the P4, board power must be cycled

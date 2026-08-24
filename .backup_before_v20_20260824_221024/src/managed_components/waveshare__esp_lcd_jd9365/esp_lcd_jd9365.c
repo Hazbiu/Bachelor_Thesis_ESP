@@ -59,7 +59,6 @@ static esp_err_t panel_jd9365_reset(esp_lcd_panel_t *panel);
 static esp_err_t panel_jd9365_invert_color(esp_lcd_panel_t *panel, bool invert_color_data);
 static esp_err_t panel_jd9365_mirror(esp_lcd_panel_t *panel, bool mirror_x, bool mirror_y);
 static esp_err_t panel_jd9365_disp_on_off(esp_lcd_panel_t *panel, bool on_off);
-static esp_err_t panel_jd9365_disp_sleep(esp_lcd_panel_t *panel, bool sleep);
 
 esp_err_t esp_lcd_new_panel_jd9365(const esp_lcd_panel_io_handle_t io, const esp_lcd_panel_dev_config_t *panel_dev_config,
                                    esp_lcd_panel_handle_t *ret_panel)
@@ -166,7 +165,6 @@ esp_err_t esp_lcd_new_panel_jd9365(const esp_lcd_panel_io_handle_t io, const esp
     panel_handle->mirror = panel_jd9365_mirror;
     panel_handle->invert_color = panel_jd9365_invert_color;
     panel_handle->disp_on_off = panel_jd9365_disp_on_off;
-    panel_handle->disp_sleep = panel_jd9365_disp_sleep;
     panel_handle->user_data = jd9365;
     *ret_panel = panel_handle;
     ESP_LOGD(TAG, "new jd9365 panel @%p", jd9365);
@@ -1677,41 +1675,4 @@ static esp_err_t panel_jd9365_disp_on_off(esp_lcd_panel_t *panel, bool on_off)
     ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(io, command, NULL, 0), TAG, "send command failed");
     return ESP_OK;
 }
-
-/*
- * V20_JD9365_FULL_SLEEP_IN
- *
- * ESP-IDF's generic esp_lcd_panel_disp_sleep() calls this callback.
- * DCS SLEEP_IN (0x10) stops panel scanning/oscillator activity; SLEEP_OUT
- * (0x11) is provided for completeness. The application uses only SLEEP_IN
- * immediately before the BSP destroys the DSI transport and P4 enters
- * Deep-sleep.
- */
-static esp_err_t panel_jd9365_disp_sleep(esp_lcd_panel_t *panel, bool sleep)
-{
-    jd9365_panel_t *jd9365 = (jd9365_panel_t *)panel->user_data;
-    esp_lcd_panel_io_handle_t io = jd9365->io;
-    int command = sleep ? LCD_CMD_SLPIN : LCD_CMD_SLPOUT;
-
-    ESP_RETURN_ON_FALSE(io, ESP_ERR_INVALID_STATE, TAG, "invalid panel IO");
-    ESP_RETURN_ON_ERROR(
-        esp_lcd_panel_io_tx_param(io, command, NULL, 0),
-        TAG,
-        "send JD9365 sleep command failed");
-
-    /*
-     * Keep DSI alive long enough for the command to settle before teardown.
-     * 120 ms is deliberately conservative for both Sleep-In and Sleep-Out.
-     */
-    vTaskDelay(pdMS_TO_TICKS(120));
-
-    ESP_LOGI(
-        TAG,
-        "V20 JD9365 %s accepted (DCS 0x%02X)",
-        sleep ? "SLEEP_IN" : "SLEEP_OUT",
-        command);
-
-    return ESP_OK;
-}
-
 #endif

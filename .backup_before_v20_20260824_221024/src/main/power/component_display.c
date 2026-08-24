@@ -9,7 +9,6 @@
 #include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "esp_lcd_panel_ops.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -796,91 +795,6 @@ static void __attribute__((constructor)) component_display_early_touch_wake(void
     (void)component_display_wake_touch_after_reset();
 }
 #endif
-
-
-esp_err_t component_display_panel_enter_full_sleep(void)
-{
-    /*
-     * V20: put the physical LCD controller into the strongest software sleep
-     * state while the BSP still owns a valid JD9365 panel/DBI handle.
-     *
-     * This MUST run before bsp_display_shutdown_for_deep_sleep(), because that
-     * teardown deletes the panel/DSI objects needed to transmit DCS commands.
-     *
-     * The managed Waveshare JD9365 v2.0.0 driver is patched by the V20
-     * installer to provide esp_lcd_panel_disp_sleep().  The callback sends:
-     *
-     *   DISPLAY_OFF (0x28) via esp_lcd_panel_disp_on_off()
-     *   SLEEP_IN    (0x10) via esp_lcd_panel_disp_sleep()
-     *
-     * SLEEP_IN stops the LCD controller's normal display scanning/oscillator
-     * activity while retaining its internal state.  A later full P4 reboot
-     * reinitializes the panel normally.
-     */
-    esp_lcd_panel_handle_t panel = bsp_display_get_panel_handle();
-
-    if (panel == NULL) {
-        ESP_LOGW(
-            TAG,
-            "LCD FULL SLEEP skipped: BSP panel handle is unavailable");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    esp_err_t first_error = ESP_OK;
-
-    esp_err_t ret = bsp_display_backlight_off();
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "LCD FULL SLEEP: backlight OFF requested");
-    } else {
-        ESP_LOGW(
-            TAG,
-            "LCD FULL SLEEP: backlight OFF request failed: %s",
-            esp_err_to_name(ret));
-        first_error = ret;
-    }
-
-    ret = esp_lcd_panel_disp_on_off(panel, false);
-    if (ret == ESP_OK) {
-        ESP_LOGI(
-            TAG,
-            "LCD FULL SLEEP: DISPLAY_OFF (DCS 0x28) accepted");
-    } else {
-        ESP_LOGW(
-            TAG,
-            "LCD FULL SLEEP: DISPLAY_OFF failed: %s",
-            esp_err_to_name(ret));
-        if (first_error == ESP_OK) {
-            first_error = ret;
-        }
-    }
-
-    /*
-     * Give the panel a short display-off settling interval before SLEEP_IN.
-     * The JD9365 driver's V20 disp_sleep callback adds the longer 120 ms
-     * post-command settling time required before the DSI transport is deleted.
-     */
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    ret = esp_lcd_panel_disp_sleep(panel, true);
-    if (ret == ESP_OK) {
-        ESP_LOGI(
-            TAG,
-            "LCD FULL SLEEP accepted: SLEEP_IN (DCS 0x10); "
-            "panel scanning/oscillator shutdown requested before DSI teardown");
-    } else {
-        ESP_LOGW(
-            TAG,
-            "LCD FULL SLEEP: SLEEP_IN failed: %s. "
-            "Continuing with normal DSI teardown.",
-            esp_err_to_name(ret));
-        if (first_error == ESP_OK) {
-            first_error = ret;
-        }
-    }
-
-    return first_error;
-}
-
 
 esp_err_t component_display_disable_for_deep_sleep(void)
 {
