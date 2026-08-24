@@ -289,34 +289,19 @@ static esp_err_t mdio_clause22_read(
     mdio_write_bits(phy_addr, 5);
     mdio_write_bits(reg_addr, 5);
 
-    /*
-     * Clause-22 read turnaround is Z0, but after the MAC releases MDIO the
-     * first clocked sample is the PHY-driven TA=0.  The high-impedance Z
-     * interval is the bus hand-off itself; it must NOT be consumed as an extra
-     * sampled clock.
-     *
-     * V17 sampled two turnaround clocks.  That shifted every 16-bit PHY read
-     * left by one and appended the idle '1' bit.  The captured BMCR 0x6201 was
-     * therefore the correctly expected 0x3100 shifted left once, which also
-     * made post-write verification report 0xD001.
-     *
-     * This sequence matches the established Linux mdio-bitbang algorithm:
-     *   release MDIO -> sample one TA=0 -> sample 16 data bits -> idle flush.
-     */
+    /* Read turnaround is Z0. */
     ret = gpio_set_direction(ETHERNET_PHY_MDIO_GPIO, GPIO_MODE_INPUT);
     if (ret != ESP_OK) {
         return ret;
     }
 
+    (void)mdio_read_bit(); /* Z */
     const int turnaround = mdio_read_bit();
 
     uint16_t value = 0;
     for (int bit = 15; bit >= 0; --bit) {
         value |= (uint16_t)(mdio_read_bit() & 1) << bit;
     }
-
-    /* One trailing idle clock leaves the management bus in a clean state. */
-    (void)mdio_read_bit();
 
     ret = gpio_set_direction(
         ETHERNET_PHY_MDIO_GPIO,
@@ -547,13 +532,6 @@ esp_err_t component_ethernet_disable_for_deep_sleep(void)
         release_phy_management_pins();
         return ret;
     }
-
-    /*
-     * BMCR Power Down disables the PHY core/oscillator, while MDC/MDIO stay
-     * accessible. Give the management interface a short settling window before
-     * reading the register back.
-     */
-    vTaskDelay(pdMS_TO_TICKS(2));
 
     uint16_t verify_bmcr = 0;
     ret = mdio_clause22_read(

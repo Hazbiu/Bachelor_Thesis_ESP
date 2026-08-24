@@ -197,44 +197,23 @@
  * Waveshare ESP32-P4-NANO board mapping:
  *
  *   GPIO54 -> ESP32-C6 CHIP_PU      LOW  = coprocessor held in reset
- *   GPIO31 -> IP101GRI MDC           Clause-22 management clock
- *   GPIO52 -> IP101GRI MDIO          Clause-22 management data
- *   GPIO51 -> IP101GRI PHY RESET     LOW = reset, HIGH = released
- *   GPIO53 -> NS4150B amplifier EN   LOW = amplifier disabled
- *   GPIO45 -> Q1 (AO3401) gate       HIGH = SD1_VDD disconnected
- *   GPIO7  -> shared I2C SDA         ES8311/GT911/display control
- *   GPIO8  -> shared I2C SCL         ES8311/GT911/display control
+ *   GPIO51 -> IP101GRI PHY RESET    LOW  = PHY held in reset
+ *   GPIO53 -> audio amplifier EN    LOW  = amplifier disabled
+ *   GPIO45 -> Q1 (AO3401) gate      HIGH = SD1_VDD disconnected
+ *   GPIO7  -> ESP_I2C_SDA           external 2.2K pull-up (R50)
+ *   GPIO8  -> ESP_I2C_SCL           external 2.2K pull-up (R48)
  */
 #define APP_PWR_WIFI_C6_CHIP_PU_GPIO                GPIO_NUM_54
 #define APP_PWR_WIFI_C6_DISABLED_LEVEL              0
 #define APP_PWR_WIFI_C6_ENABLED_LEVEL               1
 
-/*
- * IP101GRI real Deep-sleep power-down.
- *
- * Waveshare documents MDC=GPIO31, MDIO=GPIO52 and RESET=GPIO51. The PHY
- * address used by the ESP-IDF/Waveshare ESP32-P4 configuration is 1.
- * BMCR bit11 is programmed over these pins immediately before Deep-sleep.
- */
-#define APP_PWR_ETHERNET_MDC_GPIO                   GPIO_NUM_31
-#define APP_PWR_ETHERNET_MDIO_GPIO                  GPIO_NUM_52
 #define APP_PWR_ETHERNET_PHY_RESET_GPIO             GPIO_NUM_51
-#define APP_PWR_ETHERNET_PHY_ADDRESS                1
 #define APP_PWR_ETHERNET_RESET_ACTIVE_LEVEL         0
 #define APP_PWR_ETHERNET_RESET_RELEASED_LEVEL       1
 
-/*
- * Audio Deep-sleep controls.
- *
- * GPIO53 gates only the NS4150B speaker amplifier. The separate ES8311 codec
- * remains powered from the board rail and must be suspended over I2C.
- */
 #define APP_PWR_AUDIO_AMP_GPIO                      GPIO_NUM_53
 #define APP_PWR_AUDIO_AMP_DISABLED_LEVEL            0
 #define APP_PWR_AUDIO_AMP_ENABLED_LEVEL             1
-#define APP_PWR_ES8311_I2C_ADDRESS                  0x18
-#define APP_PWR_ES8311_I2C_CLOCK_HZ                 400000U
-#define APP_PWR_ES8311_I2C_TIMEOUT_MS               100U
 
 #define APP_PWR_SDCARD_POWER_GPIO                   GPIO_NUM_45
 #define APP_PWR_SDCARD_POWER_ON_LEVEL               0
@@ -322,17 +301,15 @@
 #define APP_PWR_DEEP_SLEEP_AUDIT_ENABLED            1
 
 /*
- * After SD1_VDD is switched off, stop the P4 from driving the powered-down
- * card through the SDMMC signals. Waveshare's ESP32-P4-NANO pin map confirms:
+ * After SD1_VDD is switched off, the SDMMC signals can still back-power the
+ * card through its ESD structures if the ESP32-P4 keeps driving them or if
+ * their pull-ups sit on the always-on 3V3 rail. Enable this and list the real
+ * SDMMC pins for your board to float those pads at the Deep-sleep boundary.
  *
- *   D0=GPIO39, D1=GPIO40, D2=GPIO41, D3=GPIO42,
- *   CLK=GPIO43, CMD=GPIO44.
- *
- * At the final Deep-sleep boundary these pins are changed to input/no-pull.
- * No persistent HP-GPIO hold is used: the tested P4 rev-v1.3 cannot be assumed
- * to retain arbitrary HP pad holds once the HP domain powers down.
+ * Leave disabled until the pin numbers have been confirmed in the schematic:
+ * isolating a wrong pin can disturb an unrelated peripheral.
  */
-#define APP_PWR_ISOLATE_SDMMC_PINS                  1
+#define APP_PWR_ISOLATE_SDMMC_PINS                  0
 #define APP_PWR_SDMMC_PIN_LIST                      { 39, 40, 41, 42, 43, 44 }
 
 /*

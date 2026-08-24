@@ -12,8 +12,6 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
-#include "power_save/component_audio.h"
-#include "power_save/component_ethernet.h"
 #include "power_save/component_wifi.h"
 #include "soc/soc_caps.h"
 
@@ -91,8 +89,8 @@ static const deep_sleep_rail_t s_audited_rails[] = {
     {
         .gpio_num = APP_PWR_ETHERNET_PHY_RESET_GPIO,
         .description = "IP101GRI PHY RESET",
-        .expected_level = APP_PWR_ETHERNET_RESET_RELEASED_LEVEL,
-        .consequence_if_wrong = "RESET LOW would clear BMCR Power Down",
+        .expected_level = APP_PWR_ETHERNET_RESET_ACTIVE_LEVEL,
+        .consequence_if_wrong = "Ethernet PHY is auto-negotiating (20-40 mA)",
     },
     {
         .gpio_num = APP_PWR_AUDIO_AMP_GPIO,
@@ -150,38 +148,6 @@ static void audit_rails_before_deep_sleep(void)
 
     ESP_LOGI(AUDIT_TAG, "---- Pre-Deep-sleep rail audit ----------------------");
 
-    /*
-     * GPIO51 alone no longer proves the Ethernet PHY is low-power. RESET is
-     * intentionally released so BMCR bit11 remains latched; re-read BMCR over
-     * MDC/MDIO and verify the actual IP101GRI Power Down state.
-     */
-    esp_err_t ethernet_ret = component_ethernet_verify_power_down();
-    if (ethernet_ret == ESP_OK) {
-        ESP_LOGI(AUDIT_TAG, "IP101GRI BMCR Power Down (bit11)        OK");
-    } else {
-        mismatches++;
-        ESP_LOGE(
-            AUDIT_TAG,
-            "IP101GRI BMCR Power Down (bit11)        FAILED (%s)",
-            esp_err_to_name(ethernet_ret));
-    }
-
-    /*
-     * GPIO53 proves only that the external NS4150B amplifier is disabled.
-     * The ES8311 is a separate I2C codec, so verify the final Espressif
-     * suspend-register state before the shared I2C pads are isolated.
-     */
-    esp_err_t codec_ret = component_audio_verify_power_down();
-    if (codec_ret == ESP_OK) {
-        ESP_LOGI(AUDIT_TAG, "ES8311 codec suspend registers          OK");
-    } else {
-        mismatches++;
-        ESP_LOGE(
-            AUDIT_TAG,
-            "ES8311 codec suspend registers          FAILED (%s)",
-            esp_err_to_name(codec_ret));
-    }
-
     for (size_t i = 0; i < sizeof(s_audited_rails) / sizeof(s_audited_rails[0]); i++) {
         const deep_sleep_rail_t *rail = &s_audited_rails[i];
         const int level = gpio_get_level((gpio_num_t)rail->gpio_num);
@@ -206,14 +172,10 @@ static void audit_rails_before_deep_sleep(void)
     }
 
     if (mismatches == 0) {
-        ESP_LOGI(
-            AUDIT_TAG,
-            "All software-controlled Deep-sleep states verified: "
-            "C6 policy armed, IP101GRI BMCR Power Down, ES8311 suspend, "
-            "NS4150B off, microSD rail off and shared I2C high. "
-            "Remaining current belongs to hardware without a safe software "
-            "power gate (GT911 on stock wiring, panel rails, regulators, "
-            "LEDs, USB-UART bridge and camera-module residual).");
+        ESP_LOGI(AUDIT_TAG,
+                 "All controlled rails are in their Deep-sleep state. "
+                 "Remaining current belongs to always-on hardware "
+                 "(camera module, panel, PHY, regulators, LED, USB bridge).");
     } else {
         ESP_LOGE(AUDIT_TAG,
                  "%u rail(s) are NOT in their Deep-sleep state; expect "
@@ -330,26 +292,17 @@ static esp_err_t isolate_shared_i2c_for_deep_sleep(void)
 
 #if APP_PWR_ISOLATE_SDMMC_PINS
 /*
- * Float a non-RTC SDMMC pad immediately after the card rail is off.
+ * Float a non-RTC digital pad and freeze it.
  *
- * rtc_gpio_isolate() only applies to the P4 LP/RTC-capable pin range. The
- * SDMMC signals GPIO39..44 are HP pads, so the safe software preparation is a
- * pull-less input with no sleep-state output substitution. The actual HP GPIO
- * domain is then removed by Deep-sleep.
+ * rtc_gpio_isolate() only works on GPIO0..GPIO15 (the LP-capable range) on
+ * ESP32-P4. The SDMMC signals are outside that range, so the equivalent action
+ * is: configure as a pull-less input, stop ESP-IDF from switching the pad to
+ * its sleep configuration, then hold it. This keeps the ESP32-P4 from
+ * back-powering the microSD card through its ESD structures after SD1_VDD has
+ * already been switched off.
  */
-static esp_err_t float_digital_pin_for_deep_sleep(gpio_num_t gpio_num)
+static esp_err_t float_and_hold_digital_pin(gpio_num_t gpio_num)
 {
-    /*
-     * Release any stale application hold, then stop driving the pin and remove
-     * internal pulls. Do not create a new HP-GPIO hold here: bench testing on
-     * this board's ESP32-P4 rev-v1.3 showed that arbitrary HP pad holds cannot
-     * be treated as persistent once the HP domain powers down.
-     */
-    esp_err_t ret = gpio_hold_dis(gpio_num);
-    if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
-        return ret;
-    }
-
     gpio_config_t io_config = {
         .pin_bit_mask = 1ULL << gpio_num,
         .mode = GPIO_MODE_INPUT,
@@ -358,48 +311,32 @@ static esp_err_t float_digital_pin_for_deep_sleep(gpio_num_t gpio_num)
         .intr_type = GPIO_INTR_DISABLE,
     };
 
-    ret = gpio_config(&io_config);
+    esp_err_t ret = gpio_config(&io_config);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    /*
-     * Keep this explicit high-impedance configuration at the sleep boundary.
-     * The P4 Deep-sleep hardware then powers down/isolates the HP GPIO domain.
-     */
-    return gpio_sleep_sel_dis(gpio_num);
+    (void)gpio_sleep_sel_dis(gpio_num);
+    return gpio_hold_en(gpio_num);
 }
 
 static void float_sdmmc_pins_for_deep_sleep(void)
 {
     static const int sdmmc_pins[] = APP_PWR_SDMMC_PIN_LIST;
-    unsigned failed = 0;
 
     for (size_t i = 0; i < sizeof(sdmmc_pins) / sizeof(sdmmc_pins[0]); i++) {
         const gpio_num_t gpio_num = (gpio_num_t)sdmmc_pins[i];
-        const esp_err_t ret = float_digital_pin_for_deep_sleep(gpio_num);
+        const esp_err_t ret = float_and_hold_digital_pin(gpio_num);
 
         if (ret != ESP_OK) {
-            failed++;
-            ESP_LOGW(
-                TAG,
-                "Could not float SDMMC GPIO%d: %s",
-                (int)gpio_num,
-                esp_err_to_name(ret));
+            ESP_LOGW(TAG, "Could not float SDMMC GPIO%d: %s",
+                     (int)gpio_num, esp_err_to_name(ret));
         }
     }
 
-    if (failed == 0) {
-        ESP_LOGI(
-            TAG,
-            "SDMMC GPIO39..44 floated INPUT/no-pull after SD1_VDD off; "
-            "card signal back-power path minimized");
-    } else {
-        ESP_LOGW(
-            TAG,
-            "%u SDMMC pin(s) could not be floated; continuing to Deep-sleep",
-            failed);
-    }
+    ESP_LOGI(TAG,
+             "SDMMC pads floated so the powered-down microSD card cannot be "
+             "back-powered through its signal lines");
 }
 #endif /* APP_PWR_ISOLATE_SDMMC_PINS */
 

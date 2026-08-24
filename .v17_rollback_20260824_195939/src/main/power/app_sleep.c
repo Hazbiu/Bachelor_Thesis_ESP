@@ -95,7 +95,7 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
 
 #if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
     record_first_light_sleep_error(
-        component_audio_disable_for_light_sleep(),
+        component_audio_disable_for_deep_sleep(),
         &first_error);
 #endif
 
@@ -107,7 +107,7 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
 
 #if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
     record_first_light_sleep_error(
-        component_ethernet_hold_reset_for_light_sleep(),
+        component_ethernet_disable_for_deep_sleep(),
         &first_error);
 #endif
 
@@ -145,13 +145,13 @@ static esp_err_t restore_aux_peripherals_after_light_sleep(void)
     esp_err_t first_error = ESP_OK;
 
     /*
-     * Reverse only the reversible Light-sleep operations. Deep-sleep now uses
-     * stronger one-way peripheral states (ES8311 register suspend and IP101GRI
-     * BMCR Power Down) which are intentionally not used in this polling path.
+     * Reverse the suspend order. component_*_restore_after_failed_sleep() are
+     * reversible low-level rail helpers; V8 makes their logging generic because
+     * they are now intentionally shared with Light-sleep.
      */
 #if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
     record_first_light_sleep_error(
-        component_ethernet_restore_after_light_sleep(),
+        component_ethernet_restore_after_failed_sleep(),
         &first_error);
 #endif
 
@@ -163,7 +163,7 @@ static esp_err_t restore_aux_peripherals_after_light_sleep(void)
 
 #if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
     record_first_light_sleep_error(
-        component_audio_restore_after_light_sleep(),
+        component_audio_restore_after_failed_sleep(),
         &first_error);
 #endif
 
@@ -539,16 +539,14 @@ static void run_sleep_sequence(const char *reason)
 
     /*
      * STEP 3 runs after the BSP has released its own touch handle and while
-     * the shared I2C bus is still alive. On the stock ESP32-P4-NANO the GT911
-     * INT/RESET wake pins are not connected to a P4 GPIO, so the build keeps
-     * APP_PWR_GT911_SLEEP_ENABLED=0. component_display still performs every
-     * safe display-side preparation; an actual GT911 sleep command is sent
-     * only if a future hardware revision provides a verified wake pin.
+     * the shared I2C bus is still alive. Without it the GT911 keeps scanning
+     * the capacitive matrix at roughly 5..10 mA for the whole Deep-sleep
+     * interval, which is typically the largest remaining "stuck" consumer on
+     * this board once the camera and MIPI-DSI are down.
      */
     ESP_LOGI(
         "POWER_PROFILE",
-        "STEP 3: preparing display/touch side-channels "
-        "(GT911 sleep only when a wake pin is configured)");
+        "STEP 3: sleeping GT911 touch controller and pinning display pads");
 
     esp_err_t touch_ret = component_display_disable_for_deep_sleep();
 
@@ -563,21 +561,15 @@ static void run_sleep_sequence(const char *reason)
 
     power_profile_stage_delay();
 
-    ESP_LOGI(
-        "POWER_PROFILE",
-        "STEP 4: suspending ES8311 codec and disabling NS4150B amplifier");
-
+    ESP_LOGI("POWER_PROFILE", "STEP 4: disabling audio amplifier");
     esp_err_t audio_ret = component_audio_disable_for_deep_sleep();
 
     if (audio_ret == ESP_OK) {
-        ESP_LOGI(
-            TAG,
-            "Audio subsystem Deep-sleep state verified: "
-            "ES8311=SUSPEND NS4150B=OFF");
+        ESP_LOGI(TAG, "Audio amplifier shut down successfully");
     } else {
         ESP_LOGW(
             TAG,
-            "Audio Deep-sleep shutdown completed with errors: %s",
+            "Audio amplifier shutdown failed: %s",
             esp_err_to_name(audio_ret));
     }
 
@@ -613,18 +605,16 @@ static void run_sleep_sequence(const char *reason)
 
     ESP_LOGI(
         "POWER_PROFILE",
-        "STEP 7: IP101GRI Clause-22 BMCR Power Down via MDC/MDIO");
+        "STEP 7: disabling IP101GRI Ethernet PHY");
 
     esp_err_t ethernet_ret = component_ethernet_disable_for_deep_sleep();
 
     if (ethernet_ret == ESP_OK) {
-        ESP_LOGI(
-            TAG,
-            "Ethernet PHY real Power Down verified; RESET left released");
+        ESP_LOGI(TAG, "Ethernet PHY held in reset successfully");
     } else {
         ESP_LOGW(
             TAG,
-            "Ethernet PHY BMCR Power Down failed: %s",
+            "Ethernet PHY shutdown failed: %s",
             esp_err_to_name(ethernet_ret));
     }
 
@@ -652,7 +642,7 @@ static void run_sleep_sequence(const char *reason)
     if (audio_restore_ret != ESP_OK) {
         ESP_LOGW(
             TAG,
-            "Could not restore audio subsystem after failed sleep: %s",
+            "Could not restore audio amplifier after failed sleep: %s",
             esp_err_to_name(audio_restore_ret));
     }
 

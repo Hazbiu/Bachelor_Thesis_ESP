@@ -48,12 +48,6 @@ typedef struct {
     uint8_t value;
 } es8311_reg_value_t;
 
-typedef struct {
-    uint8_t reg;
-    uint8_t expected;
-    uint8_t mask;
-} es8311_verify_value_t;
-
 /*
  * Espressif esp_codec_dev ES8311 suspend sequence (release/v2.x).
  *
@@ -79,27 +73,19 @@ static const es8311_reg_value_t s_es8311_suspend_sequence[] = {
     {ES8311_CLK_MANAGER_REG02, 0x00},
 };
 
-/*
- * Final readable register state produced by the suspend sequence.
- *
- * ES8311 SYSTEM_REG0E bit7 is reserved/not readable on this silicon.
- * Espressif's official suspend sequence intentionally writes 0xFF, while the
- * real device reads the implemented lower seven bits back as 0x7F.  Verify
- * only implemented bits instead of incorrectly treating that read-as-zero
- * reserved bit as a suspend failure.
- */
-static const es8311_verify_value_t s_es8311_suspend_verify[] = {
-    {ES8311_DAC_REG32,         0x00, 0xFF},
-    {ES8311_ADC_REG17,         0x00, 0xFF},
-    {ES8311_SYSTEM_REG0E,      0x7F, 0x7F},
-    {ES8311_SYSTEM_REG12,      0x02, 0xFF},
-    {ES8311_SYSTEM_REG14,      0x00, 0xFF},
-    {ES8311_SYSTEM_REG0D,      0xFC, 0xFF},
-    {ES8311_ADC_REG15,         0x00, 0xFF},
-    {ES8311_CLK_MANAGER_REG02, 0x00, 0xFF},
-    {ES8311_RESET_REG00,       0x1F, 0xFF},
-    {ES8311_CLK_MANAGER_REG01, 0x00, 0xFF},
-    {ES8311_GP_REG45,          0x00, 0xFF},
+/* Unique final register values produced by the sequence above. */
+static const es8311_reg_value_t s_es8311_suspend_verify[] = {
+    {ES8311_DAC_REG32,         0x00},
+    {ES8311_ADC_REG17,         0x00},
+    {ES8311_SYSTEM_REG0E,      0xFF},
+    {ES8311_SYSTEM_REG12,      0x02},
+    {ES8311_SYSTEM_REG14,      0x00},
+    {ES8311_SYSTEM_REG0D,      0xFC},
+    {ES8311_ADC_REG15,         0x00},
+    {ES8311_CLK_MANAGER_REG02, 0x00},
+    {ES8311_RESET_REG00,       0x1F},
+    {ES8311_CLK_MANAGER_REG01, 0x00},
+    {ES8311_GP_REG45,          0x00},
 };
 
 /*
@@ -446,7 +432,7 @@ static esp_err_t es8311_verify_suspend(
          i < sizeof(s_es8311_suspend_verify) /
                  sizeof(s_es8311_suspend_verify[0]);
          ++i) {
-        const es8311_verify_value_t *expected = &s_es8311_suspend_verify[i];
+        const es8311_reg_value_t *expected = &s_es8311_suspend_verify[i];
         uint8_t actual = 0;
 
         const esp_err_t ret = es8311_read_reg(
@@ -463,34 +449,22 @@ static esp_err_t es8311_verify_suspend(
             return ret;
         }
 
-        if ((actual & expected->mask) !=
-            (expected->expected & expected->mask)) {
+        if (actual != expected->value) {
             ESP_LOGE(
                 TAG,
                 "ES8311 suspend mismatch: reg=0x%02X expected=0x%02X "
-                "mask=0x%02X readback=0x%02X",
+                "readback=0x%02X",
                 expected->reg,
-                expected->expected,
-                expected->mask,
+                expected->value,
                 actual);
             return ESP_ERR_INVALID_STATE;
-        }
-
-        if (expected->mask != 0xFFU) {
-            ESP_LOGI(
-                TAG,
-                "ES8311 masked verify OK: reg=0x%02X readback=0x%02X "
-                "mask=0x%02X",
-                expected->reg,
-                actual,
-                expected->mask);
         }
     }
 
     ESP_LOGI(
         TAG,
         "ES8311 suspend verified: analog/DAC/ADC/clock blocks in "
-        "Espressif power-down register state (REG0E reserved bit masked)");
+        "Espressif power-down register state");
 
     return ESP_OK;
 }
