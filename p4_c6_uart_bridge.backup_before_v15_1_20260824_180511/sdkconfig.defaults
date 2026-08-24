@@ -1,0 +1,4 @@
+# Raw binary bridge: do not print application console text on UART0.
+CONFIG_ESP_CONSOLE_NONE=y
+CONFIG_LOG_DEFAULT_LEVEL_NONE=y
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y

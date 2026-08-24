@@ -12,6 +12,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
+#include "power_save/component_wifi.h"
 #include "soc/soc_caps.h"
 
 static const char *TAG = "deep_sleep";
@@ -37,18 +38,25 @@ static const char *TAG = "deep_sleep";
 #define SHARED_I2C_SCL_GPIO APP_PWR_SHARED_I2C_SCL_GPIO
 
 /*
- * NOTE ON GPIO HOLDS AND ESP32-P4
+ * NOTE ON GPIO HOLDS AND THIS BOARD'S ESP32-P4 REVISION
  *
- * ESP32-P4 defines SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP = 1, meaning a
- * per-pin gpio_hold_en() keeps a digital pad frozen while the digital domain
- * is powered down. Because of that capability, ESP-IDF does NOT declare
- * gpio_deep_sleep_hold_en() for this target - the header guards it with
- * "#if !SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP". Calling it here would not
- * compile, and it is not needed: the per-pin holds taken by the
- * power_save/component_*.c modules are already the correct mechanism.
+ * The tested board reports ESP32-P4 revision v1.3. GPIO54 is an HP/digital
+ * GPIO and physically drives ESP32-C6 CHIP_PU. Bench measurement showed:
  *
- * gpio_force_hold_all() does exist on ESP32-P4, but it also freezes GPIO3.
- * That is the Deep-sleep wake pin, so it is deliberately NOT used here.
+ *     before esp_deep_sleep_start(): GPIO54 ~= 0 V
+ *     in real Deep-sleep:            GPIO54 ~= 3.3 V
+ *
+ * Therefore the generic SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP capability
+ * macro must not be interpreted as a guarantee that this v1.3 board will keep
+ * GPIO54 LOW after the HP GPIO domain powers down.
+ *
+ * We still use per-pin gpio_hold_en() as the best software preparation and
+ * re-apply GPIO54 at the final application-controlled boundary. A board-level
+ * pull-down on C6 CHIP_PU is required for guaranteed LOW during Deep-sleep.
+ *
+ * gpio_force_hold_all() is deliberately NOT used: it would also freeze flash,
+ * UART and GPIO3, and ESP-IDF explicitly warns against using the global force
+ * hold as a normal Deep-sleep retention solution.
  */
 
 static void record_first_error(
@@ -460,6 +468,49 @@ void enter_deep_sleep(void)
             esp_err_to_name(i2c_ret));
     }
 
+    /*
+     * FINAL C6 CLAMP
+     *
+     * STEP 6 has already disabled the ESP32-C6. Re-apply GPIO54 LOW again now,
+     * after every other application-side teardown operation, so there is no
+     * stale-state shortcut and no component delay between this write and the
+     * actual Deep-sleep entry.
+     */
+    esp_err_t c6_final_ret = component_wifi_force_off_at_sleep_boundary();
+    if (c6_final_ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Final ESP32-C6 CHIP_PU clamp failed: %s; entering Deep-sleep "
+            "anyway because remaining ACTIVE would consume more power",
+            esp_err_to_name(c6_final_ret));
+    }
+
+    /*
+     * Dump the real GPIO54 configuration at the last observable point.
+     * ESP-IDF v5.5 reports Pullup/Pulldown, InputEn, OutputEn, DriveCap,
+     * FuncSel and SleepSelEn here.
+     */
+    esp_err_t dump_ret = gpio_dump_io_configuration(
+        stdout,
+        1ULL << APP_PWR_WIFI_C6_CHIP_PU_GPIO);
+    if (dump_ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Could not dump final GPIO54 configuration: %s",
+            esp_err_to_name(dump_ret));
+    }
+
+    const int c6_final_level =
+        gpio_get_level(APP_PWR_WIFI_C6_CHIP_PU_GPIO);
+
+    ESP_LOGW(
+        TAG,
+        "C6-FINAL-AUDIT: GPIO%d CHIP_PU level=%d expected=%d "
+        "silicon=v1.3 external_pulldown_required=yes",
+        APP_PWR_WIFI_C6_CHIP_PU_GPIO,
+        c6_final_level,
+        APP_PWR_WIFI_C6_DISABLED_LEVEL);
+
     ESP_LOGI(
         TAG,
         "Entering Deep-sleep. Press the GPIO%d button to wake up.",
@@ -468,5 +519,9 @@ void enter_deep_sleep(void)
     /* Flush buffered output before entering Deep-sleep. */
     fflush(stdout);
 
+    /*
+     * No FreeRTOS delay and no additional application GPIO reconfiguration
+     * after the final C6 clamp.
+     */
     esp_deep_sleep_start();
 }

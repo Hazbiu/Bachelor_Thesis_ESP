@@ -1,6 +1,7 @@
 #pragma once
 
 #include "driver/gpio.h"
+#include "config/sleep_mode_selection.h"
 
 /* Camera and display buffers */
 #define APP_CAMERA_BUFFER_COUNT             2
@@ -80,6 +81,31 @@
 #define APP_CPU_ACTIVE_FREQ_MHZ                     180
 #define APP_CPU_IDLE_180_AFTER_MS                   5000U
 #define APP_CPU_IDLE_90_AFTER_MS                    10000U
+
+/*
+ * Flash-selectable inactivity sleep policy.
+ *
+ * The normal legacy policy remains available when the flashing helper is
+ * called without -d/-l:
+ *
+ *   HYBRID     : Light-sleep at 15 s, then Deep-sleep at 30 s.
+ *   LIGHT_ONLY : Light-sleep only after 7 s; never auto-enters Deep-sleep.
+ *   DEEP_ONLY  : Direct Active -> Deep-sleep after 7 s; Light-sleep is skipped.
+ *
+ * The 7-second single-mode timeout is deliberately shared by -l and -d so
+ * Joulescope traces compare the two transitions from the same inactivity point.
+ */
+#define APP_SINGLE_SLEEP_TIMEOUT_MS                 7000U
+
+#if APP_SLEEP_POLICY != APP_SLEEP_POLICY_HYBRID && \
+    APP_SLEEP_POLICY != APP_SLEEP_POLICY_LIGHT_ONLY && \
+    APP_SLEEP_POLICY != APP_SLEEP_POLICY_DEEP_ONLY
+#error "Invalid APP_SLEEP_POLICY"
+#endif
+
+#if APP_SINGLE_SLEEP_TIMEOUT_MS == 0
+#error "APP_SINGLE_SLEEP_TIMEOUT_MS must be greater than zero"
+#endif
 
 /* Cache synchronization */
 #define APP_SYNC_CACHE_AROUND_OVERLAY               1

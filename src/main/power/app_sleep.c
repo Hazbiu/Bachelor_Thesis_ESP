@@ -27,7 +27,8 @@
 #include "power_save/component_wifi.h"
 #include "power_save/cpu_power.h"
 
-#if APP_LIGHT_SLEEP_TIMEOUT_MS >= APP_DEEP_SLEEP_TIMEOUT_MS
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_HYBRID && \
+    APP_LIGHT_SLEEP_TIMEOUT_MS >= APP_DEEP_SLEEP_TIMEOUT_MS
 #error "APP_LIGHT_SLEEP_TIMEOUT_MS must be smaller than APP_DEEP_SLEEP_TIMEOUT_MS"
 #endif
 
@@ -230,9 +231,23 @@ static bool claim_sleep_request(void)
 
 static bool claim_inactivity_sleep_request(void)
 {
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
+    /*
+     * Light-only firmware must never claim an inactivity Deep-sleep request.
+     * Its 7-second deadline is handled exclusively by claim_light_sleep_window().
+     */
+    return false;
+#else
     const int64_t now_us = esp_timer_get_time();
+
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_DEEP_ONLY
+    const int64_t timeout_us =
+        (int64_t)APP_SINGLE_SLEEP_TIMEOUT_MS * 1000LL;
+#else
     const int64_t timeout_us =
         (int64_t)APP_DEEP_SLEEP_TIMEOUT_MS * 1000LL;
+#endif
+
     bool claimed = false;
 
     portENTER_CRITICAL(&s_sleep_request_lock);
@@ -247,6 +262,7 @@ static bool claim_inactivity_sleep_request(void)
 
     portEXIT_CRITICAL(&s_sleep_request_lock);
     return claimed;
+#endif
 }
 
 static void release_sleep_request(void)
@@ -289,24 +305,40 @@ void app_sleep_notify_face_detected(void)
 
 bool app_sleep_light_sleep_is_due(void)
 {
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_DEEP_ONLY
+    return false;
+#else
     const int64_t now_us = esp_timer_get_time();
+
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
+    const int64_t light_timeout_us =
+        (int64_t)APP_SINGLE_SLEEP_TIMEOUT_MS * 1000LL;
+#else
     const int64_t light_timeout_us =
         (int64_t)APP_LIGHT_SLEEP_TIMEOUT_MS * 1000LL;
     const int64_t deep_timeout_us =
         (int64_t)APP_DEEP_SLEEP_TIMEOUT_MS * 1000LL;
+#endif
+
     bool due = false;
 
     portENTER_CRITICAL(&s_sleep_request_lock);
     const int64_t inactive_us = now_us - s_last_face_detected_us;
+
     due = s_inactivity_monitor_started &&
           !s_sleep_requested &&
           s_light_sleep_in_progress &&
           !s_light_sleep_failed_until_activity &&
-          inactive_us >= light_timeout_us &&
-          inactive_us < deep_timeout_us;
+          inactive_us >= light_timeout_us;
+
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_HYBRID
+    due = due && inactive_us < deep_timeout_us;
+#endif
+
     portEXIT_CRITICAL(&s_sleep_request_lock);
 
     return due;
+#endif
 }
 
 static void cancel_light_sleep_claim(void)
@@ -397,11 +429,22 @@ static void finish_light_sleep(
 
 static bool claim_light_sleep_window(uint32_t *remaining_ms)
 {
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_DEEP_ONLY
+    (void)remaining_ms;
+    return false;
+#else
     const int64_t now_us = esp_timer_get_time();
+
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
+    const int64_t light_timeout_us =
+        (int64_t)APP_SINGLE_SLEEP_TIMEOUT_MS * 1000LL;
+#else
     const int64_t light_timeout_us =
         (int64_t)APP_LIGHT_SLEEP_TIMEOUT_MS * 1000LL;
     const int64_t deep_timeout_us =
         (int64_t)APP_DEEP_SLEEP_TIMEOUT_MS * 1000LL;
+#endif
+
     bool claimed = false;
 
     portENTER_CRITICAL(&s_sleep_request_lock);
@@ -413,12 +456,23 @@ static bool claim_light_sleep_window(uint32_t *remaining_ms)
         !s_sleep_requested &&
         !s_light_sleep_in_progress &&
         !s_light_sleep_failed_until_activity &&
-        inactive_us >= light_timeout_us &&
-        inactive_us < deep_timeout_us) {
+        inactive_us >= light_timeout_us
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_HYBRID
+        && inactive_us < deep_timeout_us
+#endif
+        ) {
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
+        /*
+         * No Deep-sleep deadline exists in -l firmware. A zero value is used
+         * only as a display/logging value; the polling loop explicitly runs
+         * indefinitely until real user activity.
+         */
+        *remaining_ms = 0;
+#else
         const int64_t remaining_us = deep_timeout_us - inactive_us;
-
         *remaining_ms =
             (uint32_t)((remaining_us + 999LL) / 1000LL);
+#endif
         s_light_sleep_in_progress = true;
         claimed = true;
     }
@@ -426,6 +480,7 @@ static bool claim_light_sleep_window(uint32_t *remaining_ms)
     portEXIT_CRITICAL(&s_sleep_request_lock);
 
     return claimed;
+#endif
 }
 
 static void run_sleep_sequence(const char *reason)
@@ -627,11 +682,19 @@ static void run_sleep_sequence(const char *reason)
 
 void app_sleep_request(const char *reason)
 {
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
+    ESP_LOGW(
+        POWER_TAG,
+        "event=DEEP_SLEEP_REQUEST_IGNORED policy=LIGHT_ONLY reason=\"%s\"",
+        reason != NULL ? reason : "unknown");
+    return;
+#else
     if (!claim_sleep_request()) {
         return;
     }
 
     run_sleep_sequence(reason);
+#endif
 }
 
 static void deep_sleep_button_task(void *arg)
@@ -655,23 +718,31 @@ static void deep_sleep_button_task(void *arg)
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
-            "Failed to configure deep-sleep button: %s",
+            "Failed to configure sleep button: %s",
             esp_err_to_name(ret));
         vTaskDelete(NULL);
         return;
     }
 
-    /* Do not reuse the wake-up press as a new sleep request after boot. */
+    /* Do not reuse the wake-up press as a new request after boot. */
     while (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
         vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
     }
 
     vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
 
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
+    ESP_LOGI(
+        TAG,
+        "GPIO%d armed as Light-sleep wake/activity button; "
+        "Deep-sleep requests are disabled by -l",
+        APP_DEEP_SLEEP_BUTTON_GPIO);
+#else
     ESP_LOGI(
         TAG,
         "Deep-sleep button armed on GPIO%d",
         APP_DEEP_SLEEP_BUTTON_GPIO);
+#endif
 
     while (true) {
         /*
@@ -693,9 +764,20 @@ static void deep_sleep_button_task(void *arg)
 
             if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0 &&
                 !button_event_is_reserved_for_light_sleep()) {
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
+                /*
+                 * In -l firmware GPIO3 is never allowed to invoke the
+                 * destructive Deep-sleep sequence. Treat an active-mode press
+                 * as normal activity and wait for release.
+                 */
+                ESP_LOGI(
+                    POWER_TAG,
+                    "event=GPIO3_ACTIVITY policy=LIGHT_ONLY action=KEEP_ACTIVE");
+                app_sleep_notify_face_detected();
+#else
                 app_sleep_request("GPIO3 button");
+#endif
 
-                /* Reached only if entering Deep-sleep failed. */
                 while (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
                     vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
                 }
@@ -710,15 +792,47 @@ static void inactivity_power_policy_task(void *arg)
 {
     (void)arg;
 
+#if APP_SLEEP_POLICY != APP_SLEEP_POLICY_DEEP_ONLY
     ESP_LOGI(
         POWER_TAG,
         "event=LIGHT_SLEEP_TOUCH_FIX version=8 "
         "mode=DOC_ALIGNED_GT911_POLLING_AUX_POWERDOWN");
+#endif
 
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_DEEP_ONLY
     ESP_LOGI(
         POWER_TAG,
-        "event=INACTIVITY_POLICY_STARTED idle_180_after_ms=%u "
-        "idle_90_after_ms=%u light_sleep_after_ms=%u "
+        "event=INACTIVITY_POLICY_STARTED policy=DEEP_ONLY "
+        "idle_180_after_ms=%u idle_90_after_ms=%u "
+        "deep_sleep_after_ms=%u light_sleep=DISABLED",
+        (unsigned)APP_CPU_IDLE_180_AFTER_MS,
+        (unsigned)APP_CPU_IDLE_90_AFTER_MS,
+        (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
+
+    ESP_LOGI(
+        TAG,
+        "Inactivity power policy armed: DEEP-ONLY after %u ms",
+        (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
+#elif APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
+    ESP_LOGI(
+        POWER_TAG,
+        "event=INACTIVITY_POLICY_STARTED policy=LIGHT_ONLY "
+        "idle_180_after_ms=%u idle_90_after_ms=%u "
+        "light_sleep_after_ms=%u deep_sleep=DISABLED",
+        (unsigned)APP_CPU_IDLE_180_AFTER_MS,
+        (unsigned)APP_CPU_IDLE_90_AFTER_MS,
+        (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
+
+    ESP_LOGI(
+        TAG,
+        "Inactivity power policy armed: LIGHT-ONLY after %u ms; "
+        "automatic Deep-sleep disabled",
+        (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
+#else
+    ESP_LOGI(
+        POWER_TAG,
+        "event=INACTIVITY_POLICY_STARTED policy=HYBRID "
+        "idle_180_after_ms=%u idle_90_after_ms=%u light_sleep_after_ms=%u "
         "deep_sleep_after_ms=%u",
         (unsigned)APP_CPU_IDLE_180_AFTER_MS,
         (unsigned)APP_CPU_IDLE_90_AFTER_MS,
@@ -727,9 +841,10 @@ static void inactivity_power_policy_task(void *arg)
 
     ESP_LOGI(
         TAG,
-        "Inactivity power policy armed: light=%d ms deep=%d ms",
-        APP_LIGHT_SLEEP_TIMEOUT_MS,
-        APP_DEEP_SLEEP_TIMEOUT_MS);
+        "Inactivity power policy armed: HYBRID light=%u ms deep=%u ms",
+        (unsigned)APP_LIGHT_SLEEP_TIMEOUT_MS,
+        (unsigned)APP_DEEP_SLEEP_TIMEOUT_MS);
+#endif
 
     while (!app_sleep_is_requested()) {
         vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_INACTIVITY_POLL_MS));
@@ -742,17 +857,34 @@ static void inactivity_power_policy_task(void *arg)
         cpu_power_update_inactivity(inactive_ms);
 
         if (claim_inactivity_sleep_request()) {
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_DEEP_ONLY
             ESP_LOGI(
                 POWER_TAG,
-                "event=DEEP_SLEEP_DEADLINE_REACHED inactive_ms=%" PRIu32
-                " action=SHUTDOWN",
+                "event=DEEP_SLEEP_DEADLINE_REACHED policy=DEEP_ONLY "
+                "inactive_ms=%" PRIu32 " threshold_ms=%u "
+                "transition=ACTIVE_TO_DEEP action=SHUTDOWN",
+                inactive_ms,
+                (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
+            ESP_LOGI(
+                TAG,
+                "No activity for %u ms; entering Deep-sleep directly "
+                "without Light-sleep",
+                (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
+
+            run_sleep_sequence("7-second face inactivity (DEEP_ONLY)");
+#else
+            ESP_LOGI(
+                POWER_TAG,
+                "event=DEEP_SLEEP_DEADLINE_REACHED policy=HYBRID "
+                "inactive_ms=%" PRIu32 " action=SHUTDOWN",
                 inactive_ms);
             ESP_LOGI(
                 TAG,
-                "No activity for %d ms; entering Deep-sleep",
-                APP_DEEP_SLEEP_TIMEOUT_MS);
+                "No activity for %u ms; entering Deep-sleep",
+                (unsigned)APP_DEEP_SLEEP_TIMEOUT_MS);
 
             run_sleep_sequence("face inactivity after Light-sleep stage");
+#endif
             break;
         }
 
@@ -761,18 +893,33 @@ static void inactivity_power_policy_task(void *arg)
             continue;
         }
 
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
         ESP_LOGI(
             POWER_TAG,
-            "event=LIGHT_SLEEP_BEGIN inactive_ms=%" PRIu32
+            "event=LIGHT_SLEEP_BEGIN policy=LIGHT_ONLY "
+            "inactive_ms=%" PRIu32 " threshold_ms=%u deep_sleep=DISABLED",
+            inactive_ms,
+            (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
+
+        ESP_LOGI(
+            TAG,
+            "No activity for %u ms; entering Light-sleep only. "
+            "It will remain in Light-sleep polling until touch/GPIO3 activity.",
+            (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
+#else
+        ESP_LOGI(
+            POWER_TAG,
+            "event=LIGHT_SLEEP_BEGIN policy=HYBRID inactive_ms=%" PRIu32
             " remaining_to_deep_ms=%" PRIu32,
             inactive_ms,
             remaining_ms);
 
         ESP_LOGI(
             TAG,
-            "No activity for %d ms; entering Light-sleep for up to %" PRIu32 " ms",
-            APP_LIGHT_SLEEP_TIMEOUT_MS,
+            "No activity for %u ms; entering Light-sleep for up to %" PRIu32 " ms",
+            (unsigned)APP_LIGHT_SLEEP_TIMEOUT_MS,
             remaining_ms);
+#endif
 
         if (s_light_suspend_callback == NULL ||
             s_light_resume_callback == NULL) {
@@ -941,19 +1088,33 @@ static void inactivity_power_policy_task(void *arg)
             "released_samples=%" PRIu32,
             pre_release_samples);
 
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
         ESP_LOGI(
             TAG,
-            "GT911 polling every %d ms until the %d ms Deep-sleep deadline; "
-            "touch wake will arm only after a post-sleep release streak",
-            APP_LIGHT_SLEEP_TOUCH_POLL_MS,
-            APP_DEEP_SLEEP_TIMEOUT_MS);
+            "GT911 polling every %u ms indefinitely; Deep-sleep is disabled "
+            "for this -l firmware",
+            (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS);
 
         ESP_LOGI(
             POWER_TAG,
-            "event=LIGHT_SLEEP_ENTER mode=TIMER_SLICED "
+            "event=LIGHT_SLEEP_ENTER policy=LIGHT_ONLY "
+            "mode=TIMER_SLICED_INDEFINITE poll_ms=%u deep_sleep=DISABLED",
+            (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS);
+#else
+        ESP_LOGI(
+            TAG,
+            "GT911 polling every %u ms until the %u ms Deep-sleep deadline; "
+            "touch wake will arm only after a post-sleep release streak",
+            (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
+            (unsigned)APP_DEEP_SLEEP_TIMEOUT_MS);
+
+        ESP_LOGI(
+            POWER_TAG,
+            "event=LIGHT_SLEEP_ENTER policy=HYBRID mode=TIMER_SLICED "
             "poll_ms=%u remaining_to_deep_ms=%" PRIu32,
             (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
             remaining_ms);
+#endif
 
         esp_err_t light_ret = ESP_OK;
         esp_sleep_wakeup_cause_t wake_cause =
@@ -968,11 +1129,19 @@ static void inactivity_power_policy_task(void *arg)
         uint32_t press_stable_ms = 0;
         uint32_t short_slice_count = 0;
 
-        while (remaining_ms > 0 && !touchscreen_touched) {
+        while (
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
+            !touchscreen_touched
+#else
+            remaining_ms > 0 && !touchscreen_touched
+#endif
+            ) {
             uint32_t poll_slice_ms = APP_LIGHT_SLEEP_TOUCH_POLL_MS;
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_HYBRID
             if (poll_slice_ms > remaining_ms) {
                 poll_slice_ms = remaining_ms;
             }
+#endif
 
             const int64_t slice_start_us = esp_timer_get_time();
 
@@ -1044,8 +1213,15 @@ static void inactivity_power_policy_task(void *arg)
                 }
             }
 
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_HYBRID
             remaining_ms -= poll_slice_ms;
-            light_sleep_elapsed_ms += poll_slice_ms;
+#endif
+
+            if (UINT32_MAX - light_sleep_elapsed_ms < poll_slice_ms) {
+                light_sleep_elapsed_ms = UINT32_MAX;
+            } else {
+                light_sleep_elapsed_ms += poll_slice_ms;
+            }
 
             bool touched_now = false;
             touch_ret =
@@ -1243,17 +1419,18 @@ static void inactivity_power_policy_task(void *arg)
                     TAG,
                     "GPIO3 woke Light-sleep; camera/display restored without reboot");
             }
+#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_HYBRID
         } else if (wake_cause == ESP_SLEEP_WAKEUP_TIMER &&
                    remaining_ms == 0) {
             ESP_LOGI(
                 POWER_TAG,
-                "event=LIGHT_SLEEP_DEADLINE_REACHED inactive_ms=%u "
-                "action=DEEP_SLEEP",
+                "event=LIGHT_SLEEP_DEADLINE_REACHED policy=HYBRID "
+                "inactive_ms=%u action=DEEP_SLEEP",
                 (unsigned)APP_DEEP_SLEEP_TIMEOUT_MS);
             ESP_LOGI(
                 TAG,
-                "GT911 polling reached the %d ms Deep-sleep inactivity deadline",
-                APP_DEEP_SLEEP_TIMEOUT_MS);
+                "GT911 polling reached the %u ms Deep-sleep inactivity deadline",
+                (unsigned)APP_DEEP_SLEEP_TIMEOUT_MS);
 
             /*
              * Camera and display are already off. Claim the request directly
@@ -1265,6 +1442,7 @@ static void inactivity_power_policy_task(void *arg)
                     "face inactivity after Light-sleep timer");
             }
             break;
+#endif
         }
     }
 

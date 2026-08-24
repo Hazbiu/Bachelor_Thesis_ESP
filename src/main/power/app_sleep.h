@@ -40,29 +40,41 @@ esp_err_t app_sleep_register_light_sleep_callbacks(
     void *user_data);
 
 /**
- * Start the physical Deep-sleep button monitor.
+ * Start the physical GPIO3 sleep-button monitor.
  *
- * GPIO3 remains the Deep-sleep button while the application is active. When
- * GPIO3 is used only to wake an automatic Light-sleep interval, that wake
- * press is consumed and will not immediately request Deep-sleep.
+ * HYBRID / DEEP_ONLY:
+ *   GPIO3 remains an active-mode Deep-sleep request and the Deep-sleep wake pin.
+ *
+ * LIGHT_ONLY:
+ *   GPIO3 is only a Light-sleep wake/activity input. It is not allowed to
+ *   invoke the destructive Deep-sleep sequence.
+ *
+ * A GPIO3 press used to wake Light-sleep is consumed and will not be reused as
+ * a second sleep request after the system resumes.
  */
 esp_err_t app_sleep_start_button_monitor(
     app_sleep_prepare_callback_t prepare_callback,
     void *user_data);
 
 /**
- * Start the two-stage face-inactivity power policy.
+ * Start the flash-selected face-inactivity power policy.
  *
- * Stage 1: APP_LIGHT_SLEEP_TIMEOUT_MS without activity -> Light-sleep.
- * Camera/AI/display work is suspended and unused external board peripherals
- * (audio amplifier, microSD rail and Ethernet PHY) are also quiesced. Because
- * this display exposes GT911 only through I2C, the RTC wakes for short polling
- * slices; GT911 itself intentionally stays awake. A qualified touch or GPIO3
- * restores the reversible resources without rebooting.
+ * APP_SLEEP_POLICY_HYBRID (no -d/-l flag):
+ *   Existing behavior: Light-sleep after APP_LIGHT_SLEEP_TIMEOUT_MS, then
+ *   Deep-sleep at APP_DEEP_SLEEP_TIMEOUT_MS total inactivity.
  *
- * Stage 2: APP_DEEP_SLEEP_TIMEOUT_MS total inactivity -> Deep-sleep. If no user
- * wake occurred, already-quiesced Light-sleep resources remain off and the
- * destructive Deep-sleep sequence continues without powering them back up.
+ * APP_SLEEP_POLICY_LIGHT_ONLY (-l):
+ *   Enter reversible Light-sleep after APP_SINGLE_SLEEP_TIMEOUT_MS (7 s).
+ *   The timer-sliced GT911 polling loop continues indefinitely until qualified
+ *   touchscreen activity or GPIO3 wakes the system. Automatic Deep-sleep is
+ *   disabled, including active-mode GPIO3 Deep-sleep requests.
+ *
+ * APP_SLEEP_POLICY_DEEP_ONLY (-d):
+ *   Skip Light-sleep completely and run the existing ordered Deep-sleep
+ *   shutdown directly after APP_SINGLE_SLEEP_TIMEOUT_MS (7 s) inactivity.
+ *
+ * Positive face detections and existing application activity notifications
+ * reset the inactivity timestamp exactly as before.
  */
 esp_err_t app_sleep_start_timeout(void);
 
