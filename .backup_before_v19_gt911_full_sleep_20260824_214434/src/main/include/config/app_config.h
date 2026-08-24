@@ -266,28 +266,21 @@
  * Display / touch Deep-sleep configuration
  * ---------------------------------------------------------------------
  *
- * V19 intentionally uses the GT911's real full-Sleep command
- * (0x05 -> register 0x8040) instead of Green/low-speed scanning.
+ * Waveshare's ESP32-P4-NANO BSP defines the LCD backlight GPIO, LCD reset,
+ * GT911 reset and GT911 interrupt pins as GPIO_NUM_NC. The backlight is
+ * controlled by the display-side I2C controller (address 0x45), not by a
+ * dedicated ESP32-P4 GPIO. Therefore -1 below is intentional for this board.
  *
- * IMPORTANT STOCK-BOARD LIMITATION:
- * Waveshare's ESP32-P4-NANO BSP exposes the GT911 INT and RESET pins as
- * GPIO_NUM_NC. The GT911 programming guide requires INT-high or RESET to
- * wake from full Sleep. Therefore the P4 cannot restore touch after a
- * Deep-sleep wake on this stock wiring. This V19 build is a deepest-software
- * power-measurement build: after waking the P4 with GPIO3, a complete board
- * power-cycle is required before touch can work again.
- *
- * The sleep command is verified before the P4 sleeps by confirming that:
- *   1. the GT911 stops ACKing on I2C after >58 ms; and
- *   2. the shared I2C bus itself is still alive through the ES8311 address.
+ * The GT911 can be commanded into sleep over I2C, but a sleeping GT911 needs
+ * a hardware INT pulse or RESET toggle to wake reliably. Because the stock BSP
+ * exposes neither pin, GT911 sleep must remain disabled unless the hardware is
+ * modified or a specific display revision exposes a verified wake pin.
  */
-#define APP_PWR_GT911_SLEEP_ENABLED                 1
-#define APP_PWR_GT911_ALLOW_SLEEP_WITHOUT_HOST_WAKE 1
-#define APP_PWR_GT911_SLEEP_VERIFY_DELAY_MS         70U
+#define APP_PWR_GT911_SLEEP_ENABLED                 0
 #define APP_PWR_GT911_PRIMARY_ADDRESS               0x5D
 #define APP_PWR_GT911_SECONDARY_ADDRESS             0x14
 
-/* Timings used only when a future board exposes a real wake pin. */
+/* GT911 timings used only if a real wake pin is added/configured. */
 #define APP_PWR_GT911_RESET_ASSERT_MS               20
 #define APP_PWR_GT911_INT_PULSE_MS                  5
 #define APP_PWR_GT911_BOOT_MS                       60
@@ -296,18 +289,28 @@
 #define APP_PWR_DISPLAY_BACKLIGHT_GPIO              (-1)
 #define APP_PWR_DISPLAY_BACKLIGHT_OFF_LEVEL         0
 
-/* Stock BSP: GT911 INT is GPIO_NUM_NC. */
+/* Stock BSP: GT911 INT is GPIO_NUM_NC. Keep -1 unless hardware is verified. */
 #define APP_PWR_TOUCH_INT_GPIO                      (-1)
 
-/* Stock BSP: GT911 RESET is GPIO_NUM_NC. */
+/* Stock BSP: GT911 RESET is GPIO_NUM_NC. Keep -1 unless hardware is verified. */
 #define APP_PWR_TOUCH_RESET_GPIO                    (-1)
 #define APP_PWR_TOUCH_RESET_ACTIVE_LEVEL            0
 
 /*
- * Green mode is explicitly disabled in V19. The GT911 goes from normal
- * operation directly into full Sleep at the destructive Deep-sleep boundary.
+ * Safe software-only GT911 low-power policy for the stock board.
+ *
+ * Full GT911 Sleep (0x05 -> 0x8040) remains disabled above because the stock
+ * ESP32-P4-NANO does not expose GT911 INT/RESET to the P4, so there is no
+ * reliable host-driven wake after a P4 Deep-sleep reset.
+ *
+ * The GT911 configuration register 0x8055 instead controls the idle interval
+ * before its automatic lower-power/Green state.  Green mode wakes itself when
+ * the panel is touched, so it does not require the missing INT/RESET control.
+ * V18 changes only the low nibble, preserves the reserved high nibble, updates
+ * the GT911 configuration checksum and Config_Fresh flag, and verifies the
+ * read-back before the shared I2C pads are isolated.
  */
-#define APP_PWR_GT911_GREEN_MODE_ENABLED            0
+#define APP_PWR_GT911_GREEN_MODE_ENABLED            1
 #define APP_PWR_GT911_GREEN_IDLE_SECONDS            0U
 
 /*
@@ -395,13 +398,13 @@
 #define APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS      0
 
 /*
- * Normally full GT911 Sleep is refused when no host wake pin exists.
- * V19 explicitly opts into this only for deepest-software current measurement.
+ * Refuse to build a firmware that puts the GT911 to sleep with no way to wake
+ * it again. Without an INT or RESET pin the controller stays asleep across the
+ * next reset and bsp_touch_new() aborts the application at boot.
  */
 #if APP_PWR_GT911_SLEEP_ENABLED && \
-    (APP_PWR_TOUCH_INT_GPIO < 0) && (APP_PWR_TOUCH_RESET_GPIO < 0) && \
-    !APP_PWR_GT911_ALLOW_SLEEP_WITHOUT_HOST_WAKE
-#error "GT911 full Sleep needs INT/RESET for normal wake; set APP_PWR_GT911_ALLOW_SLEEP_WITHOUT_HOST_WAKE only for measurement builds"
+    (APP_PWR_TOUCH_INT_GPIO < 0) && (APP_PWR_TOUCH_RESET_GPIO < 0)
+#error "APP_PWR_GT911_SLEEP_ENABLED needs APP_PWR_TOUCH_INT_GPIO or APP_PWR_TOUCH_RESET_GPIO: the touch controller could not be woken and the next boot would abort in bsp_touch_new()"
 #endif
 
 #if APP_CPU_IDLE_180_AFTER_MS >= APP_CPU_IDLE_90_AFTER_MS

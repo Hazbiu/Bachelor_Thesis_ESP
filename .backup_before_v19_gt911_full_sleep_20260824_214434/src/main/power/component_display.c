@@ -51,11 +51,6 @@ static bool s_backlight_held;
 static bool s_touch_int_held;
 static bool s_touch_reset_held;
 
-#if APP_PWR_GT911_SLEEP_ENABLED
-static bool s_gt911_full_sleep_verified;
-static uint8_t s_gt911_full_sleep_address;
-#endif
-
 /*
  * __attribute__((unused)) keeps the build clean when every optional pin below
  * is left at -1, which is the default until the schematic pin numbers are
@@ -461,55 +456,7 @@ esp_err_t component_display_verify_deep_sleep_low_power(void)
 
 esp_err_t component_display_verify_deep_sleep_low_power(void)
 {
-#if APP_PWR_GT911_SLEEP_ENABLED
-    if (!s_gt911_full_sleep_verified) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
-    if (bus == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    /*
-     * A sleeping GT911 should not ACK I2C. Prove that the shared bus itself is
-     * still healthy by probing the ES8311, which is on the same SDA/SCL pair.
-     * This prevents a dead bus from being mistaken for successful GT911 Sleep.
-     */
-    if (i2c_master_probe(
-            bus,
-            APP_PWR_ES8311_I2C_ADDRESS,
-            GT911_PROBE_TIMEOUT_MS) != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "GT911 full-Sleep audit cannot prove bus health: ES8311 0x%02X "
-            "did not ACK",
-            APP_PWR_ES8311_I2C_ADDRESS);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (i2c_master_probe(
-            bus,
-            s_gt911_full_sleep_address,
-            GT911_PROBE_TIMEOUT_MS) == ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "GT911 full-Sleep final audit FAILED: controller at 0x%02X still "
-            "ACKs I2C",
-            s_gt911_full_sleep_address);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    ESP_LOGI(
-        TAG,
-        "GT911 FULL SLEEP final audit OK: addr=0x%02X no I2C ACK, "
-        "shared bus healthy via ES8311",
-        s_gt911_full_sleep_address);
-
     return ESP_OK;
-#else
-    return ESP_OK;
-#endif
 }
 
 #endif /* APP_PWR_GT911_GREEN_MODE_ENABLED */
@@ -553,36 +500,20 @@ static esp_err_t gt911_enter_sleep(void)
 {
     i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
 
-    s_gt911_full_sleep_verified = false;
-    s_gt911_full_sleep_address = 0U;
-
     if (bus == NULL) {
         ESP_LOGW(TAG,
-                 "Shared I2C bus is already released; cannot issue GT911 "
-                 "full-Sleep command");
+                 "Shared I2C bus is already released; GT911 keeps scanning. "
+                 "Move this call before bsp_display_shutdown_for_deep_sleep() "
+                 "if the BSP deinitializes I2C.");
         return ESP_ERR_INVALID_STATE;
     }
-
-#if APP_PWR_TOUCH_INT_GPIO < 0
-    /*
-     * The Goodix sequence asks the host to hold INT LOW before Command 0x05.
-     * The stock ESP32-P4-NANO does not route INT to a P4 GPIO. We therefore
-     * cannot force that prerequisite. V19 is intentionally experimental: send
-     * the command and accept it only if the controller demonstrably stops
-     * ACKing while another device proves the same I2C bus is still healthy.
-     */
-    ESP_LOGW(
-        TAG,
-        "GT911 FULL SLEEP measurement mode: host INT control is unavailable; "
-        "sleep will be accepted only after no-ACK verification");
-#endif
 
     static const uint8_t addresses[] = {
         APP_PWR_GT911_PRIMARY_ADDRESS,
         APP_PWR_GT911_SECONDARY_ADDRESS,
     };
 
-    for (size_t i = 0; i < sizeof(addresses) / sizeof(addresses[0]); ++i) {
+    for (size_t i = 0; i < sizeof(addresses) / sizeof(addresses[0]); i++) {
         const uint8_t address = addresses[i];
 
         if (i2c_master_probe(bus, address, GT911_PROBE_TIMEOUT_MS) != ESP_OK) {
@@ -590,69 +521,21 @@ static esp_err_t gt911_enter_sleep(void)
         }
 
         esp_err_t ret = gt911_write_sleep_command(bus, address);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "GT911 at 0x%02X rejected full-Sleep command: %s",
-                     address, esp_err_to_name(ret));
-            return ret;
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "GT911 at 0x%02X entered sleep mode", address);
+            /* Give the controller time to act before the bus is isolated. */
+            vTaskDelay(pdMS_TO_TICKS(10));
+            return ESP_OK;
         }
 
-        /*
-         * Goodix requires >58 ms between issuing the Sleep command and a wake.
-         * Waiting 70 ms also gives the device enough time to stop responding
-         * before we verify the state.
-         */
-        vTaskDelay(pdMS_TO_TICKS(APP_PWR_GT911_SLEEP_VERIFY_DELAY_MS));
-
-        /*
-         * First prove the bus itself is alive. The ES8311 is still awake at
-         * this point because audio suspend happens in the following stage.
-         */
-        if (i2c_master_probe(
-                bus,
-                APP_PWR_ES8311_I2C_ADDRESS,
-                GT911_PROBE_TIMEOUT_MS) != ESP_OK) {
-            ESP_LOGE(
-                TAG,
-                "GT911 full-Sleep verification aborted: shared I2C bus health "
-                "check failed at ES8311 0x%02X",
-                APP_PWR_ES8311_I2C_ADDRESS);
-            return ESP_ERR_INVALID_STATE;
-        }
-
-        if (i2c_master_probe(bus, address, GT911_PROBE_TIMEOUT_MS) == ESP_OK) {
-            ESP_LOGE(
-                TAG,
-                "GT911 FULL SLEEP FAILED at 0x%02X: controller still ACKs "
-                "after %u ms",
-                address,
-                (unsigned)APP_PWR_GT911_SLEEP_VERIFY_DELAY_MS);
-            return ESP_ERR_INVALID_STATE;
-        }
-
-        s_gt911_full_sleep_verified = true;
-        s_gt911_full_sleep_address = address;
-
-        ESP_LOGI(
-            TAG,
-            "GT911 FULL SLEEP verified at 0x%02X: Command 0x05 accepted, "
-            "controller no longer ACKs I2C after %u ms; capacitive scanning "
-            "stopped",
-            address,
-            (unsigned)APP_PWR_GT911_SLEEP_VERIFY_DELAY_MS);
-
-#if APP_PWR_TOUCH_INT_GPIO < 0 && APP_PWR_TOUCH_RESET_GPIO < 0
-        ESP_LOGW(
-            TAG,
-            "GT911 FULL SLEEP is persistent across P4 Deep-sleep reset on "
-            "stock wiring; GPIO3 can wake the P4, but a board power-cycle is "
-            "required to restore touch");
-#endif
-        return ESP_OK;
+        ESP_LOGW(TAG, "GT911 at 0x%02X rejected the sleep command: %s",
+                 address, esp_err_to_name(ret));
+        return ret;
     }
 
     ESP_LOGW(TAG,
-             "No GT911 answered at 0x%02X or 0x%02X; full Sleep was not "
-             "applied",
+             "No GT911 answered at 0x%02X or 0x%02X; touch controller may "
+             "keep scanning during Deep-sleep",
              APP_PWR_GT911_PRIMARY_ADDRESS,
              APP_PWR_GT911_SECONDARY_ADDRESS);
 
@@ -767,16 +650,11 @@ esp_err_t component_display_wake_touch_after_reset(void)
     return ESP_OK;
 
 #else
-#if APP_PWR_GT911_SLEEP_ENABLED
-    ESP_LOGW(
-        TAG,
-        "GT911 cannot be host-woken from FULL SLEEP on stock wiring: "
-        "INT/RESET are not connected to ESP32-P4. Full board power-cycle "
-        "required before touch initialization.");
-    return ESP_ERR_NOT_SUPPORTED;
-#else
+    /*
+     * No touch pin is configured, so APP_PWR_GT911_SLEEP_ENABLED is refused at
+     * build time and the controller is never put to sleep. Nothing to wake.
+     */
     return ESP_OK;
-#endif
 #endif
 }
 
@@ -828,11 +706,13 @@ esp_err_t component_display_disable_for_deep_sleep(void)
 #endif
 
     /*
-     * 2. GT911 low-power policy.
+     * 2. Put the GT911 into the lowest safe SOFTWARE-ONLY policy available on
+     *    the stock board.
      *
-     * V19 disables Green mode and requests the controller's real full Sleep
-     * state. The command is accepted only after the controller stops ACKing
-     * while the ES8311 proves that the shared I2C bus itself remains healthy.
+     * Full GT911 Sleep cannot be used safely because INT/RESET are not exposed
+     * to the P4. V18 therefore shortens Low_Power_Control to the configured
+     * interval so the GT911 automatically enters Green mode when idle and
+     * self-wakes on the next touch.
      */
 #if APP_PWR_GT911_GREEN_MODE_ENABLED
     ret = gt911_configure_automatic_green_mode();
@@ -847,17 +727,18 @@ esp_err_t component_display_disable_for_deep_sleep(void)
     }
 #endif
 
+    /*
+     * Optional full GT911 Sleep remains available only for a future hardware
+     * revision that exposes a verified INT or RESET wake pin.
+     */
 #if APP_PWR_GT911_SLEEP_ENABLED
     ret = gt911_enter_sleep();
-    if (ret != ESP_OK) {
-        ESP_LOGW(
-            TAG,
-            "GT911 did not reach verified FULL SLEEP: %s; continuing P4 "
-            "Deep-sleep so the failure is visible in the final audit",
-            esp_err_to_name(ret));
-        if (first_error == ESP_OK) {
-            first_error = ret;
-        }
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        /*
+         * Deliberately not fatal. A touch controller that refuses to sleep
+         * costs current, but must never block the shutdown sequence.
+         */
+        ESP_LOGW(TAG, "Continuing Deep-sleep shutdown without GT911 sleep");
     }
 #endif
 
@@ -935,19 +816,6 @@ esp_err_t component_display_restore_after_failed_sleep(void)
             first_error = ret;
         }
         s_backlight_held = false;
-    }
-#endif
-
-#if APP_PWR_GT911_SLEEP_ENABLED && \
-    (APP_PWR_TOUCH_INT_GPIO < 0) && (APP_PWR_TOUCH_RESET_GPIO < 0)
-    if (s_gt911_full_sleep_verified) {
-        ESP_LOGE(
-            TAG,
-            "Deep sleep failed after GT911 entered FULL SLEEP; stock wiring "
-            "has no software wake path. Power-cycle the board to restore touch.");
-        if (first_error == ESP_OK) {
-            first_error = ESP_ERR_NOT_SUPPORTED;
-        }
     }
 #endif
 

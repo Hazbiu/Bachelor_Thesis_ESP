@@ -13,7 +13,6 @@
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "power_save/component_audio.h"
-#include "power_save/component_display.h"
 #include "power_save/component_ethernet.h"
 #include "power_save/component_wifi.h"
 #include "soc/soc_caps.h"
@@ -54,11 +53,8 @@ static const char *TAG = "deep_sleep";
  * GPIO54 LOW after the HP GPIO domain powers down.
  *
  * We still use per-pin gpio_hold_en() as the best software preparation and
- * re-apply GPIO54 at the final application-controlled boundary. On this
- * project GPIO54 rising in real P4 Deep-sleep is now intentional: it releases
- * C6 CHIP_PU, the already-installed C6 self-sleep firmware boots, and the C6
- * immediately enters its own Deep-sleep. Therefore no external pull-down and
- * no additional GPIO54 hold trick is requested here.
+ * re-apply GPIO54 at the final application-controlled boundary. A board-level
+ * pull-down on C6 CHIP_PU is required for guaranteed LOW during Deep-sleep.
  *
  * gpio_force_hold_all() is deliberately NOT used: it would also freeze flash,
  * UART and GPIO3, and ESP-IDF explicitly warns against using the global force
@@ -186,30 +182,6 @@ static void audit_rails_before_deep_sleep(void)
             esp_err_to_name(codec_ret));
     }
 
-#if APP_PWR_GT911_SLEEP_ENABLED || APP_PWR_GT911_GREEN_MODE_ENABLED
-    esp_err_t gt911_ret = component_display_verify_deep_sleep_low_power();
-    if (gt911_ret == ESP_OK) {
-#if APP_PWR_GT911_SLEEP_ENABLED
-        ESP_LOGI(AUDIT_TAG, "GT911 FULL SLEEP (no I2C ACK)             OK");
-#else
-        ESP_LOGI(AUDIT_TAG, "GT911 automatic Green/low-power mode      OK");
-#endif
-    } else {
-        mismatches++;
-#if APP_PWR_GT911_SLEEP_ENABLED
-        ESP_LOGE(
-            AUDIT_TAG,
-            "GT911 FULL SLEEP                           FAILED (%s)",
-            esp_err_to_name(gt911_ret));
-#else
-        ESP_LOGE(
-            AUDIT_TAG,
-            "GT911 automatic Green/low-power mode      FAILED (%s)",
-            esp_err_to_name(gt911_ret));
-#endif
-    }
-#endif
-
     for (size_t i = 0; i < sizeof(s_audited_rails) / sizeof(s_audited_rails[0]); i++) {
         const deep_sleep_rail_t *rail = &s_audited_rails[i];
         const int level = gpio_get_level((gpio_num_t)rail->gpio_num);
@@ -237,10 +209,11 @@ static void audit_rails_before_deep_sleep(void)
         ESP_LOGI(
             AUDIT_TAG,
             "All software-controlled Deep-sleep states verified: "
-            "C6 self-sleep policy armed, IP101GRI BMCR Power Down, "
-            "ES8311 suspend, NS4150B off, GT911 FULL SLEEP, microSD rail off "
-            "and shared I2C high. V19 keeps the V18 P4 domain/GPIO cleanup and "
-            "replaces GT911 Green mode with verified full Sleep.");
+            "C6 policy armed, IP101GRI BMCR Power Down, ES8311 suspend, "
+            "NS4150B off, microSD rail off and shared I2C high. "
+            "Remaining current belongs to hardware without a safe software "
+            "power gate (GT911 on stock wiring, panel rails, regulators, "
+            "LEDs, USB-UART bridge and camera-module residual).");
     } else {
         ESP_LOGE(AUDIT_TAG,
                  "%u rail(s) are NOT in their Deep-sleep state; expect "
@@ -355,13 +328,14 @@ static esp_err_t isolate_shared_i2c_for_deep_sleep(void)
     return first_error;
 }
 
+#if APP_PWR_ISOLATE_SDMMC_PINS
 /*
- * Release a digital peripheral signal into a high-impedance/no-pull state at
- * the irreversible Deep-sleep boundary. This helper is shared by the SDMMC,
- * audio, C6, Ethernet, CSI-sideband and final UART0 cleanup paths.
+ * Float a non-RTC SDMMC pad immediately after the card rail is off.
  *
- * rtc_gpio_isolate() is still used separately for the shared I2C RTC-capable
- * pins. Do not use persistent HP-GPIO holds here.
+ * rtc_gpio_isolate() only applies to the P4 LP/RTC-capable pin range. The
+ * SDMMC signals GPIO39..44 are HP pads, so the safe software preparation is a
+ * pull-less input with no sleep-state output substitution. The actual HP GPIO
+ * domain is then removed by Deep-sleep.
  */
 static esp_err_t float_digital_pin_for_deep_sleep(gpio_num_t gpio_num)
 {
@@ -396,7 +370,6 @@ static esp_err_t float_digital_pin_for_deep_sleep(gpio_num_t gpio_num)
     return gpio_sleep_sel_dis(gpio_num);
 }
 
-#if APP_PWR_ISOLATE_SDMMC_PINS
 static void float_sdmmc_pins_for_deep_sleep(void)
 {
     static const int sdmmc_pins[] = APP_PWR_SDMMC_PIN_LIST;
@@ -429,186 +402,6 @@ static void float_sdmmc_pins_for_deep_sleep(void)
     }
 }
 #endif /* APP_PWR_ISOLATE_SDMMC_PINS */
-
-#if APP_PWR_QUIESCE_PERIPHERAL_SIGNAL_PINS
-static void quiesce_peripheral_signal_pins_for_deep_sleep(void)
-{
-    static const int signal_pins[] = APP_PWR_PERIPHERAL_SIGNAL_PIN_LIST;
-    unsigned failed = 0U;
-
-    for (size_t i = 0; i < sizeof(signal_pins) / sizeof(signal_pins[0]); ++i) {
-        const gpio_num_t gpio_num = (gpio_num_t)signal_pins[i];
-
-        /*
-         * Defensive invariants: never release the one wake input or any board
-         * control signal whose level is intentionally held until sleep entry.
-         */
-        if (gpio_num == WAKE_BUTTON_GPIO ||
-            gpio_num == APP_PWR_SDCARD_POWER_GPIO ||
-            gpio_num == APP_PWR_AUDIO_AMP_GPIO ||
-            gpio_num == APP_PWR_WIFI_C6_CHIP_PU_GPIO) {
-            failed++;
-            ESP_LOGE(
-                TAG,
-                "Refusing to float protected control/wake GPIO%d",
-                (int)gpio_num);
-            continue;
-        }
-
-        const esp_err_t ret = float_digital_pin_for_deep_sleep(gpio_num);
-        if (ret != ESP_OK) {
-            failed++;
-            ESP_LOGW(
-                TAG,
-                "Could not release peripheral signal GPIO%d: %s",
-                (int)gpio_num,
-                esp_err_to_name(ret));
-        }
-    }
-
-    if (failed == 0U) {
-        ESP_LOGI(
-            TAG,
-            "Peripheral signal audit complete: audio I2S, C6 SDIO/sideband, "
-            "C6 programming UART, Ethernet RMII and CSI side-channel GPIOs "
-            "released INPUT/no-pull");
-    } else {
-        ESP_LOGW(
-            TAG,
-            "%u peripheral signal GPIO(s) could not be released; continuing",
-            failed);
-    }
-}
-#endif /* APP_PWR_QUIESCE_PERIPHERAL_SIGNAL_PINS */
-
-#if APP_PWR_DEEP_SLEEP_FORCE_DOMAINS_OFF
-typedef struct {
-    esp_sleep_pd_domain_t domain;
-    const char *name;
-} deep_sleep_domain_request_t;
-
-static void configure_final_p4_power_domains(void)
-{
-    /*
-     * ESP-IDF defaults unused domains to AUTO. V18 makes the software-only
-     * intent explicit so no stale application request can keep these blocks on.
-     * The single Deep-sleep wake source is GPIO3.
-     */
-    static const deep_sleep_domain_request_t off_domains[] = {
-#if SOC_PM_SUPPORT_RTC_PERIPH_PD
-        { ESP_PD_DOMAIN_RTC_PERIPH, "RTC_PERIPH" },
-#endif
-        { ESP_PD_DOMAIN_XTAL,       "XTAL" },
-#if SOC_PM_SUPPORT_XTAL32K_PD
-        { ESP_PD_DOMAIN_XTAL32K,    "XTAL32K" },
-#endif
-#if SOC_PM_SUPPORT_RC32K_PD
-        { ESP_PD_DOMAIN_RC32K,      "RC32K" },
-#endif
-#if SOC_PM_SUPPORT_RC_FAST_PD
-        { ESP_PD_DOMAIN_RC_FAST,    "RC_FAST" },
-#endif
-        /*
-         * ESP-IDF v5.5.4 intentionally removes ESP_PD_DOMAIN_CPU from the
-         * public enum when CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y. The user's
-         * ESP32-P4 v1.3 build uses that compatibility path, so do not name the
-         * unavailable enum there. Deep-sleep still shuts the HP/CPU domain down
-         * as part of the SoC sleep transition.
-         */
-#if SOC_PM_SUPPORT_CPU_PD && !CONFIG_ESP32P4_SELECTS_REV_LESS_V3
-        { ESP_PD_DOMAIN_CPU,        "CPU" },
-#endif
-#if SOC_PM_SUPPORT_TOP_PD
-        { ESP_PD_DOMAIN_TOP,        "TOP" },
-#endif
-#if SOC_PM_SUPPORT_CNNT_PD
-        { ESP_PD_DOMAIN_CNNT,       "CNNT/USB-HS" },
-#endif
-    };
-
-    unsigned failed = 0U;
-    esp_err_t ret = ESP_OK;
-
-    /*
-     * Do not force the shared flash/PSRAM supply rail OFF here. The application
-     * uses XIP from PSRAM; Deep-sleep itself handles flash safely. Returning
-     * VDDSDIO to AUTO also clears any stale Light-sleep ON request.
-     */
-#if SOC_PM_SUPPORT_VDDSDIO_PD
-    ret = esp_sleep_pd_config(
-        ESP_PD_DOMAIN_VDDSDIO,
-        ESP_PD_OPTION_AUTO);
-
-    if (ret != ESP_OK) {
-        failed++;
-        ESP_LOGW(
-            TAG,
-            "Could not return VDDSDIO to AUTO: %s",
-            esp_err_to_name(ret));
-    }
-#endif
-
-    for (size_t i = 0; i < sizeof(off_domains) / sizeof(off_domains[0]); ++i) {
-        ret = esp_sleep_pd_config(
-            off_domains[i].domain,
-            ESP_PD_OPTION_OFF);
-
-        if (ret == ESP_OK) {
-            ESP_LOGI(
-                TAG,
-                "P4 Deep-sleep domain request: %-12s -> OFF",
-                off_domains[i].name);
-        } else {
-            failed++;
-            ESP_LOGW(
-                TAG,
-                "P4 Deep-sleep domain request failed: %s -> OFF: %s",
-                off_domains[i].name,
-                esp_err_to_name(ret));
-        }
-    }
-
-#if SOC_PM_SUPPORT_CNNT_PD
-    ESP_LOGI(
-        TAG,
-        "USB Type-A software policy: external VBUS switch has no P4 GPIO "
-        "control; internal high-speed connectivity domain CNNT requested OFF");
-#else
-    ESP_LOGI(
-        TAG,
-        "USB Type-A software policy: external VBUS switch has no P4 GPIO "
-        "control; target exposes no switchable CNNT power domain");
-#endif
-
-    if (failed == 0U) {
-        ESP_LOGI(
-            TAG,
-            "P4 power-domain audit: all safe software-only OFF requests accepted");
-    } else {
-        ESP_LOGW(
-            TAG,
-            "P4 power-domain audit: %u request(s) were not accepted; "
-            "ESP-IDF will still apply its Deep-sleep AUTO policy",
-            failed);
-    }
-}
-#endif /* APP_PWR_DEEP_SLEEP_FORCE_DOMAINS_OFF */
-
-#if APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY
-/*
- * Must be the LAST software operation before esp_deep_sleep_start().
- * After these pins are detached from UART0 no additional logging is allowed.
- */
-static void float_uart0_at_final_boundary(void)
-{
-    static const int uart0_pins[] = APP_PWR_UART0_PIN_LIST;
-
-    for (size_t i = 0; i < sizeof(uart0_pins) / sizeof(uart0_pins[0]); ++i) {
-        (void)float_digital_pin_for_deep_sleep(
-            (gpio_num_t)uart0_pins[i]);
-    }
-}
-#endif /* APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY */
 
 #if APP_PWR_DEEP_SLEEP_POWER_DOWN_FLASH
 static void power_down_flash_for_deep_sleep(void)
@@ -699,31 +492,11 @@ void enter_deep_sleep(void)
         }
     }
 
-    /*
-     * Clear every wake source that may have been left by an earlier
-     * Light-sleep cycle, then arm only GPIO3 for this Deep-sleep entry.
-     */
-    esp_err_t wake_clear_ret =
-        esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-
-    if (wake_clear_ret != ESP_OK && wake_clear_ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(
-            TAG,
-            "Could not clear all stale wake sources: %s",
-            esp_err_to_name(wake_clear_ret));
-    } else {
-        ESP_LOGI(TAG, "Deep-sleep wake audit: all stale wake sources cleared");
-    }
-
-    /* Wake when GPIO3 becomes LOW. No timer/USB/UART wake-up is enabled. */
+    /* Wake when GPIO3 becomes LOW. No timer wake-up is enabled. */
     ESP_ERROR_CHECK(
         esp_deep_sleep_enable_gpio_wakeup(
             1ULL << WAKE_BUTTON_GPIO,
             ESP_GPIO_WAKEUP_GPIO_LOW));
-
-#if APP_PWR_DEEP_SLEEP_FORCE_DOMAINS_OFF
-    configure_final_p4_power_domains();
-#endif
 
     /*
      * Report the state of every controlled rail while the pads can still be
@@ -757,15 +530,6 @@ void enter_deep_sleep(void)
             "I2C pin isolation completed with errors: %s; continuing",
             esp_err_to_name(i2c_ret));
     }
-
-#if APP_PWR_QUIESCE_PERIPHERAL_SIGNAL_PINS
-    /*
-     * The owning peripherals are all quiesced by this point and their audits
-     * have completed. Release the remaining board signal pins so the sleeping
-     * P4 cannot source/sink current into still-powered external devices.
-     */
-    quiesce_peripheral_signal_pins_for_deep_sleep();
-#endif
 
     /*
      * FINAL C6 CLAMP
@@ -805,7 +569,7 @@ void enter_deep_sleep(void)
     ESP_LOGW(
         TAG,
         "C6-FINAL-AUDIT: GPIO%d CHIP_PU level=%d expected=%d "
-        "silicon=v1.3 deep_sleep_behavior=C6_self_sleep_trigger",
+        "silicon=v1.3 external_pulldown_required=yes",
         APP_PWR_WIFI_C6_CHIP_PU_GPIO,
         c6_final_level,
         APP_PWR_WIFI_C6_DISABLED_LEVEL);
@@ -815,15 +579,12 @@ void enter_deep_sleep(void)
         "Entering Deep-sleep. Press the GPIO%d button to wake up.",
         WAKE_BUTTON_GPIO);
 
-    /*
-     * Flush all logs before the final UART0 detach. No logging, delay or other
-     * application activity is allowed after this point.
-     */
+    /* Flush buffered output before entering Deep-sleep. */
     fflush(stdout);
 
-#if APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY
-    float_uart0_at_final_boundary();
-#endif
-
+    /*
+     * No FreeRTOS delay and no additional application GPIO reconfiguration
+     * after the final C6 clamp.
+     */
     esp_deep_sleep_start();
 }

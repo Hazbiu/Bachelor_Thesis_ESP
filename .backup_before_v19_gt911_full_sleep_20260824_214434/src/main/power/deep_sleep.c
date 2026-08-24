@@ -186,27 +186,21 @@ static void audit_rails_before_deep_sleep(void)
             esp_err_to_name(codec_ret));
     }
 
-#if APP_PWR_GT911_SLEEP_ENABLED || APP_PWR_GT911_GREEN_MODE_ENABLED
+#if APP_PWR_GT911_GREEN_MODE_ENABLED
+    /*
+     * Full GT911 Sleep is intentionally not used on the stock board because
+     * INT/RESET are unavailable. Verify the automatic Green-mode configuration
+     * instead, while the shared I2C bus is still alive.
+     */
     esp_err_t gt911_ret = component_display_verify_deep_sleep_low_power();
     if (gt911_ret == ESP_OK) {
-#if APP_PWR_GT911_SLEEP_ENABLED
-        ESP_LOGI(AUDIT_TAG, "GT911 FULL SLEEP (no I2C ACK)             OK");
-#else
         ESP_LOGI(AUDIT_TAG, "GT911 automatic Green/low-power mode      OK");
-#endif
     } else {
         mismatches++;
-#if APP_PWR_GT911_SLEEP_ENABLED
-        ESP_LOGE(
-            AUDIT_TAG,
-            "GT911 FULL SLEEP                           FAILED (%s)",
-            esp_err_to_name(gt911_ret));
-#else
         ESP_LOGE(
             AUDIT_TAG,
             "GT911 automatic Green/low-power mode      FAILED (%s)",
             esp_err_to_name(gt911_ret));
-#endif
     }
 #endif
 
@@ -238,9 +232,10 @@ static void audit_rails_before_deep_sleep(void)
             AUDIT_TAG,
             "All software-controlled Deep-sleep states verified: "
             "C6 self-sleep policy armed, IP101GRI BMCR Power Down, "
-            "ES8311 suspend, NS4150B off, GT911 FULL SLEEP, microSD rail off "
-            "and shared I2C high. V19 keeps the V18 P4 domain/GPIO cleanup and "
-            "replaces GT911 Green mode with verified full Sleep.");
+            "ES8311 suspend, NS4150B off, GT911 automatic Green mode, "
+            "microSD rail off and shared I2C high. V18 also requests unused "
+            "P4 power domains OFF and releases completed peripheral signal "
+            "pins at the irreversible sleep boundary.");
     } else {
         ESP_LOGE(AUDIT_TAG,
                  "%u rail(s) are NOT in their Deep-sleep state; expect "

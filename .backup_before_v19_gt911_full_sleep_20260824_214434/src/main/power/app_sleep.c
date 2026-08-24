@@ -539,16 +539,15 @@ static void run_sleep_sequence(const char *reason)
 
     /*
      * STEP 3 runs after the BSP has released its own touch handle and while
-     * the shared I2C bus is still alive. V19 deliberately uses the GT911's
-     * real full-Sleep command instead of Green mode. On the stock board there
-     * is no P4-controlled GT911 INT/RESET wake pin, so this is a deepest-power
-     * measurement policy: after GPIO3 wakes the P4, board power must be cycled
-     * before touch is usable again.
+     * the shared I2C bus is still alive. The stock board has no P4-controlled
+     * GT911 INT/RESET wake pin, so full GT911 Sleep remains disabled. V18
+     * instead configures the controller's automatic Green/low-power idle mode,
+     * which self-wakes on the next touch and therefore remains software-only.
      */
     ESP_LOGI(
         "POWER_PROFILE",
-        "STEP 3: GT911 FULL SLEEP + display side-channel cleanup "
-        "(Green mode disabled; stock wiring needs power-cycle to restore touch)");
+        "STEP 3: GT911 automatic Green-mode + display side-channel cleanup "
+        "(full GT911 Sleep disabled: no host wake pin)");
 
     esp_err_t touch_ret = component_display_disable_for_deep_sleep();
 

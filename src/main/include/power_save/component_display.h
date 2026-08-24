@@ -7,66 +7,47 @@ extern "C" {
 #endif
 
 /**
- * Put the display side-channels into their lowest state before ESP32-P4
- * Deep-sleep.
+ * Put the display side-channels into their lowest software-controlled state
+ * before ESP32-P4 Deep-sleep.
  *
- * The BSP call bsp_display_shutdown_for_deep_sleep() removes LVGL, the MIPI
- * DSI panel and the touch driver, but it does not tell the GT911 controller
- * itself to stop scanning, and it does not guarantee that the backlight-enable
- * pad keeps its off level once the digital domain is powered down.
+ * V19 uses the GT911 full-Sleep command (0x05 -> 0x8040), not automatic
+ * Green mode. The controller is considered asleep only when it stops ACKing
+ * on I2C while another device on the same bus (ES8311) still responds.
  *
- * This function therefore performs the remaining work:
+ * IMPORTANT: on the stock ESP32-P4-NANO BSP, GT911 INT and RESET are not
+ * connected to a P4 GPIO. Goodix requires INT-high or RESET to wake from full
+ * Sleep. Therefore this V19 build is intended for deepest-software current
+ * measurement: after GPIO3 wakes the P4, a complete board power-cycle is
+ * required before the GT911/touch path can operate again.
  *
- *   1. drives and holds the backlight-enable pin at its off level;
- *   2. sends the GT911 sleep command (0x05 -> register 0x8040) over the
- *      shared I2C bus;
- *   3. drives and holds the GT911 INT pin LOW so the controller cannot wake
- *      itself, and optionally asserts and holds the GT911 RESET pin.
+ * Call ordering:
  *
- * Call ordering is important:
- *
- *   bsp_display_shutdown_for_deep_sleep()   <- BSP releases its touch handle
+ *   bsp_display_shutdown_for_deep_sleep()
  *   component_display_disable_for_deep_sleep()
  *   ... remaining shutdown stages ...
- *   enter_deep_sleep()                      <- isolates the shared I2C pins
- *
- * Running before the BSP shutdown risks the BSP's own touch teardown waking
- * the controller again; running after the I2C isolation makes the I2C write
- * impossible.
- *
- * A missing I2C bus or an unresponsive controller is reported but never fatal:
- * failing to sleep the touch panel must not prevent the system from sleeping.
+ *   enter_deep_sleep()
  */
 esp_err_t component_display_disable_for_deep_sleep(void);
 
 /**
- * Release the display side-channel holds only when entering Deep-sleep
- * unexpectedly fails.
+ * Audit the selected GT911 low-power state while the shared I2C bus is still
+ * available. In V19 this verifies full Sleep by confirming:
+ *   - ES8311 still ACKs (bus healthy);
+ *   - the sleeping GT911 does not ACK.
+ */
+esp_err_t component_display_verify_deep_sleep_low_power(void);
+
+/**
+ * Release display-side GPIO holds only if Deep-sleep unexpectedly returns.
+ * A GT911 already placed into full Sleep cannot be software-restored on the
+ * stock board because no host INT/RESET line is available.
  */
 esp_err_t component_display_restore_after_failed_sleep(void);
 
 /**
- * Bring the GT911 out of sleep after an ESP32-P4 reset.
- *
- * The touch controller runs from the display module's always-on 3.3 V rail,
- * so the sleep command written before Deep-sleep survives a Deep-sleep wake,
- * an EN-pin reset and a reflash. Its I2C interface is off while it sleeps, so
- * an unwoken controller makes the BSP abort at boot:
- *
- *     bsp_display_indev_init -> bsp_touch_new() -> ESP_ERR_NOT_FOUND
- *
- * This routine performs the hardware wake - a RESET toggle when that pin is
- * known, otherwise an INT pulse - and must therefore run BEFORE
- * bsp_display_start().
- *
- * It is registered as a constructor in component_display.c so it runs ahead of
- * app_main() without any edit to app_main.c, and it is exported here so it can
- * be called explicitly instead if you prefer that to be visible in app_main().
- * Calling it twice is harmless.
- *
- * With no touch pin configured the whole thing compiles to nothing: sleeping
- * the GT911 is refused at build time in that case, so there is never anything
- * to wake.
+ * Wake GT911 when a future board revision provides a usable RESET or INT GPIO.
+ * On stock wiring with V19 full-Sleep enabled this returns
+ * ESP_ERR_NOT_SUPPORTED and logs that a full board power-cycle is required.
  */
 esp_err_t component_display_wake_touch_after_reset(void);
 

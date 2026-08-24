@@ -186,27 +186,21 @@ static void audit_rails_before_deep_sleep(void)
             esp_err_to_name(codec_ret));
     }
 
-#if APP_PWR_GT911_SLEEP_ENABLED || APP_PWR_GT911_GREEN_MODE_ENABLED
+#if APP_PWR_GT911_GREEN_MODE_ENABLED
+    /*
+     * Full GT911 Sleep is intentionally not used on the stock board because
+     * INT/RESET are unavailable. Verify the automatic Green-mode configuration
+     * instead, while the shared I2C bus is still alive.
+     */
     esp_err_t gt911_ret = component_display_verify_deep_sleep_low_power();
     if (gt911_ret == ESP_OK) {
-#if APP_PWR_GT911_SLEEP_ENABLED
-        ESP_LOGI(AUDIT_TAG, "GT911 FULL SLEEP (no I2C ACK)             OK");
-#else
         ESP_LOGI(AUDIT_TAG, "GT911 automatic Green/low-power mode      OK");
-#endif
     } else {
         mismatches++;
-#if APP_PWR_GT911_SLEEP_ENABLED
-        ESP_LOGE(
-            AUDIT_TAG,
-            "GT911 FULL SLEEP                           FAILED (%s)",
-            esp_err_to_name(gt911_ret));
-#else
         ESP_LOGE(
             AUDIT_TAG,
             "GT911 automatic Green/low-power mode      FAILED (%s)",
             esp_err_to_name(gt911_ret));
-#endif
     }
 #endif
 
@@ -238,9 +232,10 @@ static void audit_rails_before_deep_sleep(void)
             AUDIT_TAG,
             "All software-controlled Deep-sleep states verified: "
             "C6 self-sleep policy armed, IP101GRI BMCR Power Down, "
-            "ES8311 suspend, NS4150B off, GT911 FULL SLEEP, microSD rail off "
-            "and shared I2C high. V19 keeps the V18 P4 domain/GPIO cleanup and "
-            "replaces GT911 Green mode with verified full Sleep.");
+            "ES8311 suspend, NS4150B off, GT911 automatic Green mode, "
+            "microSD rail off and shared I2C high. V18 also requests unused "
+            "P4 power domains OFF and releases completed peripheral signal "
+            "pins at the irreversible sleep boundary.");
     } else {
         ESP_LOGE(AUDIT_TAG,
                  "%u rail(s) are NOT in their Deep-sleep state; expect "
@@ -495,47 +490,24 @@ static void configure_final_p4_power_domains(void)
      * The single Deep-sleep wake source is GPIO3.
      */
     static const deep_sleep_domain_request_t off_domains[] = {
-#if SOC_PM_SUPPORT_RTC_PERIPH_PD
         { ESP_PD_DOMAIN_RTC_PERIPH, "RTC_PERIPH" },
-#endif
         { ESP_PD_DOMAIN_XTAL,       "XTAL" },
-#if SOC_PM_SUPPORT_XTAL32K_PD
         { ESP_PD_DOMAIN_XTAL32K,    "XTAL32K" },
-#endif
-#if SOC_PM_SUPPORT_RC32K_PD
         { ESP_PD_DOMAIN_RC32K,      "RC32K" },
-#endif
-#if SOC_PM_SUPPORT_RC_FAST_PD
         { ESP_PD_DOMAIN_RC_FAST,    "RC_FAST" },
-#endif
-        /*
-         * ESP-IDF v5.5.4 intentionally removes ESP_PD_DOMAIN_CPU from the
-         * public enum when CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y. The user's
-         * ESP32-P4 v1.3 build uses that compatibility path, so do not name the
-         * unavailable enum there. Deep-sleep still shuts the HP/CPU domain down
-         * as part of the SoC sleep transition.
-         */
-#if SOC_PM_SUPPORT_CPU_PD && !CONFIG_ESP32P4_SELECTS_REV_LESS_V3
         { ESP_PD_DOMAIN_CPU,        "CPU" },
-#endif
-#if SOC_PM_SUPPORT_TOP_PD
         { ESP_PD_DOMAIN_TOP,        "TOP" },
-#endif
-#if SOC_PM_SUPPORT_CNNT_PD
         { ESP_PD_DOMAIN_CNNT,       "CNNT/USB-HS" },
-#endif
     };
 
     unsigned failed = 0U;
-    esp_err_t ret = ESP_OK;
 
     /*
      * Do not force the shared flash/PSRAM supply rail OFF here. The application
      * uses XIP from PSRAM; Deep-sleep itself handles flash safely. Returning
      * VDDSDIO to AUTO also clears any stale Light-sleep ON request.
      */
-#if SOC_PM_SUPPORT_VDDSDIO_PD
-    ret = esp_sleep_pd_config(
+    esp_err_t ret = esp_sleep_pd_config(
         ESP_PD_DOMAIN_VDDSDIO,
         ESP_PD_OPTION_AUTO);
 
@@ -546,7 +518,6 @@ static void configure_final_p4_power_domains(void)
             "Could not return VDDSDIO to AUTO: %s",
             esp_err_to_name(ret));
     }
-#endif
 
     for (size_t i = 0; i < sizeof(off_domains) / sizeof(off_domains[0]); ++i) {
         ret = esp_sleep_pd_config(
@@ -568,17 +539,10 @@ static void configure_final_p4_power_domains(void)
         }
     }
 
-#if SOC_PM_SUPPORT_CNNT_PD
     ESP_LOGI(
         TAG,
         "USB Type-A software policy: external VBUS switch has no P4 GPIO "
         "control; internal high-speed connectivity domain CNNT requested OFF");
-#else
-    ESP_LOGI(
-        TAG,
-        "USB Type-A software policy: external VBUS switch has no P4 GPIO "
-        "control; target exposes no switchable CNNT power domain");
-#endif
 
     if (failed == 0U) {
         ESP_LOGI(

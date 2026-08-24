@@ -266,28 +266,21 @@
  * Display / touch Deep-sleep configuration
  * ---------------------------------------------------------------------
  *
- * V19 intentionally uses the GT911's real full-Sleep command
- * (0x05 -> register 0x8040) instead of Green/low-speed scanning.
+ * Waveshare's ESP32-P4-NANO BSP defines the LCD backlight GPIO, LCD reset,
+ * GT911 reset and GT911 interrupt pins as GPIO_NUM_NC. The backlight is
+ * controlled by the display-side I2C controller (address 0x45), not by a
+ * dedicated ESP32-P4 GPIO. Therefore -1 below is intentional for this board.
  *
- * IMPORTANT STOCK-BOARD LIMITATION:
- * Waveshare's ESP32-P4-NANO BSP exposes the GT911 INT and RESET pins as
- * GPIO_NUM_NC. The GT911 programming guide requires INT-high or RESET to
- * wake from full Sleep. Therefore the P4 cannot restore touch after a
- * Deep-sleep wake on this stock wiring. This V19 build is a deepest-software
- * power-measurement build: after waking the P4 with GPIO3, a complete board
- * power-cycle is required before touch can work again.
- *
- * The sleep command is verified before the P4 sleeps by confirming that:
- *   1. the GT911 stops ACKing on I2C after >58 ms; and
- *   2. the shared I2C bus itself is still alive through the ES8311 address.
+ * The GT911 can be commanded into sleep over I2C, but a sleeping GT911 needs
+ * a hardware INT pulse or RESET toggle to wake reliably. Because the stock BSP
+ * exposes neither pin, GT911 sleep must remain disabled unless the hardware is
+ * modified or a specific display revision exposes a verified wake pin.
  */
-#define APP_PWR_GT911_SLEEP_ENABLED                 1
-#define APP_PWR_GT911_ALLOW_SLEEP_WITHOUT_HOST_WAKE 1
-#define APP_PWR_GT911_SLEEP_VERIFY_DELAY_MS         70U
+#define APP_PWR_GT911_SLEEP_ENABLED                 0
 #define APP_PWR_GT911_PRIMARY_ADDRESS               0x5D
 #define APP_PWR_GT911_SECONDARY_ADDRESS             0x14
 
-/* Timings used only when a future board exposes a real wake pin. */
+/* GT911 timings used only if a real wake pin is added/configured. */
 #define APP_PWR_GT911_RESET_ASSERT_MS               20
 #define APP_PWR_GT911_INT_PULSE_MS                  5
 #define APP_PWR_GT911_BOOT_MS                       60
@@ -296,57 +289,12 @@
 #define APP_PWR_DISPLAY_BACKLIGHT_GPIO              (-1)
 #define APP_PWR_DISPLAY_BACKLIGHT_OFF_LEVEL         0
 
-/* Stock BSP: GT911 INT is GPIO_NUM_NC. */
+/* Stock BSP: GT911 INT is GPIO_NUM_NC. Keep -1 unless hardware is verified. */
 #define APP_PWR_TOUCH_INT_GPIO                      (-1)
 
-/* Stock BSP: GT911 RESET is GPIO_NUM_NC. */
+/* Stock BSP: GT911 RESET is GPIO_NUM_NC. Keep -1 unless hardware is verified. */
 #define APP_PWR_TOUCH_RESET_GPIO                    (-1)
 #define APP_PWR_TOUCH_RESET_ACTIVE_LEVEL            0
-
-/*
- * Green mode is explicitly disabled in V19. The GT911 goes from normal
- * operation directly into full Sleep at the destructive Deep-sleep boundary.
- */
-#define APP_PWR_GT911_GREEN_MODE_ENABLED            0
-#define APP_PWR_GT911_GREEN_IDLE_SECONDS            0U
-
-/*
- * Final ESP32-P4 software-only Deep-sleep pass.
- *
- * - Explicitly request OFF for P4 power domains that are not needed by the
- *   single GPIO3 wake source. ESP-IDF's default AUTO policy should already
- *   remove these domains, but the explicit requests make the intent auditable
- *   and prevent a stale application setting from keeping them on.
- * - Float only board peripheral signal pins whose owning peripherals have
- *   already been shut down. Control rails (GPIO45/53/54) and wake GPIO3 are
- *   deliberately excluded.
- * - UART0 GPIO37/38 are floated at the very last boundary, after fflush(), so
- *   the CH343P-side pins cannot create a P4 I/O leakage path during sleep.
- */
-#define APP_PWR_DEEP_SLEEP_FORCE_DOMAINS_OFF        1
-#define APP_PWR_QUIESCE_PERIPHERAL_SIGNAL_PINS      1
-#define APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY       1
-
-/*
- * Schematic-confirmed board signal pins that can be released only after all
- * corresponding subsystems are quiesced:
- *
- *   GPIO6                    C6 sideband
- *   GPIO9..13                ES8311 I2S
- *   GPIO14..19,24,25         P4<->C6 SDIO/sideband
- *   GPIO20,21                exposed C6-programming UART bridge pins
- *   GPIO28,29,30,34,35,49,50 IP101GRI RMII
- *   GPIO46,47                CSI side-channel pins
- *
- * Ethernet MDC/MDIO/RESET (31/52/51) are already released by the Ethernet
- * module after BMCR power-down. SDMMC 39..44 are handled separately. GPIO7/8
- * are RTC-isolated separately. GPIO45/53/54 must retain their control policy.
- */
-#define APP_PWR_PERIPHERAL_SIGNAL_PIN_LIST          \
-    { 6, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, \
-      20, 21, 24, 25, 28, 29, 30, 34, 35, 46, 47, 49, 50 }
-
-#define APP_PWR_UART0_PIN_LIST                      { 37, 38 }
 
 /*
  * ---------------------------------------------------------------------
@@ -395,13 +343,13 @@
 #define APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS      0
 
 /*
- * Normally full GT911 Sleep is refused when no host wake pin exists.
- * V19 explicitly opts into this only for deepest-software current measurement.
+ * Refuse to build a firmware that puts the GT911 to sleep with no way to wake
+ * it again. Without an INT or RESET pin the controller stays asleep across the
+ * next reset and bsp_touch_new() aborts the application at boot.
  */
 #if APP_PWR_GT911_SLEEP_ENABLED && \
-    (APP_PWR_TOUCH_INT_GPIO < 0) && (APP_PWR_TOUCH_RESET_GPIO < 0) && \
-    !APP_PWR_GT911_ALLOW_SLEEP_WITHOUT_HOST_WAKE
-#error "GT911 full Sleep needs INT/RESET for normal wake; set APP_PWR_GT911_ALLOW_SLEEP_WITHOUT_HOST_WAKE only for measurement builds"
+    (APP_PWR_TOUCH_INT_GPIO < 0) && (APP_PWR_TOUCH_RESET_GPIO < 0)
+#error "APP_PWR_GT911_SLEEP_ENABLED needs APP_PWR_TOUCH_INT_GPIO or APP_PWR_TOUCH_RESET_GPIO: the touch controller could not be woken and the next boot would abort in bsp_touch_new()"
 #endif
 
 #if APP_CPU_IDLE_180_AFTER_MS >= APP_CPU_IDLE_90_AFTER_MS

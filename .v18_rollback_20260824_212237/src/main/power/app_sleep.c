@@ -539,16 +539,16 @@ static void run_sleep_sequence(const char *reason)
 
     /*
      * STEP 3 runs after the BSP has released its own touch handle and while
-     * the shared I2C bus is still alive. V19 deliberately uses the GT911's
-     * real full-Sleep command instead of Green mode. On the stock board there
-     * is no P4-controlled GT911 INT/RESET wake pin, so this is a deepest-power
-     * measurement policy: after GPIO3 wakes the P4, board power must be cycled
-     * before touch is usable again.
+     * the shared I2C bus is still alive. On the stock ESP32-P4-NANO the GT911
+     * INT/RESET wake pins are not connected to a P4 GPIO, so the build keeps
+     * APP_PWR_GT911_SLEEP_ENABLED=0. component_display still performs every
+     * safe display-side preparation; an actual GT911 sleep command is sent
+     * only if a future hardware revision provides a verified wake pin.
      */
     ESP_LOGI(
         "POWER_PROFILE",
-        "STEP 3: GT911 FULL SLEEP + display side-channel cleanup "
-        "(Green mode disabled; stock wiring needs power-cycle to restore touch)");
+        "STEP 3: preparing display/touch side-channels "
+        "(GT911 sleep only when a wake pin is configured)");
 
     esp_err_t touch_ret = component_display_disable_for_deep_sleep();
 
