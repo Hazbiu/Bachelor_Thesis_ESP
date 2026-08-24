@@ -1,4 +1,0 @@
-dependencies:
-  idf: ">=5.5"
-  espressif/esp-serial-flasher: "2.0.0"
-  waveshare/esp32_p4_platform: "*"

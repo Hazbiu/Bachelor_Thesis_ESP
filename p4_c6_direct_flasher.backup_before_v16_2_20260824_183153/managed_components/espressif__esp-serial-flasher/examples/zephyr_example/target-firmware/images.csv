@@ -1,4 +1,0 @@
-# image_file;offset (hexadecimal, no 0x prefix)
-bootloader.bin;1000
-partition-table.bin;8000
-app.bin;10000
