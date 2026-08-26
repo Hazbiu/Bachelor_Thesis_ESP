@@ -14,7 +14,6 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
-#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -116,9 +115,10 @@ static void power_profile_stage_delay(void)
 
 /*
 * External board peripherals are not controlled by the ESP32-P4's internal
-* Light-sleep power-domain state machine. Quiesce the peripherals that are not
-* needed for wake detection. GT911 and the shared I2C bus deliberately remain
-* active because touchscreen wake is implemented by timed I2C polling.
+* Light-sleep power-domain state machine. Quiesce only peripherals that can be
+* restored in place without rebuilding application state. GT911 and the shared
+* I2C bus remain active for touchscreen polling, and microSD remains powered and
+* mounted so FATFS/VFS state and open application data survive Light-sleep.
 */
 static void record_first_light_sleep_error(
     esp_err_t ret,
@@ -139,12 +139,6 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
         &first_error);
 #endif
 
-#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
-    record_first_light_sleep_error(
-        component_sdcard_disable_for_deep_sleep(),
-        &first_error);
-#endif
-
 #if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
     record_first_light_sleep_error(
         component_ethernet_hold_reset_for_light_sleep(),
@@ -157,11 +151,7 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
 #else
         const char *audio_state = "UNCHANGED";
 #endif
-#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
-        const char *sdcard_state = "OFF";
-#else
-        const char *sdcard_state = "UNCHANGED";
-#endif
+        const char *sdcard_state = "PRESERVED";
 #if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
         const char *ethernet_state = "RESET";
 #else
@@ -195,12 +185,6 @@ static esp_err_t restore_aux_peripherals_after_light_sleep(void)
         &first_error);
 #endif
 
-#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
-    record_first_light_sleep_error(
-        component_sdcard_restore_after_failed_sleep(),
-        &first_error);
-#endif
-
 #if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
     record_first_light_sleep_error(
         component_audio_restore_after_light_sleep(),
@@ -213,11 +197,7 @@ static esp_err_t restore_aux_peripherals_after_light_sleep(void)
 #else
         const char *audio_state = "UNCHANGED";
 #endif
-#if APP_LIGHT_SLEEP_POWER_DOWN_SDCARD
-        const char *sdcard_state = "ON";
-#else
-        const char *sdcard_state = "UNCHANGED";
-#endif
+        const char *sdcard_state = "PRESERVED";
 #if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
         const char *ethernet_state = "RELEASED";
 #else
@@ -444,6 +424,63 @@ static void finish_light_sleep(
     if (restore_performance) {
         cpu_power_notify_activity();
     }
+}
+
+static void mark_light_sleep_recovery_failure(void)
+{
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    s_light_sleep_in_progress = false;
+    s_light_sleep_failed_until_activity = true;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+}
+
+static void recover_light_sleep_without_reset(
+    const char *phase,
+    esp_err_t cause,
+    bool restore_aux,
+    bool restore_hardware)
+{
+    mark_light_sleep_recovery_failure();
+
+    ESP_LOGE(
+        POWER_TAG,
+        "event=LIGHT_SLEEP_FAILED phase=%s error=%s "
+        "action=KEEP_ACTIVE_NO_RESET data_state=PRESERVED",
+        phase != NULL ? phase : "UNKNOWN",
+        esp_err_to_name(cause));
+
+    if (restore_aux) {
+        const esp_err_t aux_ret =
+            restore_aux_peripherals_after_light_sleep();
+
+        if (aux_ret != ESP_OK) {
+            ESP_LOGE(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_RECOVERY_WARNING phase=AUX_RESTORE "
+                "error=%s action=CONTINUE_ACTIVE_NO_RESET",
+                esp_err_to_name(aux_ret));
+        }
+    }
+
+    if (restore_hardware && s_light_resume_callback != NULL) {
+        const esp_err_t resume_ret =
+            s_light_resume_callback(s_light_transition_user_data);
+
+        if (resume_ret != ESP_OK) {
+            ESP_LOGE(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_RECOVERY_WARNING phase=HARDWARE_RESUME "
+                "error=%s action=CONTINUE_ACTIVE_NO_RESET",
+                esp_err_to_name(resume_ret));
+        }
+    }
+
+    /*
+     * Light-sleep must never become a reset boundary. Return the CPU policy to
+     * ACTIVE and keep the existing RAM/application state. A later real activity
+     * event clears the failure guard and may arm Light-sleep again.
+     */
+    cpu_power_notify_activity();
 }
 
 static bool claim_light_sleep_window(uint32_t *remaining_ms)
@@ -822,8 +859,8 @@ static void inactivity_power_policy_task(void *arg)
     if (s_light_mode_enabled) {
         ESP_LOGI(
             POWER_TAG,
-            "event=LIGHT_SLEEP_TOUCH_FIX version=8 "
-            "mode=DOC_ALIGNED_GT911_POLLING_AUX_POWERDOWN");
+            "event=LIGHT_SLEEP_STATE_POLICY version=9 "
+            "mode=RAM_PRESERVING_NO_RESET sdcard=PRESERVED gt911=POLLING");
     }
 
     const char *policy_name = s_light_mode_enabled
@@ -907,14 +944,17 @@ static void inactivity_power_policy_task(void *arg)
 
         if (s_light_suspend_callback == NULL ||
             s_light_resume_callback == NULL) {
-            ESP_LOGE(
-                POWER_TAG,
-                "event=LIGHT_SLEEP_FAILED phase=CALLBACK_CHECK "
-                "error=NOT_REGISTERED action=RESTART");
+            cancel_light_sleep_claim();
+            recover_light_sleep_without_reset(
+                "CALLBACK_CHECK",
+                ESP_ERR_INVALID_STATE,
+                false,
+                false);
             ESP_LOGE(
                 TAG,
-                "Light-sleep callbacks are not registered; restarting safely");
-            esp_restart();
+                "Light-sleep callbacks are not registered; "
+                "remaining ACTIVE without resetting application state");
+            continue;
         }
 
         if (!app_sleep_light_sleep_is_due()) {
@@ -938,38 +978,36 @@ static void inactivity_power_policy_task(void *arg)
         }
 
         if (suspend_ret != ESP_OK) {
-            ESP_LOGE(
-                POWER_TAG,
-                "event=LIGHT_SLEEP_FAILED phase=HARDWARE_SUSPEND "
-                "error=%s action=RESTART",
-                esp_err_to_name(suspend_ret));
+            recover_light_sleep_without_reset(
+                "HARDWARE_SUSPEND",
+                suspend_ret,
+                false,
+                true);
             ESP_LOGE(
                 TAG,
-                "Application Light-sleep suspend failed: %s; restarting safely",
+                "Application Light-sleep suspend failed: %s; "
+                "remaining ACTIVE without reset",
                 esp_err_to_name(suspend_ret));
-            esp_restart();
+            continue;
         }
 
         esp_err_t aux_suspend_ret =
             suspend_aux_peripherals_for_light_sleep();
 
         if (aux_suspend_ret != ESP_OK) {
-            ESP_LOGE(
-                POWER_TAG,
-                "event=LIGHT_SLEEP_FAILED phase=AUX_SUSPEND "
-                "error=%s action=RESTORE_AND_RESTART",
-                esp_err_to_name(aux_suspend_ret));
-
-            (void)restore_aux_peripherals_after_light_sleep();
-            (void)s_light_resume_callback(s_light_transition_user_data);
-            esp_restart();
+            recover_light_sleep_without_reset(
+                "AUX_SUSPEND",
+                aux_suspend_ret,
+                true,
+                true);
+            continue;
         }
 
         ESP_LOGI(
             POWER_TAG,
             "event=LIGHT_SLEEP_HARDWARE_SUSPENDED "
-            "camera=OFF display=OFF audio=OFF sdcard=OFF "
-            "ethernet=RESET c6=OFF gt911=POLLING");
+            "camera=OFF display=OFF audio=OFF sdcard=PRESERVED "
+            "ethernet=RESET c6=OFF gt911=POLLING ram=PRESERVED");
 
         /*
         * PRE-SLEEP CHECK
@@ -1010,16 +1048,17 @@ static void inactivity_power_policy_task(void *arg)
         }
 
         if (touch_ret != ESP_OK) {
-            ESP_LOGE(
-                POWER_TAG,
-                "event=LIGHT_SLEEP_FAILED phase=TOUCH_PRECHECK "
-                "error=%s action=RESTART",
-                esp_err_to_name(touch_ret));
+            recover_light_sleep_without_reset(
+                "TOUCH_PRECHECK",
+                touch_ret,
+                true,
+                true);
             ESP_LOGE(
                 TAG,
-                "Could not prepare GT911 polling: %s; restarting safely",
+                "Could not prepare GT911 polling: %s; "
+                "remaining ACTIVE without reset",
                 esp_err_to_name(touch_ret));
-            esp_restart();
+            continue;
         }
 
         if (pre_release_samples <
@@ -1043,24 +1082,24 @@ static void inactivity_power_policy_task(void *arg)
                 restore_aux_peripherals_after_light_sleep();
 
             if (aux_restore_ret != ESP_OK) {
+                mark_light_sleep_recovery_failure();
                 ESP_LOGE(
                     POWER_TAG,
-                    "event=LIGHT_SLEEP_FAILED phase=AUX_RESTORE "
-                    "error=%s action=RESTART",
+                    "event=LIGHT_SLEEP_RECOVERY_WARNING phase=AUX_RESTORE "
+                    "error=%s action=CONTINUE_ACTIVE_NO_RESET",
                     esp_err_to_name(aux_restore_ret));
-                esp_restart();
             }
 
             esp_err_t resume_ret =
                 s_light_resume_callback(s_light_transition_user_data);
 
             if (resume_ret != ESP_OK) {
+                mark_light_sleep_recovery_failure();
                 ESP_LOGE(
                     POWER_TAG,
-                    "event=LIGHT_SLEEP_FAILED phase=HARDWARE_RESUME "
-                    "error=%s action=RESTART",
+                    "event=LIGHT_SLEEP_RECOVERY_WARNING phase=HARDWARE_RESUME "
+                    "error=%s action=CONTINUE_ACTIVE_NO_RESET",
                     esp_err_to_name(resume_ret));
-                esp_restart();
             }
 
             continue;
@@ -1138,13 +1177,10 @@ static void inactivity_power_policy_task(void *arg)
                 ESP_LOGE(
                     POWER_TAG,
                     "event=LIGHT_SLEEP_FAILED phase=WAKE_CHECK "
-                    "wake_cause=%d action=RESTART",
+                    "wake_cause=%d action=RECOVER_ACTIVE_NO_RESET",
                     (int)wake_cause);
-                ESP_LOGE(
-                    TAG,
-                    "Unexpected Light-sleep wake cause %d; restarting safely",
-                    (int)wake_cause);
-                esp_restart();
+                light_ret = ESP_ERR_INVALID_STATE;
+                break;
             }
 
             /*
@@ -1207,13 +1243,10 @@ static void inactivity_power_policy_task(void *arg)
                 ESP_LOGE(
                     POWER_TAG,
                     "event=LIGHT_SLEEP_FAILED phase=TOUCH_POLL "
-                    "error=%s action=RESTART",
+                    "error=%s action=RECOVER_ACTIVE_NO_RESET",
                     esp_err_to_name(touch_ret));
-                ESP_LOGE(
-                    TAG,
-                    "GT911 Light-sleep poll failed: %s; restarting safely",
-                    esp_err_to_name(touch_ret));
-                esp_restart();
+                light_ret = touch_ret;
+                break;
             }
 
             /*
@@ -1340,16 +1373,17 @@ static void inactivity_power_policy_task(void *arg)
         finish_light_sleep(light_ret, wake_cause, user_activity);
 
         if (light_ret != ESP_OK) {
-            ESP_LOGE(
-                POWER_TAG,
-                "event=LIGHT_SLEEP_FAILED phase=SLEEP_CALL "
-                "error=%s action=RESTART",
-                esp_err_to_name(light_ret));
+            recover_light_sleep_without_reset(
+                "SLEEP_CALL_OR_POLL",
+                light_ret,
+                true,
+                true);
             ESP_LOGE(
                 TAG,
-                "Light-sleep failed after hardware suspend: %s; restarting safely",
+                "Light-sleep failed after hardware suspend: %s; "
+                "application state preserved and ACTIVE mode restored without reset",
                 esp_err_to_name(light_ret));
-            esp_restart();
+            continue;
         }
 
         if (user_activity) {
@@ -1362,28 +1396,29 @@ static void inactivity_power_policy_task(void *arg)
                 restore_aux_peripherals_after_light_sleep();
 
             if (aux_restore_ret != ESP_OK) {
+                mark_light_sleep_recovery_failure();
                 ESP_LOGE(
                     POWER_TAG,
-                    "event=LIGHT_SLEEP_FAILED phase=AUX_RESTORE "
-                    "error=%s action=RESTART",
+                    "event=LIGHT_SLEEP_RECOVERY_WARNING phase=AUX_RESTORE "
+                    "error=%s action=CONTINUE_ACTIVE_NO_RESET",
                     esp_err_to_name(aux_restore_ret));
-                esp_restart();
             }
 
             esp_err_t resume_ret =
                 s_light_resume_callback(s_light_transition_user_data);
 
             if (resume_ret != ESP_OK) {
+                mark_light_sleep_recovery_failure();
                 ESP_LOGE(
                     POWER_TAG,
-                    "event=LIGHT_SLEEP_FAILED phase=HARDWARE_RESUME "
-                    "error=%s action=RESTART",
+                    "event=LIGHT_SLEEP_RECOVERY_WARNING phase=HARDWARE_RESUME "
+                    "error=%s action=CONTINUE_ACTIVE_NO_RESET",
                     esp_err_to_name(resume_ret));
                 ESP_LOGE(
                     TAG,
-                    "Application Light-sleep resume failed: %s; restarting safely",
+                    "Application Light-sleep resume failed: %s; "
+                    "keeping RAM/application state and continuing without reset",
                     esp_err_to_name(resume_ret));
-                esp_restart();
             }
 
             if (touchscreen_touched) {

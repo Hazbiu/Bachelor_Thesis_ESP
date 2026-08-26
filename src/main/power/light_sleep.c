@@ -14,17 +14,17 @@
 
 
 /*
- * ESP-IDF v5.5 ESP32-P4 documented Light-sleep policy used by this project:
- *
- * - Flash is NOT supply-power-gated because PSRAM is enabled and shares the
- *   memory power domain.
- * - Flash and PSRAM CS leakage workarounds are required.
- * - PM support is required by the application's 180..360 MHz DFS policy.
- *
- * The installer writes these values into sdkconfig and sdkconfig.defaults.
- * Keep compile-time guards here so a future configuration change cannot
- * silently undo the low-power/safety assumptions.
- */
+* ESP-IDF v5.5 ESP32-P4 documented Light-sleep policy used by this project:
+*
+* - Flash is NOT supply-power-gated because PSRAM is enabled and shares the
+*   memory power domain.
+* - Flash and PSRAM CS leakage workarounds are required.
+* - PM support is required by the application's 180..360 MHz DFS policy.
+*
+* The installer writes these values into sdkconfig and sdkconfig.defaults.
+* Keep compile-time guards here so a future configuration change cannot
+* silently undo the low-power/safety assumptions.
+*/
 #ifndef CONFIG_PM_ENABLE
 #error "V8 Light-sleep requires CONFIG_PM_ENABLE=y"
 #endif
@@ -49,11 +49,11 @@ static esp_sleep_wakeup_cause_t s_last_wakeup_cause =
 static esp_err_t configure_documented_light_sleep_domains(void)
 {
     /*
-     * Keep the shared flash/PSRAM supply domain ON. This follows the ESP-IDF
-     * warning for applications using SPIRAM and avoids the unsafe Flash
-     * supply-power-down path. The leakage workarounds above reduce CS leakage
-     * while the rail remains powered.
-     */
+    * Keep the shared flash/PSRAM supply domain ON. This follows the ESP-IDF
+    * warning for applications using SPIRAM and avoids the unsafe Flash
+    * supply-power-down path. The leakage workarounds above reduce CS leakage
+    * while the rail remains powered.
+    */
     esp_err_t ret = esp_sleep_pd_config(
         ESP_PD_DOMAIN_VDDSDIO,
         ESP_PD_OPTION_ON);
@@ -66,20 +66,12 @@ static esp_err_t configure_documented_light_sleep_domains(void)
     }
 
     /*
-     * Let IDF automatically power RTC peripherals according to the selected
-     * wake sources. This is the documented default strategy and avoids forcing
-     * an otherwise-unused RTC peripheral domain ON.
-     */
-    ret = esp_sleep_pd_config(
-        ESP_PD_DOMAIN_RTC_PERIPH,
-        ESP_PD_OPTION_AUTO);
-    if (ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "Could not set RTC_PERIPH Light-sleep domain to AUTO: %s",
-            esp_err_to_name(ret));
-        return ret;
-    }
+    * RTC_PERIPH is intentionally not touched here. ESP-IDF/component drivers
+    * can own that reference-counted power-domain policy. Calling AUTO from
+    * application code would reset their ownership state and can make a later
+    * OFF request asymmetric. With no application override, ESP-IDF applies
+    * the domain policy required by the active wake sources.
+    */
 
     return ESP_OK;
 }
@@ -87,10 +79,10 @@ static esp_err_t configure_documented_light_sleep_domains(void)
 static void restore_light_sleep_domain_defaults(void)
 {
     /*
-     * Do not leave a manual VDD_SPI ON request behind for the later
-     * Deep-sleep path. AUTO still keeps the rail powered in ACTIVE mode; it
-     * only lets ESP-IDF choose the correct state at the next sleep entry.
-     */
+    * Do not leave a manual VDD_SPI ON request behind for the later
+    * Deep-sleep path. AUTO still keeps the rail powered in ACTIVE mode; it
+    * only lets ESP-IDF choose the correct state at the next sleep entry.
+    */
     esp_err_t ret = esp_sleep_pd_config(
         ESP_PD_DOMAIN_VDDSDIO,
         ESP_PD_OPTION_AUTO);
@@ -152,11 +144,11 @@ static esp_err_t enter_light_sleep_internal(
     }
 
     /*
-     * Wake sources remain enabled after wake according to ESP-IDF. The normal
-     * cleanup below removes the sources configured by this function; clearing
-     * all sources here as well makes every 250 ms polling slice deterministic
-     * even after an earlier rejected sleep request.
-     */
+    * Wake sources remain enabled after wake according to ESP-IDF. The normal
+    * cleanup below removes the sources configured by this function; clearing
+    * all sources here as well makes every 250 ms polling slice deterministic
+    * even after an earlier rejected sleep request.
+    */
     ret = disable_sleep_source_if_enabled(ESP_SLEEP_WAKEUP_ALL);
     if (ret != ESP_OK) {
         restore_light_sleep_domain_defaults();
@@ -189,9 +181,9 @@ static esp_err_t enter_light_sleep_internal(
         }
 
         /*
-         * GPIO wake-up is level triggered. Entering sleep while the active-low
-         * button is already held would cause an immediate wake-up.
-         */
+        * GPIO wake-up is level triggered. Entering sleep while the active-low
+        * button is already held would cause an immediate wake-up.
+        */
         if (gpio_get_level(wake_gpio) == 0) {
             if (verbose) {
                 ESP_LOGI(
@@ -291,10 +283,10 @@ static esp_err_t enter_light_sleep_internal(
     }
 
     /*
-     * Wake sources remain configured after wake-up in ESP-IDF. Remove the
-     * Light-sleep sources here so they cannot accidentally carry over into
-     * the existing Deep-sleep path.
-     */
+    * Wake sources remain configured after wake-up in ESP-IDF. Remove the
+    * Light-sleep sources here so they cannot accidentally carry over into
+    * the existing Deep-sleep path.
+    */
     esp_err_t cleanup_error = ESP_OK;
 
     esp_err_t cleanup_ret = ESP_OK;

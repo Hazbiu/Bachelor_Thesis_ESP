@@ -23,47 +23,47 @@ static const char *TAG = "deep_sleep";
 #define WAKE_BUTTON_GPIO APP_DEEP_SLEEP_BUTTON_GPIO
 
 /*
- * ESP32-P4-NANO shared I2C bus from the Waveshare schematic:
- *
- *     GPIO7 = ESP_I2C_SDA
- *     GPIO8 = ESP_I2C_SCL
- *
- * R50 (SDA) and R48 (SCL) are external 2.2K pull-ups to ESP_3V3.
- * Software cannot disconnect those physical resistors. The lowest-current
- * software state is therefore to disable every internal pull resistor and
- * isolate the ESP32-P4 pads so that the external pull-ups can hold both lines
- * HIGH without a DC path through the SoC.
- *
- * Do this only at the final, irreversible Deep-sleep boundary. Light-sleep
- * must retain this bus because the application polls the GT911 touchscreen.
- */
+* ESP32-P4-NANO shared I2C bus from the Waveshare schematic:
+*
+*     GPIO7 = ESP_I2C_SDA
+*     GPIO8 = ESP_I2C_SCL
+*
+* R50 (SDA) and R48 (SCL) are external 2.2K pull-ups to ESP_3V3.
+* Software cannot disconnect those physical resistors. The lowest-current
+* software state is therefore to disable every internal pull resistor and
+* isolate the ESP32-P4 pads so that the external pull-ups can hold both lines
+* HIGH without a DC path through the SoC.
+*
+* Do this only at the final, irreversible Deep-sleep boundary. Light-sleep
+* must retain this bus because the application polls the GT911 touchscreen.
+*/
 #define SHARED_I2C_SDA_GPIO APP_PWR_SHARED_I2C_SDA_GPIO
 #define SHARED_I2C_SCL_GPIO APP_PWR_SHARED_I2C_SCL_GPIO
 
 /*
- * NOTE ON GPIO HOLDS AND THIS BOARD'S ESP32-P4 REVISION
- *
- * The tested board reports ESP32-P4 revision v1.3. GPIO54 is an HP/digital
- * GPIO and physically drives ESP32-C6 CHIP_PU. Bench measurement showed:
- *
- *     before esp_deep_sleep_start(): GPIO54 ~= 0 V
- *     in real Deep-sleep:            GPIO54 ~= 3.3 V
- *
- * Therefore the generic SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP capability
- * macro must not be interpreted as a guarantee that this v1.3 board will keep
- * GPIO54 LOW after the HP GPIO domain powers down.
- *
- * We still use per-pin gpio_hold_en() as the best software preparation and
- * re-apply GPIO54 at the final application-controlled boundary. On this
- * project GPIO54 rising in real P4 Deep-sleep is now intentional: it releases
- * C6 CHIP_PU, the already-installed C6 self-sleep firmware boots, and the C6
- * immediately enters its own Deep-sleep. Therefore no external pull-down and
- * no additional GPIO54 hold trick is requested here.
- *
- * gpio_force_hold_all() is deliberately NOT used: it would also freeze flash,
- * UART and GPIO3, and ESP-IDF explicitly warns against using the global force
- * hold as a normal Deep-sleep retention solution.
- */
+* NOTE ON GPIO HOLDS AND THIS BOARD'S ESP32-P4 REVISION
+*
+* The tested board reports ESP32-P4 revision v1.3. GPIO54 is an HP/digital
+* GPIO and physically drives ESP32-C6 CHIP_PU. Bench measurement showed:
+*
+*     before esp_deep_sleep_start(): GPIO54 ~= 0 V
+*     in real Deep-sleep:            GPIO54 ~= 3.3 V
+*
+* Therefore the generic SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP capability
+* macro must not be interpreted as a guarantee that this v1.3 board will keep
+* GPIO54 LOW after the HP GPIO domain powers down.
+*
+* We still use per-pin gpio_hold_en() as the best software preparation and
+* re-apply GPIO54 at the final application-controlled boundary. On this
+* project GPIO54 rising in real P4 Deep-sleep is now intentional: it releases
+* C6 CHIP_PU, the already-installed C6 self-sleep firmware boots, and the C6
+* immediately enters its own Deep-sleep. Therefore no external pull-down and
+* no additional GPIO54 hold trick is requested here.
+*
+* gpio_force_hold_all() is deliberately NOT used: it would also freeze flash,
+* UART and GPIO3, and ESP-IDF explicitly warns against using the global force
+* hold as a normal Deep-sleep retention solution.
+*/
 
 static void record_first_error(
     esp_err_t operation_result,
@@ -141,13 +141,13 @@ static const deep_sleep_rail_t s_audited_rails[] = {
 };
 
 /*
- * Report every controlled rail immediately before Deep-sleep is entered.
- *
- * A pad that was configured with GPIO_MODE_INPUT_OUTPUT reads back its real
- * electrical level even while it is held, so a hold that silently failed - or
- * an external device pulling a line - shows up in the serial log instead of
- * only on a multimeter.
- */
+* Report every controlled rail immediately before Deep-sleep is entered.
+*
+* A pad that was configured with GPIO_MODE_INPUT_OUTPUT reads back its real
+* electrical level even while it is held, so a hold that silently failed - or
+* an external device pulling a line - shows up in the serial log instead of
+* only on a multimeter.
+*/
 static void audit_rails_before_deep_sleep(void)
 {
     unsigned mismatches = 0;
@@ -155,10 +155,10 @@ static void audit_rails_before_deep_sleep(void)
     ESP_LOGI(AUDIT_TAG, "---- Pre-Deep-sleep rail audit ----------------------");
 
     /*
-     * GPIO51 alone no longer proves the Ethernet PHY is low-power. RESET is
-     * intentionally released so BMCR bit11 remains latched; re-read BMCR over
-     * MDC/MDIO and verify the actual IP101GRI Power Down state.
-     */
+    * GPIO51 alone no longer proves the Ethernet PHY is low-power. RESET is
+    * intentionally released so BMCR bit11 remains latched; re-read BMCR over
+    * MDC/MDIO and verify the actual IP101GRI Power Down state.
+    */
     esp_err_t ethernet_ret = component_ethernet_verify_power_down();
     if (ethernet_ret == ESP_OK) {
         ESP_LOGI(AUDIT_TAG, "IP101GRI BMCR Power Down (bit11)        OK");
@@ -171,10 +171,10 @@ static void audit_rails_before_deep_sleep(void)
     }
 
     /*
-     * GPIO53 proves only that the external NS4150B amplifier is disabled.
-     * The ES8311 is a separate I2C codec, so verify the final Espressif
-     * suspend-register state before the shared I2C pads are isolated.
-     */
+    * GPIO53 proves only that the external NS4150B amplifier is disabled.
+    * The ES8311 is a separate I2C codec, so verify the final Espressif
+    * suspend-register state before the shared I2C pads are isolated.
+    */
     esp_err_t codec_ret = component_audio_verify_power_down();
     if (codec_ret == ESP_OK) {
         ESP_LOGI(AUDIT_TAG, "ES8311 codec suspend registers          OK");
@@ -217,19 +217,19 @@ static void audit_rails_before_deep_sleep(void)
 
         if (matches) {
             ESP_LOGI(AUDIT_TAG, "GPIO%-2d %-22s level=%d expected=%d  OK",
-                     rail->gpio_num,
-                     rail->description,
-                     level,
-                     rail->expected_level);
+                    rail->gpio_num,
+                    rail->description,
+                    level,
+                    rail->expected_level);
         } else {
             mismatches++;
             ESP_LOGE(AUDIT_TAG,
-                     "GPIO%-2d %-22s level=%d expected=%d  MISMATCH -> %s",
-                     rail->gpio_num,
-                     rail->description,
-                     level,
-                     rail->expected_level,
-                     rail->consequence_if_wrong);
+                    "GPIO%-2d %-22s level=%d expected=%d  MISMATCH -> %s",
+                    rail->gpio_num,
+                    rail->description,
+                    level,
+                    rail->expected_level,
+                    rail->consequence_if_wrong);
         }
     }
 
@@ -243,9 +243,9 @@ static void audit_rails_before_deep_sleep(void)
             "replaces GT911 Green mode with verified full Sleep.");
     } else {
         ESP_LOGE(AUDIT_TAG,
-                 "%u rail(s) are NOT in their Deep-sleep state; expect "
-                 "elevated sleep current",
-                 mismatches);
+                "%u rail(s) are NOT in their Deep-sleep state; expect "
+                "elevated sleep current",
+                mismatches);
     }
 
     ESP_LOGI(AUDIT_TAG, "-----------------------------------------------------");
@@ -269,10 +269,10 @@ static esp_err_t isolate_i2c_pin_for_deep_sleep(
 
     if (level_before_isolation == 0) {
         /*
-         * One externally pulled-up 2.2K line held LOW draws approximately
-         * 3.3 V / 2200 ohm = 1.5 mA. Isolation removes an SoC-side LOW path,
-         * but it cannot release a line that an external peripheral holds LOW.
-         */
+        * One externally pulled-up 2.2K line held LOW draws approximately
+        * 3.3 V / 2200 ohm = 1.5 mA. Isolation removes an SoC-side LOW path,
+        * but it cannot release a line that an external peripheral holds LOW.
+        */
         ESP_LOGW(
             TAG,
             "%s GPIO%d is LOW before isolation; check whether an external "
@@ -304,11 +304,11 @@ static esp_err_t isolate_i2c_pin_for_deep_sleep(
     }
 
     /*
-     * GPIO7 and GPIO8 are ESP32-P4 LP/RTC-capable GPIOs. rtc_gpio_isolate()
-     * disconnects the pad's digital input/output paths and internal pulls for
-     * Deep-sleep. A Deep-sleep wake resets the application, so no runtime
-     * restoration path is required here.
-     */
+    * GPIO7 and GPIO8 are ESP32-P4 LP/RTC-capable GPIOs. rtc_gpio_isolate()
+    * disconnects the pad's digital input/output paths and internal pulls for
+    * Deep-sleep. A Deep-sleep wake resets the application, so no runtime
+    * restoration path is required here.
+    */
     ret = rtc_gpio_isolate(gpio_num);
     if (ret != ESP_OK) {
         ESP_LOGW(
@@ -356,21 +356,21 @@ static esp_err_t isolate_shared_i2c_for_deep_sleep(void)
 }
 
 /*
- * Release a digital peripheral signal into a high-impedance/no-pull state at
- * the irreversible Deep-sleep boundary. This helper is shared by the SDMMC,
- * audio, C6, Ethernet, CSI-sideband and final UART0 cleanup paths.
- *
- * rtc_gpio_isolate() is still used separately for the shared I2C RTC-capable
- * pins. Do not use persistent HP-GPIO holds here.
- */
+* Release a digital peripheral signal into a high-impedance/no-pull state at
+* the irreversible Deep-sleep boundary. This helper is shared by the SDMMC,
+* audio, C6, Ethernet, CSI-sideband and final UART0 cleanup paths.
+*
+* rtc_gpio_isolate() is still used separately for the shared I2C RTC-capable
+* pins. Do not use persistent HP-GPIO holds here.
+*/
 static esp_err_t float_digital_pin_for_deep_sleep(gpio_num_t gpio_num)
 {
     /*
-     * Release any stale application hold, then stop driving the pin and remove
-     * internal pulls. Do not create a new HP-GPIO hold here: bench testing on
-     * this board's ESP32-P4 rev-v1.3 showed that arbitrary HP pad holds cannot
-     * be treated as persistent once the HP domain powers down.
-     */
+    * Release any stale application hold, then stop driving the pin and remove
+    * internal pulls. Do not create a new HP-GPIO hold here: bench testing on
+    * this board's ESP32-P4 rev-v1.3 showed that arbitrary HP pad holds cannot
+    * be treated as persistent once the HP domain powers down.
+    */
     esp_err_t ret = gpio_hold_dis(gpio_num);
     if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
         return ret;
@@ -390,9 +390,9 @@ static esp_err_t float_digital_pin_for_deep_sleep(gpio_num_t gpio_num)
     }
 
     /*
-     * Keep this explicit high-impedance configuration at the sleep boundary.
-     * The P4 Deep-sleep hardware then powers down/isolates the HP GPIO domain.
-     */
+    * Keep this explicit high-impedance configuration at the sleep boundary.
+    * The P4 Deep-sleep hardware then powers down/isolates the HP GPIO domain.
+    */
     return gpio_sleep_sel_dis(gpio_num);
 }
 
@@ -440,9 +440,9 @@ static void quiesce_peripheral_signal_pins_for_deep_sleep(void)
         const gpio_num_t gpio_num = (gpio_num_t)signal_pins[i];
 
         /*
-         * Defensive invariants: never release the one wake input or any board
-         * control signal whose level is intentionally held until sleep entry.
-         */
+        * Defensive invariants: never release the one wake input or any board
+        * control signal whose level is intentionally held until sleep entry.
+        */
         if (gpio_num == WAKE_BUTTON_GPIO ||
             gpio_num == APP_PWR_SDCARD_POWER_GPIO ||
             gpio_num == APP_PWR_AUDIO_AMP_GPIO ||
@@ -490,14 +490,18 @@ typedef struct {
 static void configure_final_p4_power_domains(void)
 {
     /*
-     * ESP-IDF defaults unused domains to AUTO. V18 makes the software-only
-     * intent explicit so no stale application request can keep these blocks on.
-     * The single Deep-sleep wake source is GPIO3.
-     */
+    * ESP-IDF defaults unused domains to AUTO. Keep RTC_PERIPH out of this
+    * application-owned OFF list: ESP-IDF/component drivers may manage that
+    * domain with the reference-counted esp_sleep_pd_config() API. Issuing a
+    * second OFF from here can underflow that ownership count and produces:
+    *
+    *   "Domain is already in ESP_PD_OPTION_OFF state"
+    *
+    * The application therefore leaves RTC_PERIPH with its existing owner.
+    * Deep-sleep will still power it down automatically when the configured
+    * GPIO3 wake source does not require it.
+    */
     static const deep_sleep_domain_request_t off_domains[] = {
-#if SOC_PM_SUPPORT_RTC_PERIPH_PD
-        { ESP_PD_DOMAIN_RTC_PERIPH, "RTC_PERIPH" },
-#endif
         { ESP_PD_DOMAIN_XTAL,       "XTAL" },
 #if SOC_PM_SUPPORT_XTAL32K_PD
         { ESP_PD_DOMAIN_XTAL32K,    "XTAL32K" },
@@ -509,12 +513,12 @@ static void configure_final_p4_power_domains(void)
         { ESP_PD_DOMAIN_RC_FAST,    "RC_FAST" },
 #endif
         /*
-         * ESP-IDF v5.5.4 intentionally removes ESP_PD_DOMAIN_CPU from the
-         * public enum when CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y. The user's
-         * ESP32-P4 v1.3 build uses that compatibility path, so do not name the
-         * unavailable enum there. Deep-sleep still shuts the HP/CPU domain down
-         * as part of the SoC sleep transition.
-         */
+        * ESP-IDF v5.5.4 intentionally removes ESP_PD_DOMAIN_CPU from the
+        * public enum when CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y. The user's
+        * ESP32-P4 v1.3 build uses that compatibility path, so do not name the
+        * unavailable enum there. Deep-sleep still shuts the HP/CPU domain down
+        * as part of the SoC sleep transition.
+        */
 #if SOC_PM_SUPPORT_CPU_PD && !CONFIG_ESP32P4_SELECTS_REV_LESS_V3
         { ESP_PD_DOMAIN_CPU,        "CPU" },
 #endif
@@ -529,11 +533,18 @@ static void configure_final_p4_power_domains(void)
     unsigned failed = 0U;
     esp_err_t ret = ESP_OK;
 
+#if SOC_PM_SUPPORT_RTC_PERIPH_PD
+    ESP_LOGI(
+        TAG,
+        "P4 Deep-sleep domain policy: RTC_PERIPH left to ESP-IDF/component ownership; "
+        "no application OFF request");
+#endif
+
     /*
-     * Do not force the shared flash/PSRAM supply rail OFF here. The application
-     * uses XIP from PSRAM; Deep-sleep itself handles flash safely. Returning
-     * VDDSDIO to AUTO also clears any stale Light-sleep ON request.
-     */
+    * Do not force the shared flash/PSRAM supply rail OFF here. The application
+    * uses XIP from PSRAM; Deep-sleep itself handles flash safely. Returning
+    * VDDSDIO to AUTO also clears any stale Light-sleep ON request.
+    */
 #if SOC_PM_SUPPORT_VDDSDIO_PD
     ret = esp_sleep_pd_config(
         ESP_PD_DOMAIN_VDDSDIO,
@@ -596,9 +607,9 @@ static void configure_final_p4_power_domains(void)
 
 #if APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY
 /*
- * Must be the LAST software operation before esp_deep_sleep_start().
- * After these pins are detached from UART0 no additional logging is allowed.
- */
+* Must be the LAST software operation before esp_deep_sleep_start().
+* After these pins are detached from UART0 no additional logging is allowed.
+*/
 static void float_uart0_at_final_boundary(void)
 {
     static const int uart0_pins[] = APP_PWR_UART0_PIN_LIST;
@@ -614,14 +625,14 @@ static void float_uart0_at_final_boundary(void)
 static void power_down_flash_for_deep_sleep(void)
 {
     /*
-     * GPIO3 is the only Deep-sleep wake source; the RTC timer is never armed.
-     * Under that condition ESP-IDF is allowed to remove power from the SPI
-     * flash rail for the whole sleep interval.
-     *
-     * The capability macro guard keeps this portable: on a target without a
-     * switchable VDD_SPI domain the enum value does not exist and the request
-     * is simply skipped.
-     */
+    * GPIO3 is the only Deep-sleep wake source; the RTC timer is never armed.
+    * Under that condition ESP-IDF is allowed to remove power from the SPI
+    * flash rail for the whole sleep interval.
+    *
+    * The capability macro guard keeps this portable: on a target without a
+    * switchable VDD_SPI domain the enum value does not exist and the request
+    * is simply skipped.
+    */
 #if defined(SOC_PM_SUPPORT_VDDSDIO_PD) && SOC_PM_SUPPORT_VDDSDIO_PD
     const esp_err_t ret = esp_sleep_pd_config(
         ESP_PD_DOMAIN_VDDSDIO,
@@ -631,25 +642,25 @@ static void power_down_flash_for_deep_sleep(void)
         ESP_LOGI(TAG, "SPI flash rail (VDD_SPI) will be powered down");
     } else if (ret == ESP_ERR_INVALID_STATE) {
         /*
-         * Expected on this build. The boot log reports
-         *   mmu_psram: .rodata xip on psram
-         *   mmu_psram: .text   xip on psram
-         * so code and constants execute in place from the PSRAM that shares
-         * the VDD_SPI rail with the flash; IDF refuses to switch that rail
-         * off. Nothing is wrong, and the saving would have been a few tens of
-         * microamps - far below this board's floor.
-         */
+        * Expected on this build. The boot log reports
+        *   mmu_psram: .rodata xip on psram
+        *   mmu_psram: .text   xip on psram
+        * so code and constants execute in place from the PSRAM that shares
+        * the VDD_SPI rail with the flash; IDF refuses to switch that rail
+        * off. Nothing is wrong, and the saving would have been a few tens of
+        * microamps - far below this board's floor.
+        */
         ESP_LOGI(TAG,
-                 "VDD_SPI power-down declined (XIP from PSRAM shares this "
-                 "rail); continuing without it");
+                "VDD_SPI power-down declined (XIP from PSRAM shares this "
+                "rail); continuing without it");
     } else {
         ESP_LOGW(TAG, "Could not request flash power-down: %s",
-                 esp_err_to_name(ret));
+                esp_err_to_name(ret));
     }
 #else
     ESP_LOGI(TAG,
-             "This target has no software-switchable VDD_SPI domain; "
-             "flash power-down skipped");
+            "This target has no software-switchable VDD_SPI domain; "
+            "flash power-down skipped");
 #endif
 }
 #endif
@@ -657,18 +668,18 @@ static void power_down_flash_for_deep_sleep(void)
 void enter_deep_sleep(void)
 {
     /*
-     * Button wiring:
-     *
-     * ESP_3V3 ---- external 47K..100K pull-up ---- GPIO3
-     * GPIO3  ---- button ------------------------- GND
-     *
-     * Released: GPIO3 = HIGH
-     * Pressed:  GPIO3 = LOW
-     *
-     * Keep the internal pull-up enabled as a safe fallback. Disable it only
-     * after the physical external GPIO3 pull-up has been installed and
-     * verified with a meter.
-     */
+    * Button wiring:
+    *
+    * ESP_3V3 ---- external 47K..100K pull-up ---- GPIO3
+    * GPIO3  ---- button ------------------------- GND
+    *
+    * Released: GPIO3 = HIGH
+    * Pressed:  GPIO3 = LOW
+    *
+    * Keep the internal pull-up enabled as a safe fallback. Disable it only
+    * after the physical external GPIO3 pull-up has been installed and
+    * verified with a meter.
+    */
     gpio_config_t button_config = {
         .pin_bit_mask = 1ULL << WAKE_BUTTON_GPIO,
         .mode = GPIO_MODE_INPUT,
@@ -700,9 +711,9 @@ void enter_deep_sleep(void)
     }
 
     /*
-     * Clear every wake source that may have been left by an earlier
-     * Light-sleep cycle, then arm only GPIO3 for this Deep-sleep entry.
-     */
+    * Clear every wake source that may have been left by an earlier
+    * Light-sleep cycle, then arm only GPIO3 for this Deep-sleep entry.
+    */
     esp_err_t wake_clear_ret =
         esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
 
@@ -726,10 +737,10 @@ void enter_deep_sleep(void)
 #endif
 
     /*
-     * Report the state of every controlled rail while the pads can still be
-     * read. This is the last point at which a released hold is observable in
-     * software.
-     */
+    * Report the state of every controlled rail while the pads can still be
+    * read. This is the last point at which a released hold is observable in
+    * software.
+    */
     audit_rails_before_deep_sleep();
 
 #if APP_PWR_ISOLATE_SDMMC_PINS
@@ -741,17 +752,17 @@ void enter_deep_sleep(void)
 #endif
 
     /*
-     * All camera/display teardown has completed before this function is
-     * called. Isolate the shared I2C pins at this final boundary so the GT911
-     * Light-sleep polling path is not affected.
-     */
+    * All camera/display teardown has completed before this function is
+    * called. Isolate the shared I2C pins at this final boundary so the GT911
+    * Light-sleep polling path is not affected.
+    */
     esp_err_t i2c_ret = isolate_shared_i2c_for_deep_sleep();
     if (i2c_ret != ESP_OK) {
         /*
-         * Continue into Deep-sleep even if one isolation operation failed.
-         * Remaining active would consume far more current than sleeping, and
-         * the ESP32-P4 powers down its digital I2C peripheral in Deep-sleep.
-         */
+        * Continue into Deep-sleep even if one isolation operation failed.
+        * Remaining active would consume far more current than sleeping, and
+        * the ESP32-P4 powers down its digital I2C peripheral in Deep-sleep.
+        */
         ESP_LOGW(
             TAG,
             "I2C pin isolation completed with errors: %s; continuing",
@@ -760,21 +771,21 @@ void enter_deep_sleep(void)
 
 #if APP_PWR_QUIESCE_PERIPHERAL_SIGNAL_PINS
     /*
-     * The owning peripherals are all quiesced by this point and their audits
-     * have completed. Release the remaining board signal pins so the sleeping
-     * P4 cannot source/sink current into still-powered external devices.
-     */
+    * The owning peripherals are all quiesced by this point and their audits
+    * have completed. Release the remaining board signal pins so the sleeping
+    * P4 cannot source/sink current into still-powered external devices.
+    */
     quiesce_peripheral_signal_pins_for_deep_sleep();
 #endif
 
     /*
-     * FINAL C6 CLAMP
-     *
-     * STEP 6 has already disabled the ESP32-C6. Re-apply GPIO54 LOW again now,
-     * after every other application-side teardown operation, so there is no
-     * stale-state shortcut and no component delay between this write and the
-     * actual Deep-sleep entry.
-     */
+    * FINAL C6 CLAMP
+    *
+    * STEP 6 has already disabled the ESP32-C6. Re-apply GPIO54 LOW again now,
+    * after every other application-side teardown operation, so there is no
+    * stale-state shortcut and no component delay between this write and the
+    * actual Deep-sleep entry.
+    */
     esp_err_t c6_final_ret = component_wifi_force_off_at_sleep_boundary();
     if (c6_final_ret != ESP_OK) {
         ESP_LOGE(
@@ -785,10 +796,10 @@ void enter_deep_sleep(void)
     }
 
     /*
-     * Dump the real GPIO54 configuration at the last observable point.
-     * ESP-IDF v5.5 reports Pullup/Pulldown, InputEn, OutputEn, DriveCap,
-     * FuncSel and SleepSelEn here.
-     */
+    * Dump the real GPIO54 configuration at the last observable point.
+    * ESP-IDF v5.5 reports Pullup/Pulldown, InputEn, OutputEn, DriveCap,
+    * FuncSel and SleepSelEn here.
+    */
     esp_err_t dump_ret = gpio_dump_io_configuration(
         stdout,
         1ULL << APP_PWR_WIFI_C6_CHIP_PU_GPIO);
@@ -816,9 +827,9 @@ void enter_deep_sleep(void)
         WAKE_BUTTON_GPIO);
 
     /*
-     * Flush all logs before the final UART0 detach. No logging, delay or other
-     * application activity is allowed after this point.
-     */
+    * Flush all logs before the final UART0 detach. No logging, delay or other
+    * application activity is allowed after this point.
+    */
     fflush(stdout);
 
 #if APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY

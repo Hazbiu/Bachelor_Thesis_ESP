@@ -131,13 +131,22 @@
  *
  * GT911 is intentionally NOT powered down here because this board does not
  * expose a verified GT911 INT/RESET wake pin; touchscreen wake is implemented
- * by the existing 250 ms RTC/I2C polling path.
+ * by the existing RTC/I2C polling path.
+ *
+ * microSD is also intentionally kept powered and mounted in Light-sleep.
+ * Light-sleep is a state-preserving mode: unmounting/remounting FATFS allocates
+ * fresh VFS/SDMMC resources and previously caused ESP_ERR_NO_MEM on wake,
+ * followed by an application reset. Only Deep-sleep may unmount and power-gate
+ * the card because a Deep-sleep wake is a full system restart by design.
  *
  * The ESP32-C6 follows the persistent Wi-Fi setting during Active mode. The
  * ordered Deep-sleep path still forces CHIP_PU LOW at the sleep boundary.
  */
 #define APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP            1
-#define APP_LIGHT_SLEEP_POWER_DOWN_SDCARD            1
+/*
+ * microSD has no Light-sleep power-down toggle by design. The mounted card is
+ * part of the retained application state. Deep-sleep owns SD unmount/power-off.
+ */
 #define APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET          1
 
 /*
