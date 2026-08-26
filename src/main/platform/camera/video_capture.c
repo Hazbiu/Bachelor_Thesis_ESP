@@ -94,8 +94,10 @@ static ov5647_light_sleep_state_t s_ov5647_light_sleep_state = {0};
  *     2. disable MIPI data lanes
  *     3. gate/place MIPI clock lane into low-power mode
  *     4. power down MIPI HS TX and LP RX
- *     5. request MIPI subsystem suspend
- *     6. confirm SCCB software sleep
+ *     5. disable the physical MIPI output pad (0x3016 bit3)
+ *     6. request reduced MIPI PHY bias current (0x3017 bit3)
+ *     7. ensure the documented sensor sleep gate is enabled (0x3105 bit4)
+ *     8. confirm SCCB software sleep (0x0100 bit0 = 0)
  *
  * These writes are deliberately performed only from app_video_shutdown().
  * Light-sleep continues to use the normal reversible STREAMOFF/STREAMON path
@@ -104,7 +106,10 @@ static ov5647_light_sleep_state_t s_ov5647_light_sleep_state = {0};
 
 /* OV5647 register addresses. */
 #define OV5647_REG_MODE_SELECT             0x0100
+#define OV5647_REG_MIPI_PHY                0x3016
+#define OV5647_REG_MIPI_PHY_BIAS           0x3017
 #define OV5647_REG_MIPI_SC_CTRL            0x3018
+#define OV5647_REG_PADCLK_DIV              0x3105
 #define OV5647_REG_MIPI_CTRL00             0x4800
 #define OV5647_REG_MIPI_CTRL05             0x4805
 
@@ -119,6 +124,23 @@ static ov5647_light_sleep_state_t s_ov5647_light_sleep_state = {0};
 #define OV5647_MIPI_PHY_HS_TX_POWER_DOWN   (1U << 4)
 #define OV5647_MIPI_LP_RX_POWER_DOWN       (1U << 3)
 #define OV5647_MIPI_SYSTEM_SUSPEND          (1U << 1)
+
+/*
+ * V21 conservative OV5647 additions, all from documented register fields.
+ *
+ * 0x3016 bit3: mipi_pad_enable (clear = disable MIPI output pad)
+ * 0x3017 bit3: ihalf           (set   = bias current reduction)
+ * 0x3105 bit4: Sleep enable    (set   = enable sensor sleep gating)
+ *
+ * Deliberately NOT touched:
+ *   - 0x3013 internal-regulator/debug controls (datasheet says changing them
+ *     is not recommended),
+ *   - PLL reset/debug/power-up-disable fields with no documented power-down
+ *     sequence.
+ */
+#define OV5647_MIPI_PAD_ENABLE              (1U << 3)
+#define OV5647_MIPI_BIAS_CURRENT_REDUCTION  (1U << 3)
+#define OV5647_PADCLK_SLEEP_ENABLE          (1U << 4)
 
 /*
  * 0x4800 MIPI CTRL 00
@@ -391,7 +413,7 @@ static esp_err_t ov5647_quiesce_for_deep_sleep(void)
 
     ESP_LOGI(
         CAMERA_POWER_TAG,
-        "CAMERA-Q: applying OV5647 Deep-sleep software quiesce");
+        "CAMERA-Q-V21: applying OV5647 deeper documented Deep-sleep quiesce");
 
     /*
      * STREAMOFF has already stopped capture, so no sensor-control transaction
@@ -503,7 +525,59 @@ static esp_err_t ov5647_quiesce_for_deep_sleep(void)
     }
 
     /*
-     * Step D: explicitly confirm sensor software sleep.
+     * Step D: disable the physical MIPI pad driver.
+     *
+     * 0x3016 bit3 is documented as mipi_pad_enable. The MIPI transmitter and
+     * receiver are already powered down above, so removing the pad-enable bit
+     * is the next safe shutdown boundary before system Deep-sleep.
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_MIPI_PHY,
+        0,
+        OV5647_MIPI_PAD_ENABLE,
+        "MIPI output pad OFF");
+
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+
+    /*
+     * Step E: request the OV5647's documented MIPI PHY bias-current reduction.
+     * 0x3017 bit3 is IHALF / Bias current reduction. No undocumented bias
+     * tuning fields are changed.
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_MIPI_PHY_BIAS,
+        OV5647_MIPI_BIAS_CURRENT_REDUCTION,
+        0,
+        "MIPI bias current REDUCED");
+
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+
+    /*
+     * Step F: ensure the documented sensor sleep gate is enabled.
+     *
+     * 0x3105 bit4 is named Sleep enable in the OV5647 register table. On many
+     * configurations this bit is already 1; the read-modify-write therefore
+     * becomes a verified no-op when the sensor driver already configured it.
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_PADCLK_DIV,
+        OV5647_PADCLK_SLEEP_ENABLE,
+        0,
+        "sensor sleep gate ENABLED");
+
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+
+    /*
+     * Step G: explicitly confirm sensor SCCB software sleep.
      *
      * 0x0100 bit0:
      *   1 = streaming
@@ -543,9 +617,10 @@ static esp_err_t ov5647_quiesce_for_deep_sleep(void)
     if (first_error == ESP_OK) {
         ESP_LOGI(
             CAMERA_POWER_TAG,
-            "CAMERA-Q: OV5647 software quiesce COMPLETE: "
+            "CAMERA-Q-V21: OV5647 deeper software quiesce COMPLETE: "
             "stream=OFF data_lanes=OFF clock_lane=LP "
-            "MIPI_PHY=POWER_DOWN MIPI=suspended sensor=sleep");
+            "MIPI_PHY=POWER_DOWN pad=OFF bias=REDUCED "
+            "sleep_gate=ENABLED MIPI=suspended sensor=SCCB_SLEEP");
     } else {
         /*
          * Never prevent the rest of the Deep-sleep teardown merely because one

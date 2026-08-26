@@ -73,9 +73,9 @@
  *   - the CPU is not reduced to 90 MHz while the CSI/ISP pipeline is active.
  *
  * A face detected during either ECO-SCAN stage requests 360 MHz and restores
- * the normal detection interval. At 15 seconds the existing coordinated
- * Light-sleep path stops the camera before suspending the display. At 30
- * seconds the system enters Deep-sleep.
+ * the normal detection interval. With both saved Power Modes enabled, the
+ * coordinated Light-sleep path starts at 15 seconds and Deep-sleep follows
+ * 10 seconds later unless touch/GPIO3 restores Active mode.
  */
 #define APP_CPU_MAX_FREQ_MHZ                        360
 #define APP_CPU_ACTIVE_FREQ_MHZ                     180
@@ -83,14 +83,17 @@
 #define APP_CPU_IDLE_90_AFTER_MS                    10000U
 
 /*
- * Flash-selectable inactivity sleep policy.
+ * Runtime inactivity sleep policy.
  *
- * The normal legacy policy remains available when the flashing helper is
- * called without -d/-l:
+ * Light Sleep and Deep Sleep are selected independently from Settings and
+ * persisted in NVS. The generated APP_SLEEP_POLICY value is retained only so
+ * the existing flashing helper and build layout stay compatible; app_sleep.c
+ * does not use it to select behavior.
  *
- *   HYBRID     : Light-sleep at 15 s, then Deep-sleep at 30 s.
- *   LIGHT_ONLY : Light-sleep only after 7 s; never auto-enters Deep-sleep.
- *   DEEP_ONLY  : Direct Active -> Deep-sleep after 7 s; Light-sleep is skipped.
+ *   Light ON  + Deep ON : Light at 15 s, Deep 10 s later.
+ *   Light ON  + Deep OFF: Light only at 7 s.
+ *   Light OFF + Deep ON : Deep only at 7 s.
+ *   Light OFF + Deep OFF: automatic sleep disabled.
  *
  * The 7-second single-mode timeout is deliberately shared by -l and -d so
  * Joulescope traces compare the two transitions from the same inactivity point.
@@ -113,6 +116,7 @@
 /* Light-sleep configuration */
 #define APP_LIGHT_SLEEP_WAKE_GPIO                   GPIO_NUM_3
 #define APP_LIGHT_SLEEP_TIMEOUT_MS                  15000U
+#define APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS        10000U
 #define APP_LIGHT_SLEEP_TOUCH_POLL_MS               1000U
 #define APP_LIGHT_SLEEP_BUTTON_POLL_MS              5U
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
@@ -129,7 +133,8 @@
  * expose a verified GT911 INT/RESET wake pin; touchscreen wake is implemented
  * by the existing 250 ms RTC/I2C polling path.
  *
- * The ESP32-C6 is already held disabled from boot.
+ * The ESP32-C6 follows the persistent Wi-Fi setting during Active mode. The
+ * ordered Deep-sleep path still forces CHIP_PU LOW at the sleep boundary.
  */
 #define APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP            1
 #define APP_LIGHT_SLEEP_POWER_DOWN_SDCARD            1
@@ -176,13 +181,17 @@
  */
 #define APP_LIGHT_SLEEP_EARLY_RETURN_TOLERANCE_US   5000LL
 
-/* Deep-sleep configuration */
+/* Deep-sleep configuration. The 30000 ms value is legacy compatibility only. */
 #define APP_DEEP_SLEEP_TIMEOUT_MS                   30000U
 #define APP_DEEP_SLEEP_INACTIVITY_POLL_MS           100U
 #define APP_DEEP_SLEEP_BUTTON_GPIO                  GPIO_NUM_3
 #define APP_DEEP_SLEEP_BUTTON_POLL_MS               5U
 #define APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS           25U
 #define APP_DEEP_SLEEP_BUTTON_PRIORITY              8
+
+#if APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS == 0
+#error "APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS must be greater than zero"
+#endif
 
 /*
  * =====================================================================

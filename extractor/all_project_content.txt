@@ -1,5 +1,5 @@
 COMPLETE ESP32-P4 + ESP32-C6 PROJECT EXPORT
-Generated on: Mon Aug 24 10:22:28 PM CEST 2026
+Generated on: Wed Aug 26 10:02:18 PM CEST 2026
 Project: /home/admin/Programming/Bachelor_Thesis_ESP
 
 ==================================================
@@ -29,12 +29,12 @@ Excluded:
 FILE COUNTS
 ==================================================
 
-P4 main application : 61
+P4 main application : 68
 C6 firmware         : 5
 P4-C6 direct flasher: 8
 Utilities           : 6
 Other config files  : 12
-Total               : 92
+Total               : 99
 
 ==================================================
 DEEP-SLEEP ARCHITECTURE
@@ -119,6 +119,7 @@ src/main/include/platform/camera/video_capture.h
 src/main/include/power_save/component_audio.h
 src/main/include/power_save/component_display.h
 src/main/include/power_save/component_ethernet.h
+src/main/include/power_save/component_runtime_policy.h
 src/main/include/power_save/component_sdcard.h
 src/main/include/power_save/component_wifi.h
 src/main/include/power_save/cpu_power.h
@@ -127,8 +128,10 @@ src/main/include/services/vision/backends/face_recognizer_backend.h
 src/main/include/services/vision/backends/tflm_model_runner.hpp
 src/main/include/services/vision/face_detector.h
 src/main/include/services/vision/face_recognizer.h
+src/main/include/settings/app_settings.h
 src/main/platform/camera/camera_runtime.c
 src/main/platform/camera/video_capture.c
+src/main/platform/camera/video_capture.c.v21_rollback_20260824_222934
 src/main/platform/display/display_platform.c
 src/main/platform/storage/sd_card_storage.c
 src/main/platform/storage/spiffs_storage.c
@@ -137,6 +140,7 @@ src/main/power/app_sleep.h
 src/main/power/component_audio.c
 src/main/power/component_display.c
 src/main/power/component_ethernet.c
+src/main/power/component_runtime_policy.c
 src/main/power/component_sdcard.c
 src/main/power/component_wifi.c
 src/main/power/cpu_power.c
@@ -155,10 +159,13 @@ src/main/services/vision/face_recognition/face_recognizer_espdl.cpp
 src/main/services/vision/face_recognition/face_recognizer_tflm_fp32.cpp
 src/main/services/vision/face_recognition/face_recognizer_tflm_int8.cpp
 src/main/services/vision/tflm/tflm_model_runner.cpp
+src/main/settings/app_settings.c
 src/main/ui/app_ui.c
 src/main/ui/app_ui.h
 src/main/ui/pin_screen.c
 src/main/ui/pin_screen.h
+src/main/ui/settings_screen.c
+src/main/ui/settings_screen.h
 src/sdkconfig.defaults
 utilities/esp_AI_flashing.sh
 utilities/esp_C6_sleep_flashing.sh
@@ -7431,7 +7438,8 @@ void app_boot_initialize_services(void)
     ESP_ERROR_CHECK(mount_spiffs());
 
     /* SD CARD TEST */
-    esp_err_t sd_ret = bsp_sdcard_mount();
+    /* Settings may already have mounted the card to refresh authorized users. */
+    esp_err_t sd_ret = bsp_sdcard != NULL ? ESP_OK : bsp_sdcard_mount();
     if (sd_ret == ESP_OK) {
         ESP_LOGI(TAG, "SD card mounted at /sdcard");
 
@@ -7476,6 +7484,7 @@ void app_boot_initialize_services(void)
 }
 
 
+
 ==================================================
 FILE: src/main/app/app_main.c
 ==================================================
@@ -7503,6 +7512,7 @@ FILE: src/main/app/app_main.c
 #include "diagnostics/ai_pipeline_status.h"
 #include "app/app_boot.h"
 #include "app_ui.h"
+#include "settings_screen.h"
 #include "pin_screen.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -7520,7 +7530,8 @@ FILE: src/main/app/app_main.c
 #include "config/app_features.h"
 #include "config/log_config.h"
 #include "app_sleep.h"
-#include "power_save/component_wifi.h"
+#include "power_save/component_runtime_policy.h"
+#include "settings/app_settings.h"
 
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 
@@ -9492,6 +9503,17 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
     ai_worker_resume_accepting();
 
     xSemaphoreGive(display_mode_mutex);
+
+    /* Light-sleep restores generic peripherals; reassert saved OFF policies. */
+    ret = app_settings_apply_power_policy();
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not reapply saved power policy after Light-sleep: %s",
+            esp_err_to_name(ret));
+        return ret;
+    }
+
     ESP_LOGI(TAG, "Camera and display restored after Light-sleep");
     return ESP_OK;
 }
@@ -9501,6 +9523,28 @@ static void camera_application_start_task(void *arg)
     (void)arg;
 
     esp_err_t ret;
+
+    /* Re-apply saved component states immediately before Active camera mode. */
+    ret = app_settings_apply_power_policy();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Saved power policy could not be applied: %s",
+                 esp_err_to_name(ret));
+        app_ui_show_error(
+            "Power setting could not be applied. Check the serial log and restart.");
+        application_start_requested = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const app_settings_snapshot_t settings = app_settings_get();
+    if (!settings.camera_enabled) {
+        ESP_LOGW(TAG, "Camera start blocked by the saved Camera OFF policy");
+        app_ui_show_error("Camera is disabled. Enable it in Settings first.");
+        application_start_requested = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
     app_ui_set_status("Initializing display accelerator...");
 
     ppa_client_config_t ppa_srm_config = {
@@ -9518,10 +9562,45 @@ static void camera_application_start_task(void *arg)
     app_ui_set_status("Initializing face detection and recognition...");
 
     /*
+     * Models, enrollment images and the recognition database are loaded from
+     * microSD during service initialization. If the saved policy is OFF, grant
+     * only this bounded startup access and remove SD1_VDD again before Active
+     * camera capture begins.
+     */
+    const bool restore_sdcard_off_after_ai_init = !settings.sdcard_enabled;
+    if (restore_sdcard_off_after_ai_init) {
+        ret = component_runtime_set_sdcard_enabled(true);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Temporary microSD startup access failed: %s",
+                     esp_err_to_name(ret));
+            app_ui_show_error(
+                "microSD could not be powered for AI initialization.");
+            application_start_requested = false;
+            vTaskDelete(NULL);
+            return;
+        }
+        ESP_LOGI(TAG, "microSD temporarily enabled for AI/model initialization");
+    }
+
+    /*
      * Keep the existing service initialization unchanged, but defer it until
      * the user presses Start so the launcher GUI appears immediately at boot.
      */
     app_boot_initialize_services();
+
+    if (restore_sdcard_off_after_ai_init) {
+        ret = component_runtime_set_sdcard_enabled(false);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Could not restore saved microSD OFF state: %s",
+                     esp_err_to_name(ret));
+            app_ui_show_error(
+                "AI loaded, but microSD could not be powered down safely.");
+            application_start_requested = false;
+            vTaskDelete(NULL);
+            return;
+        }
+        ESP_LOGI(TAG, "microSD returned to saved OFF state before Active camera mode");
+    }
 
 #if APP_DIAGNOSTICS_AI_PIPELINE_ENABLED
     diagnostics_start_ai_pipeline_monitor();
@@ -9747,16 +9826,85 @@ static void launcher_start_requested(void *user_data)
     }
 }
 
+static void launcher_settings_requested(void *user_data);
+static void settings_back_requested(void *user_data);
+
+static void show_settings_task(void *arg)
+{
+    (void)arg;
+
+    /* The launcher event has returned, so it is safe to take the LVGL mutex. */
+    app_ui_destroy();
+    settings_screen_create(settings_back_requested, NULL);
+    vTaskDelete(NULL);
+}
+
+static void show_launcher_task(void *arg)
+{
+    (void)arg;
+
+    /* Reload the launcher using the currently saved light/dark theme. */
+    settings_screen_destroy();
+    app_ui_create(
+        launcher_start_requested,
+        launcher_settings_requested,
+        NULL);
+    vTaskDelete(NULL);
+}
+
+static void launcher_settings_requested(void *user_data)
+{
+    (void)user_data;
+
+    BaseType_t created = xTaskCreatePinnedToCore(
+        show_settings_task,
+        "show_settings",
+        6144,
+        NULL,
+        5,
+        NULL,
+        APP_SYSTEM_WORKER_CORE);
+
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create Settings navigation task");
+    }
+}
+
+static void settings_back_requested(void *user_data)
+{
+    (void)user_data;
+
+    BaseType_t created = xTaskCreatePinnedToCore(
+        show_launcher_task,
+        "show_launcher",
+        4096,
+        NULL,
+        5,
+        NULL,
+        APP_SYSTEM_WORKER_CORE);
+
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create launcher navigation task");
+    }
+}
+
 
 void app_main(void)
 {
     app_logging_init();
-    /* ESP32-C6 is unused: keep CHIP_PU LOW permanently. */
-    esp_err_t c6_ret = component_wifi_disable_for_deep_sleep();
-    if (c6_ret != ESP_OK) {
+
+    esp_err_t settings_ret = app_settings_init();
+    if (settings_ret != ESP_OK) {
         ESP_LOGE(TAG,
-                 "Failed to disable ESP32-C6: %s",
-                 esp_err_to_name(c6_ret));
+                 "Persistent settings unavailable; in-memory defaults are active: %s",
+                 esp_err_to_name(settings_ret));
+    }
+
+    esp_err_t power_policy_ret = app_settings_apply_power_policy();
+    if (power_policy_ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "Initial power policy application failed: %s",
+                 esp_err_to_name(power_policy_ret));
     }
 
     ESP_LOGI(TAG,
@@ -9798,6 +9946,15 @@ void app_main(void)
      */
     vTaskDelay(pdMS_TO_TICKS(150));
 
+    /* The display startup creates the shared BSP I2C bus used by ES8311. */
+    esp_err_t post_display_policy_ret = app_settings_apply_power_policy();
+    if (post_display_policy_ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Post-display power policy application failed: %s",
+            esp_err_to_name(post_display_policy_ret));
+    }
+
     display_disable_lvgl_overlays();
 
     /*
@@ -9813,7 +9970,10 @@ void app_main(void)
         ESP_LOGE(TAG, "BSP did not return an LVGL touchscreen input device");
     }
 
-    app_ui_create(launcher_start_requested, NULL);
+    app_ui_create(
+        launcher_start_requested,
+        launcher_settings_requested,
+        NULL);
 
     if (!launcher_touch_indev) {
         app_ui_show_error(
@@ -10106,7 +10266,11 @@ idf_component_register(
 
         # User interface
         "ui/app_ui.c"
+        "ui/settings_screen.c"
         "ui/pin_screen.c"
+
+        # Persistent application settings
+        "settings/app_settings.c"
 
         # Camera platform
         "platform/camera/video_capture.c"
@@ -10135,6 +10299,7 @@ idf_component_register(
         "power/cpu_power.c"
         "power/component_wifi.c"
         "power/component_ethernet.c"
+        "power/component_runtime_policy.c"
         "power/component_sdcard.c"
         "power/component_audio.c"
         "power/component_display.c"
@@ -10148,6 +10313,10 @@ idf_component_register(
         "include"
         "ui"
         "power"
+
+    PRIV_REQUIRES
+        nvs_flash
+        spiffs
 )
 
 
@@ -10277,6 +10446,7 @@ void app_logging_init(void)
     ENABLE_INFO("component_ethernet");
     ENABLE_INFO("component_sdcard");
     ENABLE_INFO("component_wifi");
+    ENABLE_INFO("app_settings");
     ENABLE_INFO("POWER_PROFILE");
     /*
      * Pre-Deep-sleep rail audit. Without this line the whole audit table is
@@ -10319,11 +10489,13 @@ void app_logging_init(void)
 
 #if APP_LOG_ENABLE_UI
     ENABLE_INFO("app_ui");
+    ENABLE_INFO("settings_screen");
     ENABLE_INFO("pin_screen");
 #endif
 }
 
 #undef ENABLE_INFO
+
 
 
 ==================================================
@@ -10625,9 +10797,9 @@ FILE: src/main/include/config/app_config.h
  *   - the CPU is not reduced to 90 MHz while the CSI/ISP pipeline is active.
  *
  * A face detected during either ECO-SCAN stage requests 360 MHz and restores
- * the normal detection interval. At 15 seconds the existing coordinated
- * Light-sleep path stops the camera before suspending the display. At 30
- * seconds the system enters Deep-sleep.
+ * the normal detection interval. With both saved Power Modes enabled, the
+ * coordinated Light-sleep path starts at 15 seconds and Deep-sleep follows
+ * 10 seconds later unless touch/GPIO3 restores Active mode.
  */
 #define APP_CPU_MAX_FREQ_MHZ                        360
 #define APP_CPU_ACTIVE_FREQ_MHZ                     180
@@ -10635,14 +10807,17 @@ FILE: src/main/include/config/app_config.h
 #define APP_CPU_IDLE_90_AFTER_MS                    10000U
 
 /*
- * Flash-selectable inactivity sleep policy.
+ * Runtime inactivity sleep policy.
  *
- * The normal legacy policy remains available when the flashing helper is
- * called without -d/-l:
+ * Light Sleep and Deep Sleep are selected independently from Settings and
+ * persisted in NVS. The generated APP_SLEEP_POLICY value is retained only so
+ * the existing flashing helper and build layout stay compatible; app_sleep.c
+ * does not use it to select behavior.
  *
- *   HYBRID     : Light-sleep at 15 s, then Deep-sleep at 30 s.
- *   LIGHT_ONLY : Light-sleep only after 7 s; never auto-enters Deep-sleep.
- *   DEEP_ONLY  : Direct Active -> Deep-sleep after 7 s; Light-sleep is skipped.
+ *   Light ON  + Deep ON : Light at 15 s, Deep 10 s later.
+ *   Light ON  + Deep OFF: Light only at 7 s.
+ *   Light OFF + Deep ON : Deep only at 7 s.
+ *   Light OFF + Deep OFF: automatic sleep disabled.
  *
  * The 7-second single-mode timeout is deliberately shared by -l and -d so
  * Joulescope traces compare the two transitions from the same inactivity point.
@@ -10665,6 +10840,7 @@ FILE: src/main/include/config/app_config.h
 /* Light-sleep configuration */
 #define APP_LIGHT_SLEEP_WAKE_GPIO                   GPIO_NUM_3
 #define APP_LIGHT_SLEEP_TIMEOUT_MS                  15000U
+#define APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS        10000U
 #define APP_LIGHT_SLEEP_TOUCH_POLL_MS               1000U
 #define APP_LIGHT_SLEEP_BUTTON_POLL_MS              5U
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
@@ -10681,7 +10857,8 @@ FILE: src/main/include/config/app_config.h
  * expose a verified GT911 INT/RESET wake pin; touchscreen wake is implemented
  * by the existing 250 ms RTC/I2C polling path.
  *
- * The ESP32-C6 is already held disabled from boot.
+ * The ESP32-C6 follows the persistent Wi-Fi setting during Active mode. The
+ * ordered Deep-sleep path still forces CHIP_PU LOW at the sleep boundary.
  */
 #define APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP            1
 #define APP_LIGHT_SLEEP_POWER_DOWN_SDCARD            1
@@ -10728,13 +10905,17 @@ FILE: src/main/include/config/app_config.h
  */
 #define APP_LIGHT_SLEEP_EARLY_RETURN_TOLERANCE_US   5000LL
 
-/* Deep-sleep configuration */
+/* Deep-sleep configuration. The 30000 ms value is legacy compatibility only. */
 #define APP_DEEP_SLEEP_TIMEOUT_MS                   30000U
 #define APP_DEEP_SLEEP_INACTIVITY_POLL_MS           100U
 #define APP_DEEP_SLEEP_BUTTON_GPIO                  GPIO_NUM_3
 #define APP_DEEP_SLEEP_BUTTON_POLL_MS               5U
 #define APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS           25U
 #define APP_DEEP_SLEEP_BUTTON_PRIORITY              8
+
+#if APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS == 0
+#error "APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS must be greater than zero"
+#endif
 
 /*
  * =====================================================================
@@ -11195,13 +11376,13 @@ FILE: src/main/include/config/sleep_mode_selection.h
 
 /*
  * Generated by utilities/esp_AI_flashing.sh.
- * Selected flash mode: DEEP-ONLY: Active -> Deep after 7 s
+ * Selected flash mode: HYBRID: Light 15 s -> Deep 30 s
  */
 #define APP_SLEEP_POLICY_HYBRID       0
 #define APP_SLEEP_POLICY_LIGHT_ONLY   1
 #define APP_SLEEP_POLICY_DEEP_ONLY    2
 
-#define APP_SLEEP_POLICY APP_SLEEP_POLICY_DEEP_ONLY
+#define APP_SLEEP_POLICY APP_SLEEP_POLICY_HYBRID
 
 
 ==================================================
@@ -11571,11 +11752,20 @@ FILE: src/main/include/power_save/component_ethernet.h
 ==================================================
 #pragma once
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/**
+ * Apply the system-wide Ethernet policy immediately.
+ * Disabled sets IP101GRI BMCR Power Down; enabled restores normal operation.
+ */
+esp_err_t component_ethernet_set_enabled(bool enabled);
+bool component_ethernet_is_enabled(void);
 
 /**
  * Reversible Light-sleep path: preserve the project's previous behavior by
@@ -11606,6 +11796,44 @@ esp_err_t component_ethernet_verify_power_down(void);
  * Restores the pre-sleep BMCR value captured before Power Down.
  */
 esp_err_t component_ethernet_restore_after_failed_sleep(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+
+==================================================
+FILE: src/main/include/power_save/component_runtime_policy.h
+==================================================
+#pragma once
+
+#include <stdbool.h>
+
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/** True after the BSP shared I2C bus is available for ES8311 access. */
+bool component_runtime_audio_policy_ready(void);
+
+/**
+ * Apply the persistent Active-mode audio policy.
+ *
+ * OFF suspends the ES8311 codec and disables the NS4150B amplifier. ON restores
+ * the exact codec register snapshot captured while switching it off.
+ */
+esp_err_t component_runtime_set_audio_enabled(bool enabled);
+
+/**
+ * Apply the persistent Active-mode microSD policy.
+ *
+ * OFF safely unmounts FATFS and removes SD1_VDD. ON restores the GPIO45 rail
+ * and mounts the card at /sdcard.
+ */
+esp_err_t component_runtime_set_sdcard_enabled(bool enabled);
 
 #ifdef __cplusplus
 }
@@ -11648,7 +11876,20 @@ FILE: src/main/include/power_save/component_wifi.h
 ==================================================
 #pragma once
 
+#include <stdbool.h>
+
 #include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Apply the system-wide Wi-Fi policy immediately.
+ * Enabled releases ESP32-C6 CHIP_PU; disabled holds CHIP_PU LOW.
+ */
+esp_err_t component_wifi_set_enabled(bool enabled);
+bool component_wifi_is_enabled(void);
 
 /**
  * Disable the external ESP32-C6 Wi-Fi coprocessor by driving CHIP_PU LOW and
@@ -11656,7 +11897,7 @@ FILE: src/main/include/power_save/component_wifi.h
  *
  * Unlike the older implementation, every call re-applies the GPIO54
  * configuration instead of returning early just because the C6 was disabled
- * earlier at boot. This matters at the final Deep-sleep boundary.
+ * by the saved policy. This matters at the final Deep-sleep boundary.
  *
  * Waveshare ESP32-P4-NANO:
  * ESP32-P4 GPIO54 -> ESP32-C6 CHIP_PU
@@ -11674,10 +11915,14 @@ esp_err_t component_wifi_disable_for_deep_sleep(void);
 esp_err_t component_wifi_force_off_at_sleep_boundary(void);
 
 /**
- * Deep-sleep failure hook. In this build the ESP32-C6 intentionally remains
- * disabled, so this function does not release CHIP_PU or re-enable the C6.
+ * Deep-sleep failure hook. Restores the saved system-wide Wi-Fi policy:
+ * CHIP_PU HIGH when Wi-Fi is enabled, or LOW when it is disabled.
  */
 esp_err_t component_wifi_restore_after_failed_sleep(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 
 ==================================================
@@ -11982,6 +12227,74 @@ const char *face_recognition_backend_name(void);
 
 
 ==================================================
+FILE: src/main/include/settings/app_settings.h
+==================================================
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define APP_SETTINGS_MAX_AUTHORIZED_USERS 24
+#define APP_SETTINGS_MAX_USER_NAME_LENGTH 64
+
+typedef struct {
+    bool dark_mode;
+    bool ethernet_enabled;
+    bool wifi_enabled;
+    bool camera_enabled;
+    bool audio_enabled;
+    bool sdcard_enabled;
+    bool light_sleep_enabled;
+    bool deep_sleep_enabled;
+} app_settings_snapshot_t;
+
+typedef struct {
+    size_t count;
+    char names[APP_SETTINGS_MAX_AUTHORIZED_USERS]
+              [APP_SETTINGS_MAX_USER_NAME_LENGTH];
+} app_settings_authorized_users_t;
+
+/**
+ * Initialize persistent settings and load the saved values from NVS.
+ * Defaults for a fresh device are light mode with every component enabled.
+ */
+esp_err_t app_settings_init(void);
+
+/** Return a copy of the current in-memory settings. */
+app_settings_snapshot_t app_settings_get(void);
+
+/** Save and immediately apply the requested setting. */
+esp_err_t app_settings_set_dark_mode(bool enabled);
+esp_err_t app_settings_set_ethernet_enabled(bool enabled);
+esp_err_t app_settings_set_wifi_enabled(bool enabled);
+esp_err_t app_settings_set_camera_enabled(bool enabled);
+esp_err_t app_settings_set_audio_enabled(bool enabled);
+esp_err_t app_settings_set_sdcard_enabled(bool enabled);
+esp_err_t app_settings_set_light_sleep_enabled(bool enabled);
+esp_err_t app_settings_set_deep_sleep_enabled(bool enabled);
+
+/** Apply all saved component policies that are ready at the current boot stage. */
+esp_err_t app_settings_apply_power_policy(void);
+
+/**
+ * Mount the microSD card when needed and rescan /sdcard/enroll.
+ * Every call performs a fresh directory scan.
+ */
+esp_err_t app_settings_load_authorized_users(
+    app_settings_authorized_users_t *users_out);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+==================================================
 FILE: src/main/platform/camera/camera_runtime.c
 ==================================================
 [Empty file]
@@ -11989,6 +12302,1773 @@ FILE: src/main/platform/camera/camera_runtime.c
 
 ==================================================
 FILE: src/main/platform/camera/video_capture.c
+==================================================
+/*
+ * SPDX-FileCopyrightText: 2024 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: CC0-1.0
+ */
+#include <stdbool.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/param.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_video_init.h"
+#include "driver/i2c_master.h"
+
+#include "linux/videodev2.h"
+#include "platform/camera/video_capture.h"
+
+static const char *TAG = "app_video";
+
+/*
+ * Keep Deep-sleep camera-power messages under POWER_PROFILE so they remain
+ * visible when APP_LOG_ENABLE_CAMERA == 0 but power/sleep logging is enabled.
+ */
+static const char *CAMERA_POWER_TAG = "POWER_PROFILE";
+
+/*
+ * OV5647 SCCB address.
+ *
+ * The datasheet lists the 8-bit SCCB slave ID as 0x6C. ESP-IDF's new I2C
+ * master driver expects the raw 7-bit address without the R/W bit:
+ *
+ *     0x6C >> 1 = 0x36
+ */
+#define OV5647_I2C_ADDRESS                  0x36
+#define OV5647_I2C_TIMEOUT_MS               100
+
+/*
+ * The Waveshare BSP owns the physical I2C controller. app_video_main() stores
+ * only the bus handle so the destructive Deep-sleep path can issue the final
+ * OV5647 register writes after STREAMOFF and before the shared I2C pads are
+ * isolated. The bus itself is never deleted here because the display/touch
+ * shutdown still needs it later in the system shutdown sequence.
+ */
+static i2c_master_bus_handle_t s_camera_i2c_bus = NULL;
+
+
+typedef struct {
+    bool active;
+    uint8_t mipi_sc_ctrl;   /* 0x3018 */
+    uint8_t mipi_ctrl00;    /* 0x4800 */
+    uint8_t mipi_ctrl05;    /* 0x4805 */
+} ov5647_light_sleep_state_t;
+
+static ov5647_light_sleep_state_t s_ov5647_light_sleep_state = {0};
+
+
+#define MAX_BUFFER_COUNT                  3
+#define MIN_BUFFER_COUNT                  2
+#define VIDEO_TASK_STACK_SIZE             (4 * 1024)
+#define VIDEO_TASK_PRIORITY               4
+#define VIDEO_STOP_TIMEOUT_MS             1500
+#define VIDEO_NO_FRAME_RETRY_DELAY_MS     2
+#define VIDEO_ERROR_RETRY_DELAY_MS        10
+
+/*
+ * =====================================================================
+ * OV5647 software-only Deep-sleep quiesce
+ * =====================================================================
+ *
+ * The ESP32-P4-NANO board does not expose a software-controlled OV5647 PWDN
+ * or RESET signal to this application:
+ *
+ *     .reset_pin = -1
+ *     .pwdn_pin  = -1
+ *
+ * Therefore we cannot enter the sensor's true hardware standby or physically
+ * remove its supply from software.
+ *
+ * We can, however, place substantially more of the sensor into a quiet state
+ * before ESP32-P4 Deep-sleep:
+ *
+ *     1. normal VIDIOC_STREAMOFF
+ *     2. disable MIPI data lanes
+ *     3. gate/place MIPI clock lane into low-power mode
+ *     4. power down MIPI HS TX and LP RX
+ *     5. disable the physical MIPI output pad (0x3016 bit3)
+ *     6. request reduced MIPI PHY bias current (0x3017 bit3)
+ *     7. ensure the documented sensor sleep gate is enabled (0x3105 bit4)
+ *     8. confirm SCCB software sleep (0x0100 bit0 = 0)
+ *
+ * These writes are deliberately performed only from app_video_shutdown().
+ * Light-sleep continues to use the normal reversible STREAMOFF/STREAMON path
+ * and is therefore unaffected by this extra Deep-sleep quiesce.
+ */
+
+/* OV5647 register addresses. */
+#define OV5647_REG_MODE_SELECT             0x0100
+#define OV5647_REG_MIPI_PHY                0x3016
+#define OV5647_REG_MIPI_PHY_BIAS           0x3017
+#define OV5647_REG_MIPI_SC_CTRL            0x3018
+#define OV5647_REG_PADCLK_DIV              0x3105
+#define OV5647_REG_MIPI_CTRL00             0x4800
+#define OV5647_REG_MIPI_CTRL05             0x4805
+
+/*
+ * 0x3018 SC_CMMN_MIPI_SC_CTRL
+ *
+ * bit 4 = power down MIPI high-speed transmitter
+ * bit 3 = power down MIPI low-power receiver
+ * bit 2 = MIPI enable              <-- preserve existing value
+ * bit 1 = MIPI system suspend
+ */
+#define OV5647_MIPI_PHY_HS_TX_POWER_DOWN   (1U << 4)
+#define OV5647_MIPI_LP_RX_POWER_DOWN       (1U << 3)
+#define OV5647_MIPI_SYSTEM_SUSPEND          (1U << 1)
+
+/*
+ * V21 conservative OV5647 additions, all from documented register fields.
+ *
+ * 0x3016 bit3: mipi_pad_enable (clear = disable MIPI output pad)
+ * 0x3017 bit3: ihalf           (set   = bias current reduction)
+ * 0x3105 bit4: Sleep enable    (set   = enable sensor sleep gating)
+ *
+ * Deliberately NOT touched:
+ *   - 0x3013 internal-regulator/debug controls (datasheet says changing them
+ *     is not recommended),
+ *   - PLL reset/debug/power-up-disable fields with no documented power-down
+ *     sequence.
+ */
+#define OV5647_MIPI_PAD_ENABLE              (1U << 3)
+#define OV5647_MIPI_BIAS_CURRENT_REDUCTION  (1U << 3)
+#define OV5647_PADCLK_SLEEP_ENABLE          (1U << 4)
+
+/*
+ * 0x4800 MIPI CTRL 00
+ *
+ * bit 5 = clock lane gating
+ * bit 0 = manually place clock lane into low-power mode
+ */
+#define OV5647_MIPI_CLOCK_LANE_GATE         (1U << 5)
+#define OV5647_MIPI_CLOCK_LANE_LOW_POWER    (1U << 0)
+
+/*
+ * 0x4805 MIPI CTRL 05
+ *
+ * bit 7 = disable MIPI data lane 1
+ * bit 6 = disable MIPI data lane 2
+ */
+#define OV5647_MIPI_DATA_LANE1_DISABLE      (1U << 7)
+#define OV5647_MIPI_DATA_LANE2_DISABLE      (1U << 6)
+
+/* 0x0100 bit 0: 1 = streaming, 0 = SCCB software sleep. */
+#define OV5647_MODE_STREAMING_BIT           (1U << 0)
+
+typedef struct {
+    uint8_t *camera_buffer[MAX_BUFFER_COUNT];
+    size_t camera_buf_size;
+    uint8_t camera_buf_count;
+    uint32_t camera_buf_hes;
+    uint32_t camera_buf_ves;
+
+    struct v4l2_buffer v4l2_buf;
+    uint8_t camera_mem_mode;
+
+    app_video_frame_operation_cb_t user_camera_video_frame_operation_cb;
+
+    TaskHandle_t video_stream_task_handle;
+    uint8_t video_task_core_id;
+    volatile bool video_task_delete;
+    volatile bool video_task_paused;
+    volatile bool video_stop_nudge_complete;
+    volatile bool video_streaming;
+    SemaphoreHandle_t video_stopped_sem;
+
+    void *video_task_user_data;
+    int video_fd;
+} app_video_t;
+
+static app_video_t app_camera_video = {
+    .video_fd = -1,
+};
+
+static void clear_binary_semaphore(SemaphoreHandle_t semaphore)
+{
+    if (semaphore == NULL) {
+        return;
+    }
+
+    while (xSemaphoreTake(semaphore, 0) == pdTRUE) {
+        /* Remove a signal left from an earlier stop operation. */
+    }
+}
+
+static void reset_camera_runtime_state(void)
+{
+    s_ov5647_light_sleep_state.active = false;
+    app_camera_video.video_fd = -1;
+    app_camera_video.video_streaming = false;
+    app_camera_video.video_task_delete = false;
+    app_camera_video.video_task_paused = false;
+    app_camera_video.video_stop_nudge_complete = false;
+    app_camera_video.video_stream_task_handle = NULL;
+    app_camera_video.camera_buf_count = 0;
+    app_camera_video.camera_buf_size = 0;
+    app_camera_video.camera_buf_hes = 0;
+    app_camera_video.camera_buf_ves = 0;
+    app_camera_video.video_task_user_data = NULL;
+
+    for (int i = 0; i < MAX_BUFFER_COUNT; i++) {
+        /*
+         * Camera buffers are allocated and owned by app_main.
+         * The driver association is removed here; this module does not free
+         * application-owned PSRAM.
+         */
+        app_camera_video.camera_buffer[i] = NULL;
+    }
+}
+
+/*
+ * Read one OV5647 register directly through the shared SCCB/I2C bus.
+ *
+ * OV5647 registers use a 16-bit register address and an 8-bit value. The
+ * transmit-receive API keeps the write phase and read phase in one transaction
+ * with a repeated START, which is the normal SCCB register-read sequence.
+ */
+static esp_err_t ov5647_read_register(
+    i2c_master_dev_handle_t device,
+    uint16_t reg_addr,
+    uint8_t *value)
+{
+    if (device == NULL || value == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const uint8_t register_address[2] = {
+        (uint8_t)(reg_addr >> 8),
+        (uint8_t)(reg_addr & 0xFFU),
+    };
+
+    esp_err_t ret = i2c_master_transmit_receive(
+        device,
+        register_address,
+        sizeof(register_address),
+        value,
+        1,
+        OV5647_I2C_TIMEOUT_MS);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: OV5647 read reg 0x%04X failed: %s",
+            (unsigned)reg_addr,
+            esp_err_to_name(ret));
+    }
+
+    return ret;
+}
+
+/*
+ * Write one 8-bit OV5647 register directly through SCCB/I2C.
+ */
+static esp_err_t ov5647_write_register(
+    i2c_master_dev_handle_t device,
+    uint16_t reg_addr,
+    uint8_t value)
+{
+    if (device == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const uint8_t payload[3] = {
+        (uint8_t)(reg_addr >> 8),
+        (uint8_t)(reg_addr & 0xFFU),
+        value,
+    };
+
+    esp_err_t ret = i2c_master_transmit(
+        device,
+        payload,
+        sizeof(payload),
+        OV5647_I2C_TIMEOUT_MS);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: OV5647 write reg 0x%04X=0x%02X failed: %s",
+            (unsigned)reg_addr,
+            (unsigned)value,
+            esp_err_to_name(ret));
+    }
+
+    return ret;
+}
+
+/*
+ * Perform a safe read-modify-write.
+ *
+ * set_mask:
+ *     every 1 bit is forced HIGH.
+ *
+ * clear_mask:
+ *     every 1 bit is forced LOW.
+ *
+ * All unrelated bits are preserved. The register is read back afterwards and
+ * the controlled bits are verified.
+ */
+static esp_err_t ov5647_update_register_bits(
+    i2c_master_dev_handle_t device,
+    uint16_t reg_addr,
+    uint8_t set_mask,
+    uint8_t clear_mask,
+    const char *description)
+{
+    uint8_t before = 0;
+
+    esp_err_t ret = ov5647_read_register(
+        device,
+        reg_addr,
+        &before);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    const uint8_t requested =
+        (uint8_t)((before | set_mask) &
+                  (uint8_t)(~clear_mask));
+
+    if (requested != before) {
+        ret = ov5647_write_register(
+            device,
+            reg_addr,
+            requested);
+
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+
+    uint8_t read_back = 0;
+
+    ret = ov5647_read_register(
+        device,
+        reg_addr,
+        &read_back);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    const uint8_t controlled_mask =
+        (uint8_t)(set_mask | clear_mask);
+
+    if ((read_back & controlled_mask) !=
+        (requested & controlled_mask)) {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: %s verification failed: "
+            "reg=0x%04X before=0x%02X requested=0x%02X readback=0x%02X",
+            description,
+            (unsigned)reg_addr,
+            (unsigned)before,
+            (unsigned)requested,
+            (unsigned)read_back);
+
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(
+        CAMERA_POWER_TAG,
+        "CAMERA-Q: %-24s reg=0x%04X 0x%02X -> 0x%02X "
+        "readback=0x%02X",
+        description,
+        (unsigned)reg_addr,
+        (unsigned)before,
+        (unsigned)requested,
+        (unsigned)read_back);
+
+    return ESP_OK;
+}
+
+/*
+ * Put the OV5647 into the lowest software-controlled state available with the
+ * present ESP32-P4-NANO/Raspberry-Pi-Camera-B wiring.
+ *
+ * IMPORTANT:
+ * This is NOT the same as physically removing power from the camera. The board
+ * does not expose a camera supply switch, PWDN pin or RESET pin to this module.
+ * These SCCB writes quiesce the streaming/MIPI parts that software can control.
+ *
+ * Light-sleep is deliberately unaffected. This function is called only by the
+ * destructive Deep-sleep shutdown after normal V4L2 STREAMOFF has completed.
+ */
+static esp_err_t ov5647_quiesce_for_deep_sleep(void)
+{
+    if (s_camera_i2c_bus == NULL) {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: shared camera I2C bus is unavailable");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(
+        CAMERA_POWER_TAG,
+        "CAMERA-Q-V21: applying OV5647 deeper documented Deep-sleep quiesce");
+
+    /*
+     * STREAMOFF has already stopped capture, so no sensor-control transaction
+     * should be in flight from the video task. Confirm that the OV5647 still
+     * ACKs at its normal 7-bit SCCB address before creating the temporary
+     * handle used only for this shutdown sequence.
+     */
+    esp_err_t ret = i2c_master_probe(
+        s_camera_i2c_bus,
+        OV5647_I2C_ADDRESS,
+        OV5647_I2C_TIMEOUT_MS);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: OV5647 did not answer at I2C address 0x%02X: %s",
+            OV5647_I2C_ADDRESS,
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    i2c_device_config_t device_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = OV5647_I2C_ADDRESS,
+        .scl_speed_hz = CONFIG_BSP_I2C_CLK_SPEED_HZ,
+    };
+
+    i2c_master_dev_handle_t device = NULL;
+
+    ret = i2c_master_bus_add_device(
+        s_camera_i2c_bus,
+        &device_config,
+        &device);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: could not attach temporary OV5647 I2C handle: %s",
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    esp_err_t first_error = ESP_OK;
+
+    /*
+     * Step A: disable both MIPI data lanes.
+     *
+     * 0x4805:
+     *   bit7 = MIPI lane1 disable
+     *   bit6 = MIPI lane2 disable
+     *
+     * A disabled data lane is driven into LP00 according to the OV5647
+     * register description. All unrelated bits are preserved.
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_MIPI_CTRL05,
+        OV5647_MIPI_DATA_LANE1_DISABLE |
+            OV5647_MIPI_DATA_LANE2_DISABLE,
+        0,
+        "MIPI data lanes OFF");
+
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+
+    /*
+     * Step B: gate the MIPI clock lane and manually request low-power mode.
+     *
+     * 0x4800:
+     *   bit5 = clock lane gate enable
+     *   bit0 = clock lane disable / manually set low-power mode
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_MIPI_CTRL00,
+        OV5647_MIPI_CLOCK_LANE_GATE |
+            OV5647_MIPI_CLOCK_LANE_LOW_POWER,
+        0,
+        "MIPI clock lane LP");
+
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+
+    /*
+     * Step C: power down MIPI PHY blocks and request MIPI-system suspend.
+     *
+     * 0x3018:
+     *   bit4 = power down MIPI HS TX
+     *   bit3 = power down MIPI LP RX
+     *   bit2 = MIPI enable -- PRESERVED
+     *   bit1 = MIPI system suspend
+     *
+     * Read-modify-write is essential because lane-mode and MIPI-enable fields
+     * share the same register.
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_MIPI_SC_CTRL,
+        OV5647_MIPI_PHY_HS_TX_POWER_DOWN |
+            OV5647_MIPI_LP_RX_POWER_DOWN |
+            OV5647_MIPI_SYSTEM_SUSPEND,
+        0,
+        "MIPI PHY/suspend");
+
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+
+    /*
+     * Step D: disable the physical MIPI pad driver.
+     *
+     * 0x3016 bit3 is documented as mipi_pad_enable. The MIPI transmitter and
+     * receiver are already powered down above, so removing the pad-enable bit
+     * is the next safe shutdown boundary before system Deep-sleep.
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_MIPI_PHY,
+        0,
+        OV5647_MIPI_PAD_ENABLE,
+        "MIPI output pad OFF");
+
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+
+    /*
+     * Step E: request the OV5647's documented MIPI PHY bias-current reduction.
+     * 0x3017 bit3 is IHALF / Bias current reduction. No undocumented bias
+     * tuning fields are changed.
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_MIPI_PHY_BIAS,
+        OV5647_MIPI_BIAS_CURRENT_REDUCTION,
+        0,
+        "MIPI bias current REDUCED");
+
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+
+    /*
+     * Step F: ensure the documented sensor sleep gate is enabled.
+     *
+     * 0x3105 bit4 is named Sleep enable in the OV5647 register table. On many
+     * configurations this bit is already 1; the read-modify-write therefore
+     * becomes a verified no-op when the sensor driver already configured it.
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_PADCLK_DIV,
+        OV5647_PADCLK_SLEEP_ENABLE,
+        0,
+        "sensor sleep gate ENABLED");
+
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+
+    /*
+     * Step G: explicitly confirm sensor SCCB software sleep.
+     *
+     * 0x0100 bit0:
+     *   1 = streaming
+     *   0 = software sleep / stream stopped
+     *
+     * The stock OV5647 STREAMOFF path already clears this bit. Doing it again
+     * makes the final Deep-sleep sensor state explicit and verifiable.
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_MODE_SELECT,
+        0,
+        OV5647_MODE_STREAMING_BIT,
+        "OV5647 software sleep");
+
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+
+    /*
+     * Remove only our temporary OV5647 device handle. The physical I2C bus is
+     * BSP-owned and must remain alive for the following display/touch shutdown.
+     */
+    ret = i2c_master_bus_rm_device(device);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: could not remove temporary OV5647 I2C handle: %s",
+            esp_err_to_name(ret));
+
+        if (first_error == ESP_OK) {
+            first_error = ret;
+        }
+    }
+
+    if (first_error == ESP_OK) {
+        ESP_LOGI(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q-V21: OV5647 deeper software quiesce COMPLETE: "
+            "stream=OFF data_lanes=OFF clock_lane=LP "
+            "MIPI_PHY=POWER_DOWN pad=OFF bias=REDUCED "
+            "sleep_gate=ENABLED MIPI=suspended sensor=SCCB_SLEEP");
+    } else {
+        /*
+         * Never prevent the rest of the Deep-sleep teardown merely because one
+         * optional sensor register could not be written. app_video_shutdown()
+         * still closes the V4L2 device and app_sleep.c continues shutting down
+         * the display, SD card, C6, Ethernet PHY, and remaining peripherals.
+         */
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: OV5647 software quiesce completed with errors: %s",
+            esp_err_to_name(first_error));
+    }
+
+    return first_error;
+}
+
+
+static esp_err_t ov5647_attach_power_device(
+    i2c_master_dev_handle_t *device)
+{
+    if (device == NULL || s_camera_i2c_bus == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    *device = NULL;
+
+    esp_err_t ret = i2c_master_probe(
+        s_camera_i2c_bus,
+        OV5647_I2C_ADDRESS,
+        OV5647_I2C_TIMEOUT_MS);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-LS: OV5647 probe failed: %s",
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    i2c_device_config_t config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = OV5647_I2C_ADDRESS,
+        .scl_speed_hz = CONFIG_BSP_I2C_CLK_SPEED_HZ,
+    };
+
+    return i2c_master_bus_add_device(
+        s_camera_i2c_bus,
+        &config,
+        device);
+}
+
+
+esp_err_t app_video_prepare_sensor_for_light_sleep(void)
+{
+    if (s_ov5647_light_sleep_state.active) {
+        return ESP_OK;
+    }
+
+    i2c_master_dev_handle_t device = NULL;
+    esp_err_t ret = ov5647_attach_power_device(&device);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ov5647_light_sleep_state_t saved = {0};
+
+    /*
+     * STREAMOFF has already executed before this function is called.
+     * Save every additional register that the normal ESP-Video
+     * STREAMON path does not restore.
+     */
+    ret = ov5647_read_register(
+        device,
+        OV5647_REG_MIPI_SC_CTRL,
+        &saved.mipi_sc_ctrl);
+
+    if (ret != ESP_OK) {
+        goto cleanup;
+    }
+
+    ret = ov5647_read_register(
+        device,
+        OV5647_REG_MIPI_CTRL00,
+        &saved.mipi_ctrl00);
+
+    if (ret != ESP_OK) {
+        goto cleanup;
+    }
+
+    ret = ov5647_read_register(
+        device,
+        OV5647_REG_MIPI_CTRL05,
+        &saved.mipi_ctrl05);
+
+    if (ret != ESP_OK) {
+        goto cleanup;
+    }
+
+    ESP_LOGI(
+        CAMERA_POWER_TAG,
+        "CAMERA-LS: saved OV5647 registers: "
+        "3018=0x%02X 4800=0x%02X 4805=0x%02X",
+        saved.mipi_sc_ctrl,
+        saved.mipi_ctrl00,
+        saved.mipi_ctrl05);
+
+    /*
+     * Disable the two MIPI data lanes.
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_MIPI_CTRL05,
+        OV5647_MIPI_DATA_LANE1_DISABLE |
+            OV5647_MIPI_DATA_LANE2_DISABLE,
+        0,
+        "LS MIPI data lanes OFF");
+
+    if (ret != ESP_OK) {
+        goto rollback;
+    }
+
+    /*
+     * Gate the clock lane and place it in low-power mode.
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_MIPI_CTRL00,
+        OV5647_MIPI_CLOCK_LANE_GATE |
+            OV5647_MIPI_CLOCK_LANE_LOW_POWER,
+        0,
+        "LS MIPI clock lane LP");
+
+    if (ret != ESP_OK) {
+        goto rollback;
+    }
+
+    /*
+     * Power down the MIPI transmitter/receiver and suspend
+     * the sensor-side MIPI subsystem.
+     */
+    ret = ov5647_update_register_bits(
+        device,
+        OV5647_REG_MIPI_SC_CTRL,
+        OV5647_MIPI_PHY_HS_TX_POWER_DOWN |
+            OV5647_MIPI_LP_RX_POWER_DOWN |
+            OV5647_MIPI_SYSTEM_SUSPEND,
+        0,
+        "LS MIPI PHY suspend");
+
+    if (ret != ESP_OK) {
+        goto rollback;
+    }
+
+    saved.active = true;
+    s_ov5647_light_sleep_state = saved;
+
+    ESP_LOGI(
+        CAMERA_POWER_TAG,
+        "CAMERA-LS: OV5647 reversible Light-sleep standby ACTIVE");
+
+    goto cleanup;
+
+rollback:
+    /*
+     * A partial transition is unsafe for a later STREAMON.
+     * Restore the exact pre-Light-sleep values before reporting failure.
+     */
+    ESP_LOGW(
+        CAMERA_POWER_TAG,
+        "CAMERA-LS: standby failed; restoring OV5647 registers");
+
+    (void)ov5647_write_register(
+        device,
+        OV5647_REG_MIPI_SC_CTRL,
+        saved.mipi_sc_ctrl);
+
+    (void)ov5647_write_register(
+        device,
+        OV5647_REG_MIPI_CTRL05,
+        saved.mipi_ctrl05);
+
+    (void)ov5647_write_register(
+        device,
+        OV5647_REG_MIPI_CTRL00,
+        saved.mipi_ctrl00);
+
+cleanup:
+    {
+        esp_err_t remove_ret = i2c_master_bus_rm_device(device);
+
+        if (remove_ret != ESP_OK && ret == ESP_OK) {
+            ret = remove_ret;
+        }
+    }
+
+    return ret;
+}
+
+
+esp_err_t app_video_restore_sensor_after_light_sleep(void)
+{
+    if (!s_ov5647_light_sleep_state.active) {
+        return ESP_OK;
+    }
+
+    i2c_master_dev_handle_t device = NULL;
+    esp_err_t ret = ov5647_attach_power_device(&device);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /*
+     * Restore sensor-side MIPI power first, then data lanes,
+     * then the original MIPI clock/control state.
+     *
+     * 0x0100 remains in STREAMOFF here. The normal
+     * video_stream_start() call will subsequently perform STREAMON.
+     */
+    ret = ov5647_write_register(
+        device,
+        OV5647_REG_MIPI_SC_CTRL,
+        s_ov5647_light_sleep_state.mipi_sc_ctrl);
+
+    if (ret == ESP_OK) {
+        ret = ov5647_write_register(
+            device,
+            OV5647_REG_MIPI_CTRL05,
+            s_ov5647_light_sleep_state.mipi_ctrl05);
+    }
+
+    if (ret == ESP_OK) {
+        ret = ov5647_write_register(
+            device,
+            OV5647_REG_MIPI_CTRL00,
+            s_ov5647_light_sleep_state.mipi_ctrl00);
+    }
+
+    esp_err_t remove_ret = i2c_master_bus_rm_device(device);
+
+    if (ret == ESP_OK && remove_ret != ESP_OK) {
+        ret = remove_ret;
+    }
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(
+            CAMERA_POWER_TAG,
+            "CAMERA-LS: OV5647 MIPI state restored before STREAMON");
+
+        s_ov5647_light_sleep_state.active = false;
+    }
+
+    return ret;
+}
+
+
+esp_err_t app_video_main(i2c_master_bus_handle_t i2c_bus_handle)
+{
+    if (i2c_bus_handle == NULL) {
+        ESP_LOGE(TAG, "Camera initialization requires a valid I2C bus");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+     * Keep a non-owning reference to the BSP bus. ESP-Video receives exactly
+     * the same handle for normal SCCB sensor control.
+     */
+    s_camera_i2c_bus = i2c_bus_handle;
+
+    esp_video_init_csi_config_t csi_config[] = {
+        {
+            .sccb_config = {
+                .init_sccb = false,
+                .i2c_handle = i2c_bus_handle,
+                .freq = CONFIG_BSP_I2C_CLK_SPEED_HZ,
+            },
+            /*
+             * The present board/BSP does not expose camera RESET or PWDN
+             * control through this module, so software cannot physically
+             * power-gate the OV5647.
+             */
+            .reset_pin = -1,
+            .pwdn_pin = -1,
+        },
+    };
+
+    esp_video_init_config_t cam_config = {
+        .csi = csi_config,
+    };
+
+    esp_err_t ret = esp_video_init(&cam_config);
+
+    if (ret != ESP_OK) {
+        /*
+         * Do not keep a bus reference for a camera stack that never
+         * initialized successfully.
+         */
+        s_camera_i2c_bus = NULL;
+    }
+
+    return ret;
+}
+
+int app_video_open(char *dev, video_fmt_t init_fmt)
+{
+    if (dev == NULL) {
+        ESP_LOGE(TAG, "Video device path is NULL");
+        return -1;
+    }
+
+    struct v4l2_format default_format;
+    struct v4l2_capability capability;
+    const int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+    struct v4l2_ext_controls controls;
+    struct v4l2_ext_control control[1];
+
+    /*
+     * Use non-blocking capture so the stream task periodically regains
+     * execution and can observe video_task_delete. This prevents shutdown
+     * from depending on VIDIOC_STREAMOFF waking a blocking VIDIOC_DQBUF.
+     */
+    int fd = open(dev, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+        ESP_LOGE(TAG, "Open video failed, errno=%d", errno);
+        return -1;
+    }
+
+    memset(&capability, 0, sizeof(capability));
+    if (ioctl(fd, VIDIOC_QUERYCAP, &capability) != 0) {
+        ESP_LOGE(TAG, "Failed to get video capability, errno=%d", errno);
+        goto exit_error;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "version: %d.%d.%d",
+        (uint16_t)(capability.version >> 16),
+        (uint8_t)(capability.version >> 8),
+        (uint8_t)capability.version);
+    ESP_LOGI(TAG, "driver:  %s", capability.driver);
+    ESP_LOGI(TAG, "card:    %s", capability.card);
+    ESP_LOGI(TAG, "bus:     %s", capability.bus_info);
+
+    memset(&default_format, 0, sizeof(default_format));
+    default_format.type = type;
+
+    if (ioctl(fd, VIDIOC_G_FMT, &default_format) != 0) {
+        ESP_LOGE(TAG, "Failed to get video format, errno=%d", errno);
+        goto exit_error;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "width=%" PRIu32 " height=%" PRIu32,
+        default_format.fmt.pix.width,
+        default_format.fmt.pix.height);
+
+    app_camera_video.camera_buf_hes = default_format.fmt.pix.width;
+    app_camera_video.camera_buf_ves = default_format.fmt.pix.height;
+
+    if (default_format.fmt.pix.pixelformat != init_fmt) {
+        struct v4l2_format format = {
+            .type = type,
+            .fmt.pix.width = default_format.fmt.pix.width,
+            .fmt.pix.height = default_format.fmt.pix.height,
+            .fmt.pix.pixelformat = init_fmt,
+        };
+
+        if (ioctl(fd, VIDIOC_S_FMT, &format) != 0) {
+            ESP_LOGE(TAG, "Failed to set video format, errno=%d", errno);
+            goto exit_error;
+        }
+    }
+
+    memset(&controls, 0, sizeof(controls));
+    memset(control, 0, sizeof(control));
+
+    controls.ctrl_class = V4L2_CTRL_CLASS_USER;
+    controls.count = 1;
+    controls.controls = control;
+
+    control[0].id = V4L2_CID_VFLIP;
+    control[0].value = 0;
+
+    if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) != 0) {
+        ESP_LOGW(TAG, "Failed to configure vertical flip; continuing");
+    }
+
+    control[0].id = V4L2_CID_HFLIP;
+    control[0].value = 0;
+
+    if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) != 0) {
+        ESP_LOGW(TAG, "Failed to configure horizontal flip; continuing");
+    }
+
+    app_camera_video.video_fd = fd;
+    return fd;
+
+exit_error:
+    close(fd);
+    return -1;
+}
+
+esp_err_t app_video_set_bufs(
+    int video_fd,
+    uint32_t fb_num,
+    const void **fb)
+{
+    if (video_fd < 0) {
+        ESP_LOGE(TAG, "Invalid video file descriptor");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (fb_num > MAX_BUFFER_COUNT) {
+        ESP_LOGE(TAG, "Buffer count is too large");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (fb_num < MIN_BUFFER_COUNT) {
+        ESP_LOGE(TAG, "At least two camera buffers are required");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    struct v4l2_requestbuffers req;
+    const int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+    memset(&req, 0, sizeof(req));
+    req.count = fb_num;
+    req.type = type;
+    req.memory = fb ? V4L2_MEMORY_USERPTR : V4L2_MEMORY_MMAP;
+
+    app_camera_video.camera_buf_count = fb_num;
+    app_camera_video.camera_mem_mode = req.memory;
+
+    if (ioctl(video_fd, VIDIOC_REQBUFS, &req) != 0) {
+        ESP_LOGE(TAG, "Requesting video buffers failed, errno=%d", errno);
+        return ESP_FAIL;
+    }
+
+    for (uint32_t i = 0; i < fb_num; i++) {
+        struct v4l2_buffer buf;
+
+        memset(&buf, 0, sizeof(buf));
+        buf.type = type;
+        buf.memory = req.memory;
+        buf.index = i;
+
+        if (ioctl(video_fd, VIDIOC_QUERYBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "Querying camera buffer %" PRIu32 " failed", i);
+            return ESP_FAIL;
+        }
+
+        if (req.memory == V4L2_MEMORY_MMAP) {
+            void *mapped = mmap(
+                NULL,
+                buf.length,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED,
+                video_fd,
+                buf.m.offset);
+
+            /*
+             * ESP-IDF's mmap compatibility layer does not define MAP_FAILED
+             * for every target/configuration. Accept both common failure
+             * representations without depending on that macro.
+             */
+            if (mapped == NULL || mapped == (void *)(intptr_t)-1) {
+                ESP_LOGE(TAG, "Mapping camera buffer %" PRIu32 " failed", i);
+                return ESP_FAIL;
+            }
+
+            app_camera_video.camera_buffer[i] = mapped;
+        } else {
+            if (fb[i] == NULL) {
+                ESP_LOGE(TAG, "Camera buffer %" PRIu32 " is NULL", i);
+                return ESP_ERR_INVALID_ARG;
+            }
+
+            buf.m.userptr = (unsigned long)fb[i];
+            app_camera_video.camera_buffer[i] = (uint8_t *)fb[i];
+        }
+
+        app_camera_video.camera_buf_size = buf.length;
+
+        if (ioctl(video_fd, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "Queueing camera buffer %" PRIu32 " failed", i);
+            return ESP_FAIL;
+        }
+    }
+
+    for (uint32_t i = fb_num; i < MAX_BUFFER_COUNT; i++) {
+        app_camera_video.camera_buffer[i] = NULL;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t app_video_get_bufs(int fb_num, void **fb)
+{
+    if (fb == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (fb_num > MAX_BUFFER_COUNT || fb_num < MIN_BUFFER_COUNT) {
+        ESP_LOGE(TAG, "Invalid camera buffer count: %d", fb_num);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (int i = 0; i < fb_num; i++) {
+        if (app_camera_video.camera_buffer[i] == NULL) {
+            ESP_LOGE(TAG, "Camera buffer %d is NULL", i);
+            return ESP_FAIL;
+        }
+
+        fb[i] = app_camera_video.camera_buffer[i];
+    }
+
+    return ESP_OK;
+}
+
+uint32_t app_video_get_buf_size(void)
+{
+    const uint32_t bytes_per_pixel =
+        APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? 2U : 3U;
+
+    return app_camera_video.camera_buf_hes *
+           app_camera_video.camera_buf_ves *
+           bytes_per_pixel;
+}
+
+static esp_err_t video_receive_video_frame(int video_fd)
+{
+    memset(
+        &app_camera_video.v4l2_buf,
+        0,
+        sizeof(app_camera_video.v4l2_buf));
+
+    app_camera_video.v4l2_buf.type =
+        V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    app_camera_video.v4l2_buf.memory =
+        app_camera_video.camera_mem_mode;
+
+    if (ioctl(
+            video_fd,
+            VIDIOC_DQBUF,
+            &app_camera_video.v4l2_buf) != 0) {
+        const int dq_errno = errno;
+
+        /*
+         * A controller task requests a persistent camera pause by setting
+         * video_task_delete BEFORE issuing VIDIOC_STREAMOFF. If the capture
+         * task is inside/non-blockingly entering VIDIOC_DQBUF at exactly that
+         * moment, ESP-Video can return EPERM/EIO from DQBUF because STREAMOFF
+         * has already invalidated the capture queue.
+         *
+         * That is an expected stop race, not a camera failure. Return the same
+         * transient state used by the task loop so it observes
+         * video_task_delete and enters the controlled paused state without
+         * printing a false error.
+         */
+        if (app_camera_video.video_task_delete) {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        /*
+         * O_NONBLOCK makes EAGAIN/EWOULDBLOCK the normal "no completed frame
+         * yet" condition. It is not a camera failure.
+         */
+        if (dq_errno == EAGAIN || dq_errno == EWOULDBLOCK) {
+            return ESP_ERR_NOT_FOUND;
+        }
+
+        /*
+         * A signal/interruption is transient. Let the task retry unless a
+         * shutdown request is already pending.
+         */
+        if (dq_errno == EINTR) {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        ESP_LOGE(TAG, "VIDIOC_DQBUF failed, errno=%d", dq_errno);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static void video_operation_video_frame(void)
+{
+    uint32_t buffer_index = app_camera_video.v4l2_buf.index;
+
+    if (buffer_index >= app_camera_video.camera_buf_count ||
+        buffer_index >= MAX_BUFFER_COUNT) {
+        ESP_LOGE(
+            TAG,
+            "Driver returned invalid camera buffer index %" PRIu32,
+            buffer_index);
+        return;
+    }
+
+    uint8_t *buffer =
+        app_camera_video.camera_buffer[buffer_index];
+
+    if (buffer == NULL) {
+        ESP_LOGE(
+            TAG,
+            "Camera buffer %" PRIu32 " is NULL",
+            buffer_index);
+        return;
+    }
+
+    app_camera_video.v4l2_buf.m.userptr =
+        (unsigned long)buffer;
+    app_camera_video.v4l2_buf.length =
+        app_camera_video.camera_buf_size;
+
+    if (app_camera_video.user_camera_video_frame_operation_cb != NULL) {
+        app_camera_video.user_camera_video_frame_operation_cb(
+            buffer,
+            (uint8_t)buffer_index,
+            app_camera_video.camera_buf_hes,
+            app_camera_video.camera_buf_ves,
+            app_camera_video.camera_buf_size,
+            app_camera_video.video_task_user_data);
+    }
+}
+
+static esp_err_t video_free_video_frame(int video_fd)
+{
+    if (ioctl(
+            video_fd,
+            VIDIOC_QBUF,
+            &app_camera_video.v4l2_buf) != 0) {
+        ESP_LOGE(TAG, "VIDIOC_QBUF failed, errno=%d", errno);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t video_stream_start(int video_fd)
+{
+    ESP_LOGI(TAG, "Video Stream Start");
+
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+    if (ioctl(video_fd, VIDIOC_STREAMON, &type) != 0) {
+        ESP_LOGE(
+            TAG,
+            "Failed to start video stream, errno=%d",
+            errno);
+        return ESP_FAIL;
+    }
+
+    struct v4l2_format format;
+    memset(&format, 0, sizeof(format));
+    format.type = type;
+
+    if (ioctl(video_fd, VIDIOC_G_FMT, &format) != 0) {
+        ESP_LOGE(TAG, "Failed to read format after stream start");
+        (void)ioctl(video_fd, VIDIOC_STREAMOFF, &type);
+        return ESP_FAIL;
+    }
+
+    app_camera_video.video_streaming = true;
+    return ESP_OK;
+}
+
+static esp_err_t video_stream_stop(int video_fd)
+{
+    if (!app_camera_video.video_streaming) {
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Video Stream Stop");
+
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+    if (ioctl(video_fd, VIDIOC_STREAMOFF, &type) != 0) {
+        ESP_LOGE(
+            TAG,
+            "Failed to stop video stream, errno=%d",
+            errno);
+        return ESP_FAIL;
+    }
+
+    app_camera_video.video_streaming = false;
+    return ESP_OK;
+}
+
+static void video_stream_task(void *arg)
+{
+    int video_fd = *((int *)arg);
+
+    ESP_LOGI(
+        TAG,
+        "[CORE-PROOF] Video task running: actual_cpu=%d task=%s",
+        xPortGetCoreID(),
+        pcTaskGetName(NULL));
+
+    for (;;) {
+        while (!app_camera_video.video_task_delete) {
+            esp_err_t ret =
+                video_receive_video_frame(video_fd);
+
+            if (ret == ESP_ERR_NOT_FOUND) {
+                /*
+                 * No frame is ready yet. Yield briefly and then check the
+                 * shutdown flag again.
+                 */
+                vTaskDelay(
+                    pdMS_TO_TICKS(
+                        VIDEO_NO_FRAME_RETRY_DELAY_MS));
+                continue;
+            }
+
+            if (ret == ESP_ERR_INVALID_STATE) {
+                if (app_camera_video.video_task_delete) {
+                    break;
+                }
+
+                taskYIELD();
+                continue;
+            }
+
+            if (ret != ESP_OK) {
+                if (app_camera_video.video_task_delete) {
+                    break;
+                }
+
+                vTaskDelay(
+                    pdMS_TO_TICKS(
+                        VIDEO_ERROR_RETRY_DELAY_MS));
+                continue;
+            }
+
+            /*
+             * Once shutdown is requested, do not process or requeue another
+             * completed frame.
+             */
+            if (app_camera_video.video_task_delete) {
+                break;
+            }
+
+            video_operation_video_frame();
+
+            if (app_camera_video.video_task_delete) {
+                break;
+            }
+
+            ret = video_free_video_frame(video_fd);
+            if (ret != ESP_OK) {
+                if (!app_camera_video.video_task_delete) {
+                    ESP_LOGE(
+                        TAG,
+                        "Failed to return video frame to the driver");
+                }
+                break;
+            }
+        }
+
+        const bool requested_stop = app_camera_video.video_task_delete;
+
+        /*
+         * During a requested stop, app_video_stream_task_stop() already
+         * executes VIDIOC_STREAMOFF. If capture failed independently, this
+         * task remains responsible for stopping the device.
+         */
+        if (!requested_stop) {
+            esp_err_t stop_ret = video_stream_stop(video_fd);
+
+            if (stop_ret != ESP_OK) {
+                ESP_LOGW(TAG, "Video stream did not stop cleanly");
+            }
+        }
+
+        /*
+         * The controller must finish its wake/abort calls before this task
+         * suspends itself; otherwise a late vTaskResume() could accidentally
+         * undo the intentional Light-sleep pause.
+         */
+        while (requested_stop &&
+               !app_camera_video.video_stop_nudge_complete) {
+            taskYIELD();
+        }
+
+        app_camera_video.video_task_delete = false;
+        app_camera_video.video_task_paused = true;
+
+        if (app_camera_video.video_stopped_sem != NULL) {
+            xSemaphoreGive(app_camera_video.video_stopped_sem);
+        }
+
+        ESP_LOGI(TAG, "VIDEO-STOP-V6: video task paused");
+        vTaskSuspend(NULL);
+
+        app_camera_video.video_task_paused = false;
+        ESP_LOGI(TAG, "VIDEO-STOP-V6: video task resumed");
+    }
+}
+
+static void wake_video_task_for_stop(TaskHandle_t video_task)
+{
+    if (video_task == NULL) {
+        return;
+    }
+
+#if (INCLUDE_xTaskAbortDelay == 1)
+    if (xTaskAbortDelay(video_task) == pdPASS) {
+        ESP_LOGI(TAG, "VIDEO-STOP-V6: aborted blocked capture wait");
+    }
+#endif
+
+    /*
+     * Some ESP-Video 0.8 capture paths can report the task as Suspended after
+     * a restart. vTaskResume() is harmless for a Ready/Running/Blocked task and
+     * releases a genuinely suspended capture wait.
+     */
+    vTaskResume(video_task);
+}
+
+esp_err_t app_video_stream_task_start(
+    int video_fd,
+    int core_id,
+    void *user_data)
+{
+    if (video_fd < 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (app_camera_video.video_stream_task_handle != NULL) {
+        ESP_LOGW(
+            TAG,
+            "Video stream task is already running");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (app_camera_video.video_stopped_sem == NULL) {
+        app_camera_video.video_stopped_sem =
+            xSemaphoreCreateBinary();
+
+        if (app_camera_video.video_stopped_sem == NULL) {
+            ESP_LOGE(
+                TAG,
+                "Failed to create video-stop semaphore");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    clear_binary_semaphore(
+        app_camera_video.video_stopped_sem);
+
+    app_camera_video.video_task_delete = false;
+    app_camera_video.video_task_paused = false;
+    app_camera_video.video_stop_nudge_complete = false;
+    app_camera_video.video_task_core_id = core_id;
+    app_camera_video.video_task_user_data = user_data;
+    app_camera_video.video_fd = video_fd;
+
+    esp_err_t ret = video_stream_start(video_fd);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "[CORE-PROOF] Creating video stream task: requested_core=%d",
+        core_id);
+
+    BaseType_t result = xTaskCreatePinnedToCore(
+        video_stream_task,
+        "video stream task",
+        VIDEO_TASK_STACK_SIZE,
+        &app_camera_video.video_fd,
+        VIDEO_TASK_PRIORITY,
+        &app_camera_video.video_stream_task_handle,
+        core_id);
+
+    if (result != pdPASS) {
+        ESP_LOGE(
+            TAG,
+            "Failed to create video stream task");
+
+        app_camera_video.video_stream_task_handle = NULL;
+        (void)video_stream_stop(video_fd);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t app_video_stream_task_restart(int video_fd)
+{
+    if (video_fd < 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (app_camera_video.video_stream_task_handle == NULL ||
+        !app_camera_video.video_task_paused) {
+        ESP_LOGE(
+            TAG,
+            "Cannot resume because video stream task is not paused");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t ret = app_video_set_bufs(
+        video_fd,
+        app_camera_video.camera_buf_count,
+        (const void **)app_camera_video.camera_buffer);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to restore camera buffers");
+        return ret;
+    }
+
+    app_camera_video.video_task_delete = false;
+    app_camera_video.video_stop_nudge_complete = false;
+
+    ret = video_stream_start(video_fd);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Failed to restart video stream");
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "VIDEO-STOP-V6: resuming persistent video task");
+    app_camera_video.video_task_paused = false;
+    vTaskResume(app_camera_video.video_stream_task_handle);
+
+    return ESP_OK;
+}
+
+esp_err_t app_video_stream_task_stop(int video_fd)
+{
+    if (video_fd < 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (app_camera_video.video_stream_task_handle == NULL) {
+        return ESP_OK;
+    }
+
+    if (app_camera_video.video_task_paused) {
+        return ESP_OK;
+    }
+
+    if (xTaskGetCurrentTaskHandle() ==
+        app_camera_video.video_stream_task_handle) {
+        ESP_LOGE(
+            TAG,
+            "Video task cannot synchronously stop itself");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (app_camera_video.video_stopped_sem == NULL) {
+        ESP_LOGE(
+            TAG,
+            "Video-stop semaphore is unavailable");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    clear_binary_semaphore(
+        app_camera_video.video_stopped_sem);
+
+    /*
+     * Set this before STREAMOFF. With non-blocking DQBUF, the task observes
+     * the flag within a few milliseconds even if STREAMOFF does not wake the
+     * driver immediately.
+     */
+    app_camera_video.video_stop_nudge_complete = false;
+    app_camera_video.video_task_delete = true;
+
+    esp_err_t streamoff_ret =
+        video_stream_stop(video_fd);
+
+    if (streamoff_ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "STREAMOFF failed while requesting task shutdown");
+    }
+
+    /*
+     * STREAMOFF does not consistently release the capture task after a second
+     * Light-sleep cycle with ESP-Video 0.8. Wake either kind of RTOS wait, then
+     * allow the task to enter its controlled persistent pause.
+     */
+    wake_video_task_for_stop(app_camera_video.video_stream_task_handle);
+    app_camera_video.video_stop_nudge_complete = true;
+
+    if (xSemaphoreTake(
+            app_camera_video.video_stopped_sem,
+            pdMS_TO_TICKS(VIDEO_STOP_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGE(
+            TAG,
+            "VIDEO-STOP-V6: timed out while pausing video stream task");
+
+        /*
+         * Keep video_task_delete asserted. app_video_shutdown() will close
+         * the file descriptor before deleting the remaining task.
+         */
+        return ESP_ERR_TIMEOUT;
+    }
+
+    return streamoff_ret;
+}
+
+esp_err_t app_video_shutdown(void)
+{
+    int video_fd = app_camera_video.video_fd;
+
+    if (video_fd < 0) {
+        ESP_LOGI(TAG, "Camera is already closed");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Shutting down camera before deep sleep");
+
+    /*
+     * First stop CSI capture normally.
+     *
+     * For OV5647, ESP-Video's STREAMOFF path calls the sensor driver's
+     * ov5647_set_stream(false), which stops normal sensor streaming before we
+     * start changing MIPI power-state registers.
+     */
+    esp_err_t stop_ret =
+        app_video_stream_task_stop(video_fd);
+
+    if (stop_ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Graceful camera-task stop failed: %s; "
+            "continuing with Deep-sleep quiesce before forced close",
+            esp_err_to_name(stop_ret));
+    }
+
+    /*
+     * Apply the extra OV5647 low-power register sequence over the same
+     * BSP-owned I2C bus that ESP-Video uses for SCCB.
+     *
+     * This is deliberately done after STREAMOFF so the video task no longer
+     * competes for sensor control, and before later Deep-sleep code isolates
+     * the shared I2C pads.
+     *
+     * Light-sleep never calls this path, so its reversible STREAMOFF/STREAMON
+     * behavior remains unchanged.
+     */
+    esp_err_t quiesce_ret =
+        ov5647_quiesce_for_deep_sleep();
+
+    if (quiesce_ret == ESP_OK) {
+        ESP_LOGI(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: sensor register shutdown completed before V4L2 close");
+    } else {
+        ESP_LOGW(
+            CAMERA_POWER_TAG,
+            "CAMERA-Q: sensor register shutdown had errors: %s; "
+            "closing camera anyway",
+            esp_err_to_name(quiesce_ret));
+    }
+
+    /*
+     * Always close the camera file descriptor, even when the normal task-stop
+     * handshake or sensor quiesce fails.
+     *
+     * Remaining awake because an optional shutdown operation failed would
+     * consume far more power than continuing into the normal Deep-sleep
+     * sequence.
+     */
+    esp_err_t close_ret = ESP_OK;
+
+    if (close(video_fd) != 0) {
+        ESP_LOGE(
+            TAG,
+            "Closing camera device failed, errno=%d",
+            errno);
+        close_ret = ESP_FAIL;
+    }
+
+    app_camera_video.video_fd = -1;
+    app_camera_video.video_streaming = false;
+
+    /*
+     * Light-sleep preserves the paused task, but Deep-sleep closes the camera
+     * permanently. Explicitly suspend before deletion so another core cannot
+     * be executing the task while its resources are released.
+     */
+    TaskHandle_t video_task =
+        app_camera_video.video_stream_task_handle;
+
+    app_camera_video.video_stream_task_handle = NULL;
+
+    if (video_task != NULL) {
+        vTaskSuspend(video_task);
+        vTaskDelete(video_task);
+    }
+
+    reset_camera_runtime_state();
+
+    /*
+     * Closing the device is the most fundamental shutdown operation, so report
+     * a close failure first. Otherwise expose a sensor-quiesce failure to the
+     * higher-level Deep-sleep log while still allowing app_sleep.c to continue
+     * shutting down all remaining peripherals.
+     */
+    if (close_ret != ESP_OK) {
+        return close_ret;
+    }
+
+    if (quiesce_ret != ESP_OK) {
+        return quiesce_ret;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Camera stream stopped, OV5647 quiesced, "
+        "and camera device closed");
+
+    return ESP_OK;
+}
+
+esp_err_t app_video_register_frame_operation_cb(
+    app_video_frame_operation_cb_t operation_cb)
+{
+    if (operation_cb == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    app_camera_video.user_camera_video_frame_operation_cb =
+        operation_cb;
+
+    return ESP_OK;
+}
+
+
+==================================================
+FILE: src/main/platform/camera/video_capture.c.v21_rollback_20260824_222934
 ==================================================
 /*
  * SPDX-FileCopyrightText: 2024 Espressif Systems (Shanghai) CO LTD
@@ -13728,22 +15808,18 @@ FILE: src/main/power/app_sleep.c
 #include "power_save/component_sdcard.h"
 #include "power_save/component_wifi.h"
 #include "power_save/cpu_power.h"
-
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_HYBRID && \
-    APP_LIGHT_SLEEP_TIMEOUT_MS >= APP_DEEP_SLEEP_TIMEOUT_MS
-#error "APP_LIGHT_SLEEP_TIMEOUT_MS must be smaller than APP_DEEP_SLEEP_TIMEOUT_MS"
-#endif
+#include "settings/app_settings.h"
 
 #if APP_LIGHT_SLEEP_TOUCH_POLL_MS == 0
 #error "APP_LIGHT_SLEEP_TOUCH_POLL_MS must be greater than zero"
 #endif
 
 /*
- * Defined in config/app_config.h. Set it to 5000 only when deliberately
- * recording per-subsystem current plateaus with a bench supply; the default of
- * 0 is mandatory for normal firmware, because a non-zero value keeps the board
- * fully awake for one extra delay per shutdown stage on every Deep-sleep entry.
- */
+* Defined in config/app_config.h. Set it to 5000 only when deliberately
+* recording per-subsystem current plateaus with a bench supply; the default of
+* 0 is mandatory for normal firmware, because a non-zero value keeps the board
+* fully awake for one extra delay per shutdown stage on every Deep-sleep entry.
+*/
 #ifndef APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS
 #define APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS 0
 #endif
@@ -13762,12 +15838,56 @@ static bool s_light_sleep_in_progress;
 static bool s_ignore_button_until_release;
 static bool s_light_sleep_failed_until_activity;
 static int64_t s_last_face_detected_us;
+static bool s_light_mode_enabled;
+static bool s_deep_mode_enabled;
+static uint32_t s_light_sleep_threshold_ms;
+static uint32_t s_deep_sleep_threshold_ms;
 
 static app_sleep_prepare_callback_t s_prepare_callback;
 static void *s_prepare_user_data;
 static app_sleep_light_transition_callback_t s_light_suspend_callback;
 static app_sleep_light_transition_callback_t s_light_resume_callback;
 static void *s_light_transition_user_data;
+
+static void configure_runtime_power_modes(void)
+{
+    const app_settings_snapshot_t settings = app_settings_get();
+    const bool light_enabled = settings.light_sleep_enabled;
+    const bool deep_enabled = settings.deep_sleep_enabled;
+
+    uint32_t light_threshold_ms = 0;
+    uint32_t deep_threshold_ms = 0;
+
+    if (light_enabled && deep_enabled) {
+        light_threshold_ms = APP_LIGHT_SLEEP_TIMEOUT_MS;
+        deep_threshold_ms =
+            APP_LIGHT_SLEEP_TIMEOUT_MS +
+            APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS;
+    } else if (light_enabled) {
+        light_threshold_ms = APP_SINGLE_SLEEP_TIMEOUT_MS;
+    } else if (deep_enabled) {
+        deep_threshold_ms = APP_SINGLE_SLEEP_TIMEOUT_MS;
+    }
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    s_light_mode_enabled = light_enabled;
+    s_deep_mode_enabled = deep_enabled;
+    s_light_sleep_threshold_ms = light_threshold_ms;
+    s_deep_sleep_threshold_ms = deep_threshold_ms;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    ESP_LOGI(
+        POWER_TAG,
+        "event=POWER_MODES_CONFIGURED light=%s deep=%s light_after_ms=%u "
+        "deep_after_ms=%u light_to_deep_gap_ms=%u",
+        light_enabled ? "ENABLED" : "DISABLED",
+        deep_enabled ? "ENABLED" : "DISABLED",
+        (unsigned)light_threshold_ms,
+        (unsigned)deep_threshold_ms,
+        (unsigned)(light_enabled && deep_enabled
+            ? APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS
+            : 0U));
+}
 
 static void power_profile_stage_delay(void)
 {
@@ -13777,11 +15897,11 @@ static void power_profile_stage_delay(void)
 }
 
 /*
- * External board peripherals are not controlled by the ESP32-P4's internal
- * Light-sleep power-domain state machine. Quiesce the peripherals that are not
- * needed for wake detection. GT911 and the shared I2C bus deliberately remain
- * active because touchscreen wake is implemented by timed I2C polling.
- */
+* External board peripherals are not controlled by the ESP32-P4's internal
+* Light-sleep power-domain state machine. Quiesce the peripherals that are not
+* needed for wake detection. GT911 and the shared I2C bus deliberately remain
+* active because touchscreen wake is implemented by timed I2C polling.
+*/
 static void record_first_light_sleep_error(
     esp_err_t ret,
     esp_err_t *first_error)
@@ -13847,10 +15967,10 @@ static esp_err_t restore_aux_peripherals_after_light_sleep(void)
     esp_err_t first_error = ESP_OK;
 
     /*
-     * Reverse only the reversible Light-sleep operations. Deep-sleep now uses
-     * stronger one-way peripheral states (ES8311 register suspend and IP101GRI
-     * BMCR Power Down) which are intentionally not used in this polling path.
-     */
+    * Reverse only the reversible Light-sleep operations. Deep-sleep now uses
+    * stronger one-way peripheral states (ES8311 register suspend and IP101GRI
+    * BMCR Power Down) which are intentionally not used in this polling path.
+    */
 #if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
     record_first_light_sleep_error(
         component_ethernet_restore_after_light_sleep(),
@@ -13933,28 +16053,17 @@ static bool claim_sleep_request(void)
 
 static bool claim_inactivity_sleep_request(void)
 {
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
-    /*
-     * Light-only firmware must never claim an inactivity Deep-sleep request.
-     * Its 7-second deadline is handled exclusively by claim_light_sleep_window().
-     */
-    return false;
-#else
     const int64_t now_us = esp_timer_get_time();
-
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_DEEP_ONLY
-    const int64_t timeout_us =
-        (int64_t)APP_SINGLE_SLEEP_TIMEOUT_MS * 1000LL;
-#else
-    const int64_t timeout_us =
-        (int64_t)APP_DEEP_SLEEP_TIMEOUT_MS * 1000LL;
-#endif
-
     bool claimed = false;
 
     portENTER_CRITICAL(&s_sleep_request_lock);
 
-    if (s_inactivity_monitor_started &&
+    const int64_t timeout_us =
+        (int64_t)s_deep_sleep_threshold_ms * 1000LL;
+
+    if (s_deep_mode_enabled &&
+        s_deep_sleep_threshold_ms > 0 &&
+        s_inactivity_monitor_started &&
         !s_sleep_requested &&
         !s_light_sleep_in_progress &&
         (now_us - s_last_face_detected_us) >= timeout_us) {
@@ -13964,7 +16073,6 @@ static bool claim_inactivity_sleep_request(void)
 
     portEXIT_CRITICAL(&s_sleep_request_lock);
     return claimed;
-#endif
 }
 
 static void release_sleep_request(void)
@@ -14007,40 +16115,31 @@ void app_sleep_notify_face_detected(void)
 
 bool app_sleep_light_sleep_is_due(void)
 {
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_DEEP_ONLY
-    return false;
-#else
     const int64_t now_us = esp_timer_get_time();
-
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
-    const int64_t light_timeout_us =
-        (int64_t)APP_SINGLE_SLEEP_TIMEOUT_MS * 1000LL;
-#else
-    const int64_t light_timeout_us =
-        (int64_t)APP_LIGHT_SLEEP_TIMEOUT_MS * 1000LL;
-    const int64_t deep_timeout_us =
-        (int64_t)APP_DEEP_SLEEP_TIMEOUT_MS * 1000LL;
-#endif
-
     bool due = false;
 
     portENTER_CRITICAL(&s_sleep_request_lock);
     const int64_t inactive_us = now_us - s_last_face_detected_us;
+    const int64_t light_timeout_us =
+        (int64_t)s_light_sleep_threshold_ms * 1000LL;
+    const int64_t deep_timeout_us =
+        (int64_t)s_deep_sleep_threshold_ms * 1000LL;
 
-    due = s_inactivity_monitor_started &&
-          !s_sleep_requested &&
-          s_light_sleep_in_progress &&
-          !s_light_sleep_failed_until_activity &&
-          inactive_us >= light_timeout_us;
+    due = s_light_mode_enabled &&
+        s_light_sleep_threshold_ms > 0 &&
+        s_inactivity_monitor_started &&
+        !s_sleep_requested &&
+        s_light_sleep_in_progress &&
+        !s_light_sleep_failed_until_activity &&
+        inactive_us >= light_timeout_us;
 
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_HYBRID
-    due = due && inactive_us < deep_timeout_us;
-#endif
+    if (s_deep_mode_enabled && s_deep_sleep_threshold_ms > 0) {
+        due = due && inactive_us < deep_timeout_us;
+    }
 
     portEXIT_CRITICAL(&s_sleep_request_lock);
 
     return due;
-#endif
 }
 
 static void cancel_light_sleep_claim(void)
@@ -14102,16 +16201,16 @@ static void finish_light_sleep(
 
     if (light_ret != ESP_OK) {
         /*
-         * Avoid retrying Light-sleep every 100 ms after a configuration or
-         * hardware failure. Normal activity clears this guard.
-         */
+        * Avoid retrying Light-sleep every 100 ms after a configuration or
+        * hardware failure. Normal activity clears this guard.
+        */
         s_light_sleep_failed_until_activity = true;
     } else if (user_activity) {
         if (wake_cause == ESP_SLEEP_WAKEUP_GPIO) {
             /*
-             * Consume the GPIO3 wake press so the Deep-sleep button task does
-             * not interpret the same electrical LOW as a second request.
-             */
+            * Consume the GPIO3 wake press so the Deep-sleep button task does
+            * not interpret the same electrical LOW as a second request.
+            */
             s_ignore_button_until_release = true;
         }
 
@@ -14131,50 +16230,34 @@ static void finish_light_sleep(
 
 static bool claim_light_sleep_window(uint32_t *remaining_ms)
 {
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_DEEP_ONLY
-    (void)remaining_ms;
-    return false;
-#else
     const int64_t now_us = esp_timer_get_time();
-
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
-    const int64_t light_timeout_us =
-        (int64_t)APP_SINGLE_SLEEP_TIMEOUT_MS * 1000LL;
-#else
-    const int64_t light_timeout_us =
-        (int64_t)APP_LIGHT_SLEEP_TIMEOUT_MS * 1000LL;
-    const int64_t deep_timeout_us =
-        (int64_t)APP_DEEP_SLEEP_TIMEOUT_MS * 1000LL;
-#endif
-
     bool claimed = false;
 
     portENTER_CRITICAL(&s_sleep_request_lock);
 
     const int64_t inactive_us = now_us - s_last_face_detected_us;
+    const int64_t light_timeout_us =
+        (int64_t)s_light_sleep_threshold_ms * 1000LL;
+    const int64_t deep_timeout_us =
+        (int64_t)s_deep_sleep_threshold_ms * 1000LL;
 
     if (remaining_ms != NULL &&
+        s_light_mode_enabled &&
+        s_light_sleep_threshold_ms > 0 &&
         s_inactivity_monitor_started &&
         !s_sleep_requested &&
         !s_light_sleep_in_progress &&
         !s_light_sleep_failed_until_activity &&
-        inactive_us >= light_timeout_us
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_HYBRID
-        && inactive_us < deep_timeout_us
-#endif
-        ) {
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
-        /*
-         * No Deep-sleep deadline exists in -l firmware. A zero value is used
-         * only as a display/logging value; the polling loop explicitly runs
-         * indefinitely until real user activity.
-         */
-        *remaining_ms = 0;
-#else
-        const int64_t remaining_us = deep_timeout_us - inactive_us;
-        *remaining_ms =
-            (uint32_t)((remaining_us + 999LL) / 1000LL);
-#endif
+        inactive_us >= light_timeout_us &&
+        (!s_deep_mode_enabled || inactive_us < deep_timeout_us)) {
+        if (s_deep_mode_enabled && s_deep_sleep_threshold_ms > 0) {
+            const int64_t remaining_us = deep_timeout_us - inactive_us;
+            *remaining_ms =
+                (uint32_t)((remaining_us + 999LL) / 1000LL);
+        } else {
+            /* Light-only mode polls until real touch/GPIO3 activity. */
+            *remaining_ms = 0;
+        }
         s_light_sleep_in_progress = true;
         claimed = true;
     }
@@ -14182,7 +16265,6 @@ static bool claim_light_sleep_window(uint32_t *remaining_ms)
     portEXIT_CRITICAL(&s_sleep_request_lock);
 
     return claimed;
-#endif
 }
 
 static void run_sleep_sequence(const char *reason)
@@ -14223,10 +16305,10 @@ static void run_sleep_sequence(const char *reason)
     power_profile_stage_delay();
 
     /*
-     * V20 STEP 2A: the physical JD9365 must receive DISPLAY_OFF + SLEEP_IN
-     * while the BSP panel/DBI handle still exists. Deleting the MIPI-DSI
-     * objects first would make the DCS Sleep-In command impossible.
-     */
+    * V20 STEP 2A: the physical JD9365 must receive DISPLAY_OFF + SLEEP_IN
+    * while the BSP panel/DBI handle still exists. Deleting the MIPI-DSI
+    * objects first would make the DCS Sleep-In command impossible.
+    */
     ESP_LOGI(
         "POWER_PROFILE",
         "STEP 2A: LCD controller DISPLAY_OFF + FULL SLEEP_IN");
@@ -14266,13 +16348,13 @@ static void run_sleep_sequence(const char *reason)
     power_profile_stage_delay();
 
     /*
-     * STEP 3 runs after the BSP has released its own touch handle and while
-     * the shared I2C bus is still alive. V20 retains V19's GT911
-     * real full-Sleep command instead of Green mode. On the stock board there
-     * is no P4-controlled GT911 INT/RESET wake pin, so this is a deepest-power
-     * measurement policy: after GPIO3 wakes the P4, board power must be cycled
-     * before touch is usable again.
-     */
+    * STEP 3 runs after the BSP has released its own touch handle and while
+    * the shared I2C bus is still alive. V20 retains V19's GT911
+    * real full-Sleep command instead of Green mode. On the stock board there
+    * is no P4-controlled GT911 INT/RESET wake pin, so this is a deepest-power
+    * measurement policy: after GPIO3 wakes the P4, board power must be cycled
+    * before touch is usable again.
+    */
     ESP_LOGI(
         "POWER_PROFILE",
         "STEP 3: GT911 FULL SLEEP + display side-channel cleanup "
@@ -14420,19 +16502,20 @@ static void run_sleep_sequence(const char *reason)
 
 void app_sleep_request(const char *reason)
 {
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
-    ESP_LOGW(
-        POWER_TAG,
-        "event=DEEP_SLEEP_REQUEST_IGNORED policy=LIGHT_ONLY reason=\"%s\"",
-        reason != NULL ? reason : "unknown");
-    return;
-#else
+    const app_settings_snapshot_t settings = app_settings_get();
+    if (!settings.deep_sleep_enabled) {
+        ESP_LOGW(
+            POWER_TAG,
+            "event=DEEP_SLEEP_REQUEST_IGNORED policy=RUNTIME_DISABLED reason=\"%s\"",
+            reason != NULL ? reason : "unknown");
+        return;
+    }
+
     if (!claim_sleep_request()) {
         return;
     }
 
     run_sleep_sequence(reason);
-#endif
 }
 
 static void deep_sleep_button_task(void *arg)
@@ -14443,9 +16526,9 @@ static void deep_sleep_button_task(void *arg)
         .pin_bit_mask = 1ULL << APP_DEEP_SLEEP_BUTTON_GPIO,
         .mode = GPIO_MODE_INPUT,
         /*
-         * GPIO3 is biased by the external pull-up fitted between GPIO3 and
-         * ESP_3V3. Do not enable the internal pull-up in parallel.
-         */
+        * GPIO3 is biased by the external pull-up fitted between GPIO3 and
+        * ESP_3V3. Do not enable the internal pull-up in parallel.
+        */
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
@@ -14469,25 +16552,17 @@ static void deep_sleep_button_task(void *arg)
 
     vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
 
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
     ESP_LOGI(
         TAG,
-        "GPIO%d armed as Light-sleep wake/activity button; "
-        "Deep-sleep requests are disabled by -l",
+        "GPIO%d power-mode button armed; behavior follows saved Deep-sleep toggle",
         APP_DEEP_SLEEP_BUTTON_GPIO);
-#else
-    ESP_LOGI(
-        TAG,
-        "Deep-sleep button armed on GPIO%d",
-        APP_DEEP_SLEEP_BUTTON_GPIO);
-#endif
 
     while (true) {
         /*
-         * GPIO3 is also the Light-sleep wake source. While Light-sleep is
-         * active, or until its wake press is released, the button belongs to
-         * the Light-sleep path and must not request Deep-sleep.
-         */
+        * GPIO3 is also the Light-sleep wake source. While Light-sleep is
+        * active, or until its wake press is released, the button belongs to
+        * the Light-sleep path and must not request Deep-sleep.
+        */
         if (button_event_is_reserved_for_light_sleep()) {
             if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) != 0) {
                 clear_button_release_guard();
@@ -14502,19 +16577,15 @@ static void deep_sleep_button_task(void *arg)
 
             if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0 &&
                 !button_event_is_reserved_for_light_sleep()) {
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
-                /*
-                 * In -l firmware GPIO3 is never allowed to invoke the
-                 * destructive Deep-sleep sequence. Treat an active-mode press
-                 * as normal activity and wait for release.
-                 */
-                ESP_LOGI(
-                    POWER_TAG,
-                    "event=GPIO3_ACTIVITY policy=LIGHT_ONLY action=KEEP_ACTIVE");
-                app_sleep_notify_face_detected();
-#else
-                app_sleep_request("GPIO3 button");
-#endif
+                const app_settings_snapshot_t settings = app_settings_get();
+                if (settings.deep_sleep_enabled) {
+                    app_sleep_request("GPIO3 button");
+                } else {
+                    ESP_LOGI(
+                        POWER_TAG,
+                        "event=GPIO3_ACTIVITY deep_sleep=DISABLED action=KEEP_ACTIVE");
+                    app_sleep_notify_face_detected();
+                }
 
                 while (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
                     vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
@@ -14530,99 +16601,61 @@ static void inactivity_power_policy_task(void *arg)
 {
     (void)arg;
 
-#if APP_SLEEP_POLICY != APP_SLEEP_POLICY_DEEP_ONLY
-    ESP_LOGI(
-        POWER_TAG,
-        "event=LIGHT_SLEEP_TOUCH_FIX version=8 "
-        "mode=DOC_ALIGNED_GT911_POLLING_AUX_POWERDOWN");
-#endif
+    if (s_light_mode_enabled) {
+        ESP_LOGI(
+            POWER_TAG,
+            "event=LIGHT_SLEEP_TOUCH_FIX version=8 "
+            "mode=DOC_ALIGNED_GT911_POLLING_AUX_POWERDOWN");
+    }
 
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_DEEP_ONLY
+    const char *policy_name = s_light_mode_enabled
+        ? (s_deep_mode_enabled ? "LIGHT_THEN_DEEP" : "LIGHT_ONLY")
+        : (s_deep_mode_enabled ? "DEEP_ONLY" : "SLEEP_DISABLED");
+
     ESP_LOGI(
         POWER_TAG,
-        "event=INACTIVITY_POLICY_STARTED policy=DEEP_ONLY "
+        "event=INACTIVITY_POLICY_STARTED policy=%s "
         "idle_180_after_ms=%u idle_90_after_ms=%u "
-        "deep_sleep_after_ms=%u light_sleep=DISABLED",
+        "light_sleep_after_ms=%u deep_sleep_after_ms=%u",
+        policy_name,
         (unsigned)APP_CPU_IDLE_180_AFTER_MS,
         (unsigned)APP_CPU_IDLE_90_AFTER_MS,
-        (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
+        (unsigned)s_light_sleep_threshold_ms,
+        (unsigned)s_deep_sleep_threshold_ms);
 
     ESP_LOGI(
         TAG,
-        "Inactivity power policy armed: DEEP-ONLY after %u ms",
-        (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
-#elif APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
-    ESP_LOGI(
-        POWER_TAG,
-        "event=INACTIVITY_POLICY_STARTED policy=LIGHT_ONLY "
-        "idle_180_after_ms=%u idle_90_after_ms=%u "
-        "light_sleep_after_ms=%u deep_sleep=DISABLED",
-        (unsigned)APP_CPU_IDLE_180_AFTER_MS,
-        (unsigned)APP_CPU_IDLE_90_AFTER_MS,
-        (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
-
-    ESP_LOGI(
-        TAG,
-        "Inactivity power policy armed: LIGHT-ONLY after %u ms; "
-        "automatic Deep-sleep disabled",
-        (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
-#else
-    ESP_LOGI(
-        POWER_TAG,
-        "event=INACTIVITY_POLICY_STARTED policy=HYBRID "
-        "idle_180_after_ms=%u idle_90_after_ms=%u light_sleep_after_ms=%u "
-        "deep_sleep_after_ms=%u",
-        (unsigned)APP_CPU_IDLE_180_AFTER_MS,
-        (unsigned)APP_CPU_IDLE_90_AFTER_MS,
-        (unsigned)APP_LIGHT_SLEEP_TIMEOUT_MS,
-        (unsigned)APP_DEEP_SLEEP_TIMEOUT_MS);
-
-    ESP_LOGI(
-        TAG,
-        "Inactivity power policy armed: HYBRID light=%u ms deep=%u ms",
-        (unsigned)APP_LIGHT_SLEEP_TIMEOUT_MS,
-        (unsigned)APP_DEEP_SLEEP_TIMEOUT_MS);
-#endif
+        "Runtime Power Modes armed: policy=%s light=%u ms deep=%u ms",
+        policy_name,
+        (unsigned)s_light_sleep_threshold_ms,
+        (unsigned)s_deep_sleep_threshold_ms);
 
     while (!app_sleep_is_requested()) {
         vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_INACTIVITY_POLL_MS));
 
         /*
-         * Apply the staged active CPU policy and reduce AI duty cycle before
-         * entering the coordinated Light-sleep window.
-         */
+        * Apply the staged active CPU policy and reduce AI duty cycle before
+        * entering the coordinated Light-sleep window.
+        */
         const uint32_t inactive_ms = get_inactivity_ms();
         cpu_power_update_inactivity(inactive_ms);
 
         if (claim_inactivity_sleep_request()) {
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_DEEP_ONLY
             ESP_LOGI(
                 POWER_TAG,
-                "event=DEEP_SLEEP_DEADLINE_REACHED policy=DEEP_ONLY "
+                "event=DEEP_SLEEP_DEADLINE_REACHED policy=%s "
                 "inactive_ms=%" PRIu32 " threshold_ms=%u "
                 "transition=ACTIVE_TO_DEEP action=SHUTDOWN",
+                s_light_mode_enabled ? "LIGHT_THEN_DEEP" : "DEEP_ONLY",
                 inactive_ms,
-                (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
+                (unsigned)s_deep_sleep_threshold_ms);
             ESP_LOGI(
                 TAG,
                 "No activity for %u ms; entering Deep-sleep directly "
                 "without Light-sleep",
-                (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
+                (unsigned)s_deep_sleep_threshold_ms);
 
-            run_sleep_sequence("7-second face inactivity (DEEP_ONLY)");
-#else
-            ESP_LOGI(
-                POWER_TAG,
-                "event=DEEP_SLEEP_DEADLINE_REACHED policy=HYBRID "
-                "inactive_ms=%" PRIu32 " action=SHUTDOWN",
-                inactive_ms);
-            ESP_LOGI(
-                TAG,
-                "No activity for %u ms; entering Deep-sleep",
-                (unsigned)APP_DEEP_SLEEP_TIMEOUT_MS);
-
-            run_sleep_sequence("face inactivity after Light-sleep stage");
-#endif
+            run_sleep_sequence("runtime Deep-sleep inactivity deadline");
             break;
         }
 
@@ -14631,33 +16664,28 @@ static void inactivity_power_policy_task(void *arg)
             continue;
         }
 
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
         ESP_LOGI(
             POWER_TAG,
-            "event=LIGHT_SLEEP_BEGIN policy=LIGHT_ONLY "
-            "inactive_ms=%" PRIu32 " threshold_ms=%u deep_sleep=DISABLED",
-            inactive_ms,
-            (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
-
-        ESP_LOGI(
-            TAG,
-            "No activity for %u ms; entering Light-sleep only. "
-            "It will remain in Light-sleep polling until touch/GPIO3 activity.",
-            (unsigned)APP_SINGLE_SLEEP_TIMEOUT_MS);
-#else
-        ESP_LOGI(
-            POWER_TAG,
-            "event=LIGHT_SLEEP_BEGIN policy=HYBRID inactive_ms=%" PRIu32
+            "event=LIGHT_SLEEP_BEGIN policy=%s inactive_ms=%" PRIu32
             " remaining_to_deep_ms=%" PRIu32,
+            s_deep_mode_enabled ? "LIGHT_THEN_DEEP" : "LIGHT_ONLY",
             inactive_ms,
             remaining_ms);
 
-        ESP_LOGI(
-            TAG,
-            "No activity for %u ms; entering Light-sleep for up to %" PRIu32 " ms",
-            (unsigned)APP_LIGHT_SLEEP_TIMEOUT_MS,
-            remaining_ms);
-#endif
+        if (s_deep_mode_enabled) {
+            ESP_LOGI(
+                TAG,
+                "No activity for %u ms; entering Light-sleep for up to %" PRIu32
+                " ms before Deep-sleep",
+                (unsigned)s_light_sleep_threshold_ms,
+                remaining_ms);
+        } else {
+            ESP_LOGI(
+                TAG,
+                "No activity for %u ms; entering Light-sleep only until "
+                "touch/GPIO3 activity",
+                (unsigned)s_light_sleep_threshold_ms);
+        }
 
         if (s_light_suspend_callback == NULL ||
             s_light_resume_callback == NULL) {
@@ -14726,23 +16754,23 @@ static void inactivity_power_policy_task(void *arg)
             "ethernet=RESET c6=OFF gt911=POLLING");
 
         /*
-         * PRE-SLEEP CHECK
-         *
-         * The old code consumed just one GT911 sample here.  The V2 filter
-         * proved that the controller is genuinely released before sleep, but
-         * the hardware can still report a sustained false press immediately
-         * after the first sleep slice.  Keep this pre-check as a sanity guard,
-         * but DO NOT use it to arm touchscreen wake.
-         *
-         * Touch wake is armed only after a fresh post-sleep release streak.
-         */
+        * PRE-SLEEP CHECK
+        *
+        * The old code consumed just one GT911 sample here.  The V2 filter
+        * proved that the controller is genuinely released before sleep, but
+        * the hardware can still report a sustained false press immediately
+        * after the first sleep slice.  Keep this pre-check as a sanity guard,
+        * but DO NOT use it to arm touchscreen wake.
+        *
+        * Touch wake is armed only after a fresh post-sleep release streak.
+        */
         esp_err_t touch_ret = ESP_OK;
         uint32_t pre_release_samples = 0;
 
         for (uint32_t attempt = 0;
-             attempt < APP_LIGHT_SLEEP_TOUCH_PRECHECK_MAX_SAMPLES &&
-             pre_release_samples < APP_LIGHT_SLEEP_TOUCH_PRE_RELEASE_SAMPLES;
-             ++attempt) {
+            attempt < APP_LIGHT_SLEEP_TOUCH_PRECHECK_MAX_SAMPLES &&
+            pre_release_samples < APP_LIGHT_SLEEP_TOUCH_PRE_RELEASE_SAMPLES;
+            ++attempt) {
             bool touched_now = false;
             touch_ret = bsp_touch_poll_for_light_sleep(&touched_now);
 
@@ -14779,10 +16807,10 @@ static void inactivity_power_policy_task(void *arg)
         if (pre_release_samples <
             APP_LIGHT_SLEEP_TOUCH_PRE_RELEASE_SAMPLES) {
             /*
-             * A real finger may have arrived while the hardware was being
-             * suspended.  Restore ACTIVE instead of entering a sleep window
-             * with an ambiguous precondition.
-             */
+            * A real finger may have arrived while the hardware was being
+            * suspended.  Restore ACTIVE instead of entering a sleep window
+            * with an ambiguous precondition.
+            */
             ESP_LOGI(
                 POWER_TAG,
                 "event=LIGHT_SLEEP_EXIT reason=TOUCHSCREEN_PRECHECK "
@@ -14826,33 +16854,32 @@ static void inactivity_power_policy_task(void *arg)
             "released_samples=%" PRIu32,
             pre_release_samples);
 
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
-        ESP_LOGI(
-            TAG,
-            "GT911 polling every %u ms indefinitely; Deep-sleep is disabled "
-            "for this -l firmware",
-            (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS);
+        if (s_deep_mode_enabled) {
+            ESP_LOGI(
+                TAG,
+                "GT911 polling every %u ms for %" PRIu32
+                " ms before Deep-sleep; touch/GPIO3 returns to Active mode",
+                (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
+                remaining_ms);
 
-        ESP_LOGI(
-            POWER_TAG,
-            "event=LIGHT_SLEEP_ENTER policy=LIGHT_ONLY "
-            "mode=TIMER_SLICED_INDEFINITE poll_ms=%u deep_sleep=DISABLED",
-            (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS);
-#else
-        ESP_LOGI(
-            TAG,
-            "GT911 polling every %u ms until the %u ms Deep-sleep deadline; "
-            "touch wake will arm only after a post-sleep release streak",
-            (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
-            (unsigned)APP_DEEP_SLEEP_TIMEOUT_MS);
+            ESP_LOGI(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_ENTER policy=LIGHT_THEN_DEEP "
+                "mode=TIMER_SLICED poll_ms=%u remaining_to_deep_ms=%" PRIu32,
+                (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
+                remaining_ms);
+        } else {
+            ESP_LOGI(
+                TAG,
+                "GT911 polling every %u ms indefinitely; Deep-sleep is disabled",
+                (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS);
 
-        ESP_LOGI(
-            POWER_TAG,
-            "event=LIGHT_SLEEP_ENTER policy=HYBRID mode=TIMER_SLICED "
-            "poll_ms=%u remaining_to_deep_ms=%" PRIu32,
-            (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
-            remaining_ms);
-#endif
+            ESP_LOGI(
+                POWER_TAG,
+                "event=LIGHT_SLEEP_ENTER policy=LIGHT_ONLY "
+                "mode=TIMER_SLICED_INDEFINITE poll_ms=%u deep_sleep=DISABLED",
+                (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS);
+        }
 
         esp_err_t light_ret = ESP_OK;
         esp_sleep_wakeup_cause_t wake_cause =
@@ -14867,19 +16894,12 @@ static void inactivity_power_policy_task(void *arg)
         uint32_t press_stable_ms = 0;
         uint32_t short_slice_count = 0;
 
-        while (
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_LIGHT_ONLY
-            !touchscreen_touched
-#else
-            remaining_ms > 0 && !touchscreen_touched
-#endif
-            ) {
+        while (!touchscreen_touched &&
+               (!s_deep_mode_enabled || remaining_ms > 0)) {
             uint32_t poll_slice_ms = APP_LIGHT_SLEEP_TOUCH_POLL_MS;
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_HYBRID
-            if (poll_slice_ms > remaining_ms) {
+            if (s_deep_mode_enabled && poll_slice_ms > remaining_ms) {
                 poll_slice_ms = remaining_ms;
             }
-#endif
 
             const int64_t slice_start_us = esp_timer_get_time();
 
@@ -14910,11 +16930,11 @@ static void inactivity_power_policy_task(void *arg)
             }
 
             /*
-             * The RTC can occasionally return materially before the requested
-             * timer slice. Pad that shortfall while the application remains
-             * suspended so the inactivity and touch qualification windows are
-             * based on real scheduler time rather than a tight polling loop.
-             */
+            * The RTC can occasionally return materially before the requested
+            * timer slice. Pad that shortfall while the application remains
+            * suspended so the inactivity and touch qualification windows are
+            * based on real scheduler time rather than a tight polling loop.
+            */
             const int64_t requested_us = (int64_t)poll_slice_ms * 1000LL;
             const int64_t tolerance_us =
                 (int64_t)APP_LIGHT_SLEEP_EARLY_RETURN_TOLERANCE_US;
@@ -14951,9 +16971,9 @@ static void inactivity_power_policy_task(void *arg)
                 }
             }
 
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_HYBRID
-            remaining_ms -= poll_slice_ms;
-#endif
+            if (s_deep_mode_enabled) {
+                remaining_ms -= poll_slice_ms;
+            }
 
             if (UINT32_MAX - light_sleep_elapsed_ms < poll_slice_ms) {
                 light_sleep_elapsed_ms = UINT32_MAX;
@@ -14979,27 +16999,27 @@ static void inactivity_power_policy_task(void *arg)
             }
 
             /*
-             * V8 TIME-QUALIFIED TOUCH GATE (PRESERVED FROM V6)
-             *
-             * V4 proved that counting a few consecutive RELEASED samples was
-             * insufficient: the GT911 could emit PRESSED -> RELEASED -> PRESSED
-             * during the display/DSI power transition and satisfy the old gate.
-             *
-             * The V6/V8 managed-driver patch fixes the GT911 stale-point cache. This elapsed-time gate remains as a secondary filter:
-             *
-             *   startup quarantine
-             *       ignore every GT911 PRESSED/RELEASED value
-             *
-             *   stable release window
-             *       require continuously RELEASED for a configured duration
-             *
-             *   stable press window
-             *       after arming, require continuously PRESSED for a configured
-             *       duration before restoring the camera/display
-             *
-             * Any opposite sample resets the corresponding stability timer.
-             * GPIO3 is independent and still wakes immediately.
-             */
+            * V8 TIME-QUALIFIED TOUCH GATE (PRESERVED FROM V6)
+            *
+            * V4 proved that counting a few consecutive RELEASED samples was
+            * insufficient: the GT911 could emit PRESSED -> RELEASED -> PRESSED
+            * during the display/DSI power transition and satisfy the old gate.
+            *
+            * The V6/V8 managed-driver patch fixes the GT911 stale-point cache. This elapsed-time gate remains as a secondary filter:
+            *
+            *   startup quarantine
+            *       ignore every GT911 PRESSED/RELEASED value
+            *
+            *   stable release window
+            *       require continuously RELEASED for a configured duration
+            *
+            *   stable press window
+            *       after arming, require continuously PRESSED for a configured
+            *       duration before restoring the camera/display
+            *
+            * Any opposite sample resets the corresponding stability timer.
+            * GPIO3 is independent and still wakes immediately.
+            */
             if (light_sleep_elapsed_ms <
                 APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS) {
                 release_stable_ms = 0;
@@ -15157,30 +17177,28 @@ static void inactivity_power_policy_task(void *arg)
                     TAG,
                     "GPIO3 woke Light-sleep; camera/display restored without reboot");
             }
-#if APP_SLEEP_POLICY == APP_SLEEP_POLICY_HYBRID
         } else if (wake_cause == ESP_SLEEP_WAKEUP_TIMER &&
-                   remaining_ms == 0) {
+                s_deep_mode_enabled && remaining_ms == 0) {
             ESP_LOGI(
                 POWER_TAG,
-                "event=LIGHT_SLEEP_DEADLINE_REACHED policy=HYBRID "
+                "event=LIGHT_SLEEP_DEADLINE_REACHED policy=LIGHT_THEN_DEEP "
                 "inactive_ms=%u action=DEEP_SLEEP",
-                (unsigned)APP_DEEP_SLEEP_TIMEOUT_MS);
+                (unsigned)s_deep_sleep_threshold_ms);
             ESP_LOGI(
                 TAG,
                 "GT911 polling reached the %u ms Deep-sleep inactivity deadline",
-                (unsigned)APP_DEEP_SLEEP_TIMEOUT_MS);
+                (unsigned)s_deep_sleep_threshold_ms);
 
             /*
-             * Camera and display are already off. Claim the request directly
-             * and continue into the destructive shutdown without powering
-             * either pipeline back up for a single scheduler iteration.
-             */
+            * Camera and display are already off. Claim the request directly
+            * and continue into the destructive shutdown without powering
+            * either pipeline back up for a single scheduler iteration.
+            */
             if (claim_sleep_request()) {
                 run_sleep_sequence(
                     "face inactivity after Light-sleep timer");
             }
             break;
-#endif
         }
     }
 
@@ -15219,6 +17237,7 @@ esp_err_t app_sleep_start_button_monitor(
 
 esp_err_t app_sleep_start_timeout(void)
 {
+    configure_runtime_power_modes();
     const int64_t start_time_us = esp_timer_get_time();
 
     portENTER_CRITICAL(&s_sleep_request_lock);
@@ -15274,88 +17293,89 @@ extern "C" {
 #endif
 
 /**
- * Called immediately before the application begins the destructive
- * Deep-sleep shutdown sequence.
- *
- * The application should stop new camera-frame, PPA, AI and display work.
- * Light-sleep does not use this callback because execution resumes in place.
- */
+* Called immediately before the application begins the destructive
+* Deep-sleep shutdown sequence.
+*
+* The application should stop new camera-frame, PPA, AI and display work.
+* Light-sleep does not use this callback because execution resumes in place.
+*/
 typedef void (*app_sleep_prepare_callback_t)(void *user_data);
 
 /**
- * Suspend or resume application-owned hardware around manual Light-sleep.
- *
- * The suspend callback must stop every DMA/worker that cannot run while the
- * ESP32-P4 clocks are gated. The resume callback must rebuild those resources
- * after a touch or GPIO wake. A non-ESP_OK result is treated as unsafe and
- * causes a controlled restart instead of continuing with half-initialized
- * hardware.
- */
+* Suspend or resume application-owned hardware around manual Light-sleep.
+*
+* The suspend callback must stop every DMA/worker that cannot run while the
+* ESP32-P4 clocks are gated. The resume callback must rebuild those resources
+* after a touch or GPIO wake. A non-ESP_OK result is treated as unsafe and
+* causes a controlled restart instead of continuing with half-initialized
+* hardware.
+*/
 typedef esp_err_t (*app_sleep_light_transition_callback_t)(void *user_data);
 
 /**
- * Register the application callbacks used around manual Light-sleep.
- *
- * Both callbacks are required. Registration is normally performed once during
- * app_main(), before app_sleep_start_timeout() starts the inactivity policy.
- */
+* Register the application callbacks used around manual Light-sleep.
+*
+* Both callbacks are required. Registration is normally performed once during
+* app_main(), before app_sleep_start_timeout() starts the inactivity policy.
+*/
 esp_err_t app_sleep_register_light_sleep_callbacks(
     app_sleep_light_transition_callback_t suspend_callback,
     app_sleep_light_transition_callback_t resume_callback,
     void *user_data);
 
 /**
- * Start the physical GPIO3 sleep-button monitor.
- *
- * HYBRID / DEEP_ONLY:
- *   GPIO3 remains an active-mode Deep-sleep request and the Deep-sleep wake pin.
- *
- * LIGHT_ONLY:
- *   GPIO3 is only a Light-sleep wake/activity input. It is not allowed to
- *   invoke the destructive Deep-sleep sequence.
- *
- * A GPIO3 press used to wake Light-sleep is consumed and will not be reused as
- * a second sleep request after the system resumes.
- */
+* Start the physical GPIO3 sleep-button monitor.
+*
+* When the saved Deep-sleep toggle is ON, GPIO3 remains an active-mode
+* Deep-sleep request and the Deep-sleep wake pin. When it is OFF, GPIO3 is only
+* a Light-sleep wake/activity input.
+*
+* A GPIO3 press used to wake Light-sleep is consumed and will not be reused as
+* a second sleep request after the system resumes.
+*/
 esp_err_t app_sleep_start_button_monitor(
     app_sleep_prepare_callback_t prepare_callback,
     void *user_data);
 
 /**
- * Start the flash-selected face-inactivity power policy.
- *
- * APP_SLEEP_POLICY_HYBRID (no -d/-l flag):
- *   Existing behavior: Light-sleep after APP_LIGHT_SLEEP_TIMEOUT_MS, then
- *   Deep-sleep at APP_DEEP_SLEEP_TIMEOUT_MS total inactivity.
- *
- * APP_SLEEP_POLICY_LIGHT_ONLY (-l):
- *   Enter reversible Light-sleep after APP_SINGLE_SLEEP_TIMEOUT_MS (7 s).
- *   The timer-sliced GT911 polling loop continues indefinitely until qualified
- *   touchscreen activity or GPIO3 wakes the system. Automatic Deep-sleep is
- *   disabled, including active-mode GPIO3 Deep-sleep requests.
- *
- * APP_SLEEP_POLICY_DEEP_ONLY (-d):
- *   Skip Light-sleep completely and run the existing ordered Deep-sleep
- *   shutdown directly after APP_SINGLE_SLEEP_TIMEOUT_MS (7 s) inactivity.
- *
- * Positive face detections and existing application activity notifications
- * reset the inactivity timestamp exactly as before.
- */
+* Start the NVS-selected face-inactivity power policy.
+*
+* Light ON + Deep ON:
+*   Enter Light-sleep at APP_LIGHT_SLEEP_TIMEOUT_MS, then enter Deep-sleep
+*   APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS later if no touch/GPIO3 activity wakes
+*   the application back to Active mode.
+*
+* Light ON + Deep OFF:
+*   Enter reversible Light-sleep after APP_SINGLE_SLEEP_TIMEOUT_MS (7 s).
+*   The timer-sliced GT911 polling loop continues indefinitely until qualified
+*   touchscreen activity or GPIO3 wakes the system.
+*
+* Light OFF + Deep ON:
+*   Skip Light-sleep completely and run the existing ordered Deep-sleep
+*   shutdown directly after APP_SINGLE_SLEEP_TIMEOUT_MS (7 s) inactivity.
+*
+* Light OFF + Deep OFF:
+*   Keep both automatic sleep transitions disabled while retaining the staged
+*   Active-mode CPU policy.
+*
+* Positive face detections and existing application activity notifications
+* reset the inactivity timestamp exactly as before.
+*/
 esp_err_t app_sleep_start_timeout(void);
 
 /**
- * Record user activity and restart the complete inactivity policy.
- *
- * Positive face detections and PIN-screen interaction both call this API.
- */
+* Record user activity and restart the complete inactivity policy.
+*
+* Positive face detections and PIN-screen interaction both call this API.
+*/
 void app_sleep_notify_face_detected(void);
 
 /**
- * Return true only while the currently claimed automatic Light-sleep window
- * is still justified by the inactivity timer. A long AI inference may finish
- * after the Light-sleep deadline and report activity; callers use this check
- * before destructively suspending camera/display hardware.
- */
+* Return true only while the currently claimed automatic Light-sleep window
+* is still justified by the inactivity timer. A long AI inference may finish
+* after the Light-sleep deadline and report activity; callers use this check
+* before destructively suspending camera/display hardware.
+*/
 bool app_sleep_light_sleep_is_due(void);
 
 /** Request the existing ordered Deep-sleep shutdown sequence. */
@@ -17158,6 +19178,7 @@ static bool s_light_reset_asserted;
 static bool s_phy_powered_down;
 static bool s_original_bmcr_valid;
 static uint16_t s_original_bmcr;
+static bool s_user_enabled = true;
 
 /* -------------------------------------------------------------------------- */
 /* GPIO helpers                                                               */
@@ -17538,6 +19559,11 @@ static esp_err_t read_phy_identity(
 
 esp_err_t component_ethernet_hold_reset_for_light_sleep(void)
 {
+    if (!s_user_enabled) {
+        ESP_LOGI(TAG, "Ethernet stays in BMCR Power Down during Light-sleep");
+        return ESP_OK;
+    }
+
     if (s_light_reset_asserted) {
         return ESP_OK;
     }
@@ -17566,6 +19592,10 @@ esp_err_t component_ethernet_hold_reset_for_light_sleep(void)
 
 esp_err_t component_ethernet_restore_after_light_sleep(void)
 {
+    if (!s_user_enabled) {
+        return ESP_OK;
+    }
+
     if (!s_light_reset_asserted) {
         return ESP_OK;
     }
@@ -17764,6 +19794,12 @@ esp_err_t component_ethernet_verify_power_down(void)
 
 esp_err_t component_ethernet_restore_after_failed_sleep(void)
 {
+    if (!s_user_enabled) {
+        ESP_LOGI(TAG,
+                 "IP101GRI remains powered down because the saved Ethernet policy is OFF");
+        return ESP_OK;
+    }
+
     /*
      * Restore whenever an original BMCR snapshot exists. The write may have
      * reached the PHY even if the first verification read failed, so checking
@@ -17825,6 +19861,108 @@ esp_err_t component_ethernet_restore_after_failed_sleep(void)
         verify_bmcr);
 
     release_phy_management_pins();
+    return ESP_OK;
+}
+
+esp_err_t component_ethernet_set_enabled(bool enabled)
+{
+    const bool previous_policy = s_user_enabled;
+    s_user_enabled = enabled;
+
+    esp_err_t ret;
+
+    if (!enabled) {
+        ret = component_ethernet_disable_for_deep_sleep();
+    } else if (s_original_bmcr_valid) {
+        ret = component_ethernet_restore_after_failed_sleep();
+    } else {
+        ret = configure_phy_reset_level(
+            ETHERNET_PHY_RESET_RELEASED,
+            false);
+        if (ret == ESP_OK) {
+            s_light_reset_asserted = false;
+            s_phy_powered_down = false;
+            ESP_LOGI(TAG, "IP101GRI enabled by saved Ethernet policy");
+        }
+    }
+
+    if (ret != ESP_OK) {
+        s_user_enabled = previous_policy;
+    }
+
+    return ret;
+}
+
+bool component_ethernet_is_enabled(void)
+{
+    return s_user_enabled && !s_phy_powered_down && !s_light_reset_asserted;
+}
+
+
+
+==================================================
+FILE: src/main/power/component_runtime_policy.c
+==================================================
+#include "power_save/component_runtime_policy.h"
+
+#include "bsp/esp-bsp.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "power_save/component_audio.h"
+#include "power_save/component_sdcard.h"
+
+static const char *TAG = "runtime_policy";
+
+bool component_runtime_audio_policy_ready(void)
+{
+    return bsp_i2c_get_handle() != NULL;
+}
+
+esp_err_t component_runtime_set_audio_enabled(bool enabled)
+{
+    if (!component_runtime_audio_policy_ready()) {
+        ESP_LOGI(TAG, "Audio policy deferred until the BSP I2C bus is ready");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const esp_err_t ret = enabled
+        ? component_audio_restore_after_failed_sleep()
+        : component_audio_disable_for_deep_sleep();
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "Runtime audio policy applied: ES8311/NS4150B=%s",
+            enabled ? "ON" : "OFF");
+    }
+
+    return ret;
+}
+
+esp_err_t component_runtime_set_sdcard_enabled(bool enabled)
+{
+    if (!enabled) {
+        const esp_err_t ret = component_sdcard_disable_for_deep_sleep();
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Runtime storage policy applied: microSD=OFF");
+        }
+        return ret;
+    }
+
+    esp_err_t ret = component_sdcard_restore_after_failed_sleep();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if (bsp_sdcard == NULL) {
+        ret = bsp_sdcard_mount();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Could not mount enabled microSD: %s", esp_err_to_name(ret));
+            return ret;
+        }
+    }
+
+    ESP_LOGI(TAG, "Runtime storage policy applied: microSD=ON and mounted");
     return ESP_OK;
 }
 
@@ -18164,6 +20302,7 @@ static const char *TAG = "component_wifi";
  * disabled the C6.
  */
 static bool s_c6_disabled;
+static bool s_user_enabled = true;
 
 /*
  * Poll the pad until it reaches the expected level, or until the settle
@@ -18194,6 +20333,64 @@ static int wait_for_pad_level(gpio_num_t gpio_num, int expected_level,
     }
 
     return level;
+}
+
+static esp_err_t configure_c6_chip_pu_high(void)
+{
+    const gpio_num_t pin = WIFI_C6_CHIP_PU_GPIO;
+
+    esp_err_t ret = gpio_hold_dis(pin);
+    if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGE(TAG, "Could not release GPIO%d hold: %s",
+                 pin, esp_err_to_name(ret));
+        return ret;
+    }
+
+    gpio_config_t io_config = {
+        .pin_bit_mask = 1ULL << pin,
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ret = gpio_config(&io_config);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = gpio_set_drive_capability(pin, GPIO_DRIVE_CAP_3);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = gpio_set_level(pin, WIFI_C6_ENABLED_LEVEL);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = gpio_sleep_sel_dis(pin);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    uint32_t settle_ms = 0;
+    const int level = wait_for_pad_level(
+        pin,
+        WIFI_C6_ENABLED_LEVEL,
+        &settle_ms);
+
+    if (level != WIFI_C6_ENABLED_LEVEL) {
+        ESP_LOGE(TAG, "ESP32-C6 CHIP_PU reads %d; expected enabled level %d",
+                 level, WIFI_C6_ENABLED_LEVEL);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_c6_disabled = false;
+    ESP_LOGI(TAG,
+             "ESP32-C6 enabled: GPIO%d CHIP_PU HIGH (read-back=%d after %" PRIu32 " ms)",
+             pin, level, settle_ms);
+    return ESP_OK;
 }
 
 static esp_err_t configure_c6_chip_pu_low(
@@ -18353,10 +20550,10 @@ esp_err_t component_wifi_disable_for_deep_sleep(void)
     /*
      * Intentionally no "if (s_c6_disabled) return" shortcut.
      *
-     * app_main() disables the unused C6 during boot, while the ordered sleep
-     * sequence calls this function again at STEP 6. Reprogramming the pad on
-     * every call guarantees that STEP 6 really does work instead of merely
-     * reporting success from a stale software flag.
+     * The settings policy may already have disabled the C6, while the ordered
+     * sleep sequence calls this function again at STEP 6. Reprogramming the
+     * pad on every call guarantees that STEP 6 really does work instead of
+     * merely reporting success from a stale software flag.
      */
     return configure_c6_chip_pu_low(false, true);
 }
@@ -18372,13 +20569,33 @@ esp_err_t component_wifi_force_off_at_sleep_boundary(void)
 
 esp_err_t component_wifi_restore_after_failed_sleep(void)
 {
-    /* C6 is intentionally kept disabled permanently. */
-    ESP_LOGI(
-        TAG,
-        "ESP32-C6 remains disabled; GPIO54 software state will be re-applied "
-        "on the next sleep request");
-    return ESP_OK;
+    if (s_user_enabled) {
+        ESP_LOGI(TAG, "Restoring ESP32-C6 because the saved Wi-Fi policy is ON");
+        return configure_c6_chip_pu_high();
+    }
+
+    ESP_LOGI(TAG, "ESP32-C6 remains disabled because the saved Wi-Fi policy is OFF");
+    return configure_c6_chip_pu_low(false, true);
 }
+
+esp_err_t component_wifi_set_enabled(bool enabled)
+{
+    esp_err_t ret = enabled
+        ? configure_c6_chip_pu_high()
+        : configure_c6_chip_pu_low(false, true);
+
+    if (ret == ESP_OK) {
+        s_user_enabled = enabled;
+    }
+
+    return ret;
+}
+
+bool component_wifi_is_enabled(void)
+{
+    return s_user_enabled && !s_c6_disabled;
+}
+
 
 
 ==================================================
@@ -25426,6 +27643,522 @@ esp_err_t tflm_tensor_write_real(TfLiteTensor *tensor, size_t index, float value
 
 
 ==================================================
+FILE: src/main/settings/app_settings.c
+==================================================
+#include "settings/app_settings.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
+
+#include "esp_err.h"
+#include "esp_log.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "power_save/component_ethernet.h"
+#include "power_save/component_runtime_policy.h"
+#include "power_save/component_wifi.h"
+
+#define SETTINGS_NAMESPACE "app_settings"
+#define KEY_DARK_MODE       "dark"
+#define KEY_ETHERNET        "ethernet"
+#define KEY_WIFI            "wifi"
+#define KEY_CAMERA          "camera"
+#define KEY_AUDIO           "audio"
+#define KEY_SDCARD          "sdcard"
+#define KEY_LIGHT_SLEEP     "light_sleep"
+#define KEY_DEEP_SLEEP      "deep_sleep"
+#define ENROLLMENT_ROOT     "/sdcard/enroll"
+
+static const char *TAG = "app_settings";
+
+static app_settings_snapshot_t s_settings = {
+    .dark_mode = false,
+    .ethernet_enabled = true,
+    .wifi_enabled = true,
+    .camera_enabled = true,
+    .audio_enabled = true,
+    .sdcard_enabled = true,
+    .light_sleep_enabled = true,
+    .deep_sleep_enabled = true,
+};
+
+static bool s_initialized;
+static bool s_nvs_available;
+
+static esp_err_t read_bool(nvs_handle_t handle, const char *key, bool *value)
+{
+    uint8_t stored = 0;
+    esp_err_t ret = nvs_get_u8(handle, key, &stored);
+
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    *value = stored != 0;
+    return ESP_OK;
+}
+
+static esp_err_t save_bool(const char *key, bool value)
+{
+    if (!s_nvs_available) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = nvs_set_u8(handle, key, value ? 1U : 0U);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+    return ret;
+}
+
+esp_err_t app_settings_init(void)
+{
+    if (s_initialized) {
+        return s_nvs_available ? ESP_OK : ESP_ERR_INVALID_STATE;
+    }
+
+    s_initialized = true;
+
+    esp_err_t ret = nvs_flash_init();
+    if (ret != ESP_OK) {
+        /* Preserve other NVS users; never erase the partition automatically. */
+        ESP_LOGE(
+            TAG,
+            "NVS initialization failed; defaults remain active: %s",
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    nvs_handle_t handle;
+    ret = nvs_open(SETTINGS_NAMESPACE, NVS_READONLY, &handle);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        /* Namespace is created on the first user change. */
+        s_nvs_available = true;
+        ESP_LOGI(TAG, "No saved settings; using light mode with all components enabled");
+        return ESP_OK;
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not open settings namespace: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    esp_err_t first_error = ESP_OK;
+    esp_err_t item_ret = read_bool(handle, KEY_DARK_MODE, &s_settings.dark_mode);
+    if (item_ret != ESP_OK) {
+        first_error = item_ret;
+    }
+
+    item_ret = read_bool(handle, KEY_ETHERNET, &s_settings.ethernet_enabled);
+    if (item_ret != ESP_OK && first_error == ESP_OK) {
+        first_error = item_ret;
+    }
+
+    item_ret = read_bool(handle, KEY_WIFI, &s_settings.wifi_enabled);
+    if (item_ret != ESP_OK && first_error == ESP_OK) {
+        first_error = item_ret;
+    }
+
+    item_ret = read_bool(handle, KEY_CAMERA, &s_settings.camera_enabled);
+    if (item_ret != ESP_OK && first_error == ESP_OK) {
+        first_error = item_ret;
+    }
+
+    item_ret = read_bool(handle, KEY_AUDIO, &s_settings.audio_enabled);
+    if (item_ret != ESP_OK && first_error == ESP_OK) {
+        first_error = item_ret;
+    }
+
+    item_ret = read_bool(handle, KEY_SDCARD, &s_settings.sdcard_enabled);
+    if (item_ret != ESP_OK && first_error == ESP_OK) {
+        first_error = item_ret;
+    }
+
+    item_ret = read_bool(
+        handle,
+        KEY_LIGHT_SLEEP,
+        &s_settings.light_sleep_enabled);
+    if (item_ret != ESP_OK && first_error == ESP_OK) {
+        first_error = item_ret;
+    }
+
+    item_ret = read_bool(
+        handle,
+        KEY_DEEP_SLEEP,
+        &s_settings.deep_sleep_enabled);
+    if (item_ret != ESP_OK && first_error == ESP_OK) {
+        first_error = item_ret;
+    }
+
+    nvs_close(handle);
+    s_nvs_available = first_error == ESP_OK;
+
+    if (first_error != ESP_OK) {
+        ESP_LOGE(TAG, "Could not read one or more settings: %s",
+                 esp_err_to_name(first_error));
+        return first_error;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Loaded settings: theme=%s ethernet=%s wifi=%s camera=%s audio=%s "
+        "sdcard=%s light_sleep=%s deep_sleep=%s",
+        s_settings.dark_mode ? "dark" : "light",
+        s_settings.ethernet_enabled ? "on" : "off",
+        s_settings.wifi_enabled ? "on" : "off",
+        s_settings.camera_enabled ? "on" : "off",
+        s_settings.audio_enabled ? "on" : "off",
+        s_settings.sdcard_enabled ? "on" : "off",
+        s_settings.light_sleep_enabled ? "on" : "off",
+        s_settings.deep_sleep_enabled ? "on" : "off");
+    return ESP_OK;
+}
+
+app_settings_snapshot_t app_settings_get(void)
+{
+    return s_settings;
+}
+
+esp_err_t app_settings_set_dark_mode(bool enabled)
+{
+    const bool previous = s_settings.dark_mode;
+    s_settings.dark_mode = enabled;
+
+    esp_err_t ret = save_bool(KEY_DARK_MODE, enabled);
+    if (ret != ESP_OK) {
+        s_settings.dark_mode = previous;
+        ESP_LOGE(TAG, "Could not save theme: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "Theme saved: %s", enabled ? "dark" : "light");
+    return ESP_OK;
+}
+
+esp_err_t app_settings_set_ethernet_enabled(bool enabled)
+{
+    const bool previous = s_settings.ethernet_enabled;
+    if (enabled == previous) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = component_ethernet_set_enabled(enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Ethernet state change failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = save_bool(KEY_ETHERNET, enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not save Ethernet setting: %s", esp_err_to_name(ret));
+        (void)component_ethernet_set_enabled(previous);
+        return ret;
+    }
+
+    s_settings.ethernet_enabled = enabled;
+    ESP_LOGI(TAG, "Ethernet policy saved and applied: %s", enabled ? "on" : "off");
+    return ESP_OK;
+}
+
+esp_err_t app_settings_set_wifi_enabled(bool enabled)
+{
+    const bool previous = s_settings.wifi_enabled;
+    if (enabled == previous) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = component_wifi_set_enabled(enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Wi-Fi state change failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = save_bool(KEY_WIFI, enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not save Wi-Fi setting: %s", esp_err_to_name(ret));
+        (void)component_wifi_set_enabled(previous);
+        return ret;
+    }
+
+    s_settings.wifi_enabled = enabled;
+    ESP_LOGI(TAG, "Wi-Fi policy saved and applied: %s", enabled ? "on" : "off");
+    return ESP_OK;
+}
+
+esp_err_t app_settings_set_camera_enabled(bool enabled)
+{
+    const bool previous = s_settings.camera_enabled;
+    if (enabled == previous) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = save_bool(KEY_CAMERA, enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not save Camera setting: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    s_settings.camera_enabled = enabled;
+    ESP_LOGI(
+        TAG,
+        "Camera policy saved: %s; camera pipeline is %s",
+        enabled ? "on" : "off",
+        enabled ? "available" : "blocked and uninitialized");
+    return ESP_OK;
+}
+
+esp_err_t app_settings_set_audio_enabled(bool enabled)
+{
+    const bool previous = s_settings.audio_enabled;
+    if (enabled == previous) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = component_runtime_set_audio_enabled(enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Audio state change failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = save_bool(KEY_AUDIO, enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not save Audio setting: %s", esp_err_to_name(ret));
+        (void)component_runtime_set_audio_enabled(previous);
+        return ret;
+    }
+
+    s_settings.audio_enabled = enabled;
+    ESP_LOGI(TAG, "Audio policy saved and applied: %s", enabled ? "on" : "off");
+    return ESP_OK;
+}
+
+esp_err_t app_settings_set_sdcard_enabled(bool enabled)
+{
+    const bool previous = s_settings.sdcard_enabled;
+    if (enabled == previous) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = component_runtime_set_sdcard_enabled(enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "microSD state change failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = save_bool(KEY_SDCARD, enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not save microSD setting: %s", esp_err_to_name(ret));
+        (void)component_runtime_set_sdcard_enabled(previous);
+        return ret;
+    }
+
+    s_settings.sdcard_enabled = enabled;
+    ESP_LOGI(TAG, "microSD policy saved and applied: %s", enabled ? "on" : "off");
+    return ESP_OK;
+}
+
+esp_err_t app_settings_set_light_sleep_enabled(bool enabled)
+{
+    const bool previous = s_settings.light_sleep_enabled;
+    if (enabled == previous) {
+        return ESP_OK;
+    }
+
+    const esp_err_t ret = save_bool(KEY_LIGHT_SLEEP, enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not save Light-sleep setting: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    s_settings.light_sleep_enabled = enabled;
+    ESP_LOGI(TAG, "Light-sleep mode saved: %s", enabled ? "enabled" : "disabled");
+    return ESP_OK;
+}
+
+esp_err_t app_settings_set_deep_sleep_enabled(bool enabled)
+{
+    const bool previous = s_settings.deep_sleep_enabled;
+    if (enabled == previous) {
+        return ESP_OK;
+    }
+
+    const esp_err_t ret = save_bool(KEY_DEEP_SLEEP, enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not save Deep-sleep setting: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    s_settings.deep_sleep_enabled = enabled;
+    ESP_LOGI(TAG, "Deep-sleep mode saved: %s", enabled ? "enabled" : "disabled");
+    return ESP_OK;
+}
+
+esp_err_t app_settings_apply_power_policy(void)
+{
+    esp_err_t first_error = ESP_OK;
+
+    esp_err_t ret = component_wifi_set_enabled(s_settings.wifi_enabled);
+    if (ret != ESP_OK) {
+        first_error = ret;
+        ESP_LOGE(TAG, "Could not apply saved Wi-Fi policy: %s", esp_err_to_name(ret));
+    }
+
+    ret = component_ethernet_set_enabled(s_settings.ethernet_enabled);
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not apply saved Ethernet policy: %s", esp_err_to_name(ret));
+    }
+
+    ret = component_runtime_set_sdcard_enabled(s_settings.sdcard_enabled);
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not apply saved microSD policy: %s", esp_err_to_name(ret));
+    }
+
+    if (component_runtime_audio_policy_ready()) {
+        ret = component_runtime_set_audio_enabled(s_settings.audio_enabled);
+        if (ret != ESP_OK && first_error == ESP_OK) {
+            first_error = ret;
+        }
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Could not apply saved Audio policy: %s", esp_err_to_name(ret));
+        }
+    } else {
+        ESP_LOGI(TAG, "Saved Audio policy will be applied after display/I2C startup");
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Camera policy applied: pipeline=%s",
+        s_settings.camera_enabled ? "available" : "blocked and uninitialized");
+
+    return first_error;
+}
+
+static bool is_directory_entry(const struct dirent *entry)
+{
+    /* FAT directory entries are not required to expose d_type; use stat. */
+    char full_path[256];
+    int written = snprintf(full_path, sizeof(full_path), "%s/%s",
+                           ENROLLMENT_ROOT, entry->d_name);
+    if (written < 0 || (size_t)written >= sizeof(full_path)) {
+        return false;
+    }
+
+    struct stat info;
+    return stat(full_path, &info) == 0 && S_ISDIR(info.st_mode);
+}
+
+static int compare_names(const void *left, const void *right)
+{
+    const char *left_name = left;
+    const char *right_name = right;
+    return strcasecmp(left_name, right_name);
+}
+
+esp_err_t app_settings_load_authorized_users(
+    app_settings_authorized_users_t *users_out)
+{
+    if (users_out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(users_out, 0, sizeof(*users_out));
+
+    const bool restore_saved_off_state = !s_settings.sdcard_enabled;
+    esp_err_t access_ret = component_runtime_set_sdcard_enabled(true);
+    if (access_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not power/mount microSD for user refresh: %s",
+                 esp_err_to_name(access_ret));
+        return access_ret;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "microSD ready for authorized-user refresh%s",
+        restore_saved_off_state ? " (temporary access)" : "");
+
+    DIR *directory = opendir(ENROLLMENT_ROOT);
+    if (directory == NULL) {
+        const esp_err_t scan_ret = errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+        ESP_LOGE(TAG, "Could not open %s: errno=%d", ENROLLMENT_ROOT, errno);
+        if (restore_saved_off_state) {
+            const esp_err_t restore_ret = component_runtime_set_sdcard_enabled(false);
+            if (restore_ret != ESP_OK) {
+                ESP_LOGE(TAG, "Could not restore saved microSD OFF state: %s",
+                         esp_err_to_name(restore_ret));
+            }
+        }
+        return scan_ret;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL &&
+           users_out->count < APP_SETTINGS_MAX_AUTHORIZED_USERS) {
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0 ||
+            entry->d_name[0] == '.') {
+            continue;
+        }
+
+        if (!is_directory_entry(entry)) {
+            continue;
+        }
+
+        char *destination = users_out->names[users_out->count];
+        const size_t name_length = strnlen(
+            entry->d_name,
+            APP_SETTINGS_MAX_USER_NAME_LENGTH - 1U);
+        memcpy(destination, entry->d_name, name_length);
+        destination[name_length] = '\0';
+        users_out->count++;
+    }
+
+    closedir(directory);
+
+    qsort(
+        users_out->names,
+        users_out->count,
+        APP_SETTINGS_MAX_USER_NAME_LENGTH,
+        compare_names);
+
+    ESP_LOGI(TAG, "Authorized users refreshed from SD card: %u",
+             (unsigned)users_out->count);
+
+    if (restore_saved_off_state) {
+        const esp_err_t restore_ret = component_runtime_set_sdcard_enabled(false);
+        if (restore_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Could not restore saved microSD OFF state: %s",
+                     esp_err_to_name(restore_ret));
+            return restore_ret;
+        }
+        ESP_LOGI(TAG, "microSD returned to the saved OFF state after refresh");
+    }
+
+    return ESP_OK;
+}
+
+
+==================================================
 FILE: src/main/ui/app_ui.c
 ==================================================
 #include "app_ui.h"
@@ -25439,16 +28172,20 @@ FILE: src/main/ui/app_ui.c
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
+#include "settings/app_settings.h"
 
 static const char *TAG = "app_ui";
 
 static app_ui_start_callback_t s_start_callback;
-static void *s_start_user_data;
+static app_ui_settings_callback_t s_settings_callback;
+static void *s_user_data;
 
 static lv_obj_t *s_status_label;
 static lv_obj_t *s_start_button;
 static lv_obj_t *s_start_button_label;
-static bool s_start_dispatched;
+static lv_obj_t *s_settings_button;
+static lv_obj_t *s_settings_button_label;
+static bool s_action_dispatched;
 
 /*
  * Wait for the BSP LVGL mutex. The LVGL worker performs its first refresh
@@ -25475,83 +28212,156 @@ static esp_err_t app_ui_lock(void)
     return ret;
 }
 
-static void dispatch_start_request(void)
+static void disable_launcher_actions(void)
 {
-    if (s_start_dispatched) {
-        return;
-    }
-
-    s_start_dispatched = true;
-    ESP_LOGI(TAG, "Launcher touch accepted; requesting camera application start");
-
-    /* Prevent repeated starts while camera and AI services initialize. */
     if (s_start_button) {
         lv_obj_add_state(s_start_button, LV_STATE_DISABLED);
     }
+    if (s_settings_button) {
+        lv_obj_add_state(s_settings_button, LV_STATE_DISABLED);
+    }
+}
+
+static void dispatch_start_request(void)
+{
+    if (s_action_dispatched) {
+        return;
+    }
+
+    const app_settings_snapshot_t settings = app_settings_get();
+    if (!settings.camera_enabled) {
+        if (s_status_label) {
+            lv_label_set_text(
+                s_status_label,
+                "Camera is OFF. Enable it in Settings.");
+            lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xD97706), 0);
+        }
+        return;
+    }
+
+    s_action_dispatched = true;
+    ESP_LOGI(TAG, "Start Camera pressed; requesting camera application start");
+    disable_launcher_actions();
+
     if (s_start_button_label) {
         lv_label_set_text(s_start_button_label, "Starting...");
     }
     if (s_status_label) {
         lv_label_set_text(s_status_label, "Preparing camera and face recognition...");
-        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xB8C2CC), 0);
+        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x64748B), 0);
     }
 
     if (s_start_callback) {
-        s_start_callback(s_start_user_data);
+        s_start_callback(s_user_data);
     }
 }
 
-static void launcher_press_event_cb(lv_event_t *event)
+static void dispatch_settings_request(void)
 {
-    /*
-     * Start on the initial press rather than LV_EVENT_CLICKED.
-     *
-     * CLICKED is sent only after release and only if LVGL decides that the
-     * pointer did not scroll or drift outside the widget. A large GT911 panel
-     * can report a few pixels of release movement, which can suppress CLICKED.
-     * PRESSED is immediate and is the correct behavior for this launcher.
-     */
+    if (s_action_dispatched) {
+        return;
+    }
+
+    s_action_dispatched = true;
+    ESP_LOGI(TAG, "Settings pressed; requesting fresh settings screen");
+    disable_launcher_actions();
+
+    if (s_settings_button_label) {
+        lv_label_set_text(s_settings_button_label, "Opening Settings...");
+    }
+
+    if (s_settings_callback) {
+        s_settings_callback(s_user_data);
+    }
+}
+
+static void launcher_start_event_cb(lv_event_t *event)
+{
     if (lv_event_get_code(event) == LV_EVENT_PRESSED) {
         dispatch_start_request();
     }
 }
 
-void app_ui_create(app_ui_start_callback_t start_callback, void *user_data)
+static void launcher_settings_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_PRESSED) {
+        dispatch_settings_request();
+    }
+}
+
+static void create_ready_pill(lv_obj_t *parent, bool dark_mode, bool camera_ready)
+{
+    lv_obj_t *pill = lv_obj_create(parent);
+    lv_obj_set_size(pill, 176, 46);
+    lv_obj_remove_flag(pill, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(pill, 23, 0);
+    lv_obj_set_style_border_width(pill, 0, 0);
+    lv_obj_set_style_bg_color(
+        pill,
+        lv_color_hex(
+            camera_ready
+                ? (dark_mode ? 0x153A2A : 0xDCFCE7)
+                : (dark_mode ? 0x422006 : 0xFEF3C7)),
+        0);
+
+    lv_obj_t *label = lv_label_create(pill);
+    lv_label_set_text(label, camera_ready ? "SYSTEM READY" : "POWER SAVING");
+    lv_obj_set_style_text_color(
+        label,
+        lv_color_hex(
+            camera_ready
+                ? (dark_mode ? 0x86EFAC : 0x15803D)
+                : (dark_mode ? 0xFCD34D : 0xB45309)),
+        0);
+    lv_obj_center(label);
+}
+
+void app_ui_create(
+    app_ui_start_callback_t start_callback,
+    app_ui_settings_callback_t settings_callback,
+    void *user_data)
 {
     s_start_callback = start_callback;
-    s_start_user_data = user_data;
-    s_start_dispatched = false;
+    s_settings_callback = settings_callback;
+    s_user_data = user_data;
+    s_action_dispatched = false;
+
+    const app_settings_snapshot_t settings = app_settings_get();
+    const bool dark = settings.dark_mode;
+    const bool camera_ready = settings.camera_enabled;
 
     esp_err_t lock_ret = app_ui_lock();
     if (lock_ret != ESP_OK) {
         return;
     }
 
+    const uint32_t screen_bg = dark ? 0x08111F : 0xF3F7FA;
+    const uint32_t panel_bg = dark ? 0x111C2E : 0xFFFFFF;
+    const uint32_t primary_text = dark ? 0xF8FAFC : 0x172033;
+    const uint32_t secondary_text = dark ? 0xA9B6C7 : 0x64748B;
+    const uint32_t border = dark ? 0x29415F : 0xDFE7EE;
+
     lv_obj_t *screen = lv_screen_active();
     lv_obj_clean(screen);
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x08111F), 0);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(screen_bg), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
-
-    /*
-     * The launcher has only one action, so the entire background is also a
-     * touch target. This makes startup robust while still keeping the visible
-     * Start Camera button as the main control.
-     */
-    lv_obj_add_flag(screen, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(screen, launcher_press_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *panel = lv_obj_create(screen);
-    lv_obj_set_size(panel, LV_PCT(72), LV_PCT(68));
+    lv_obj_set_size(panel, LV_PCT(82), LV_PCT(76));
     lv_obj_center(panel);
     lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(panel, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(panel, launcher_press_event_cb, LV_EVENT_PRESSED, NULL);
-    lv_obj_set_style_radius(panel, 28, 0);
-    lv_obj_set_style_bg_color(panel, lv_color_hex(0x111C2E), 0);
+    lv_obj_set_style_radius(panel, 34, 0);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(panel_bg), 0);
     lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(panel, lv_color_hex(0x29415F), 0);
-    lv_obj_set_style_border_width(panel, 2, 0);
-    lv_obj_set_style_pad_all(panel, 36, 0);
+    lv_obj_set_style_border_color(panel, lv_color_hex(border), 0);
+    lv_obj_set_style_border_width(panel, 1, 0);
+    lv_obj_set_style_shadow_color(panel, lv_color_hex(0x0F172A), 0);
+    lv_obj_set_style_shadow_opa(panel, dark ? LV_OPA_20 : LV_OPA_10, 0);
+    lv_obj_set_style_shadow_width(panel, 28, 0);
+    lv_obj_set_style_shadow_ofs_y(panel, 10, 0);
+    lv_obj_set_style_pad_all(panel, 44, 0);
+    lv_obj_set_style_pad_row(panel, 20, 0);
     lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(
         panel,
@@ -25559,69 +28369,115 @@ void app_ui_create(app_ui_start_callback_t start_callback, void *user_data)
         LV_FLEX_ALIGN_CENTER,
         LV_FLEX_ALIGN_CENTER);
 
+    lv_obj_t *brand = lv_obj_create(panel);
+    lv_obj_set_size(brand, 104, 104);
+    lv_obj_remove_flag(brand, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(brand, 30, 0);
+    lv_obj_set_style_border_width(brand, 0, 0);
+    lv_obj_set_style_bg_color(brand, lv_color_hex(0x2F80ED), 0);
+
+    lv_obj_t *brand_label = lv_label_create(brand);
+    lv_label_set_text(brand_label, "AI");
+    lv_obj_set_style_text_color(brand_label, lv_color_white(), 0);
+    lv_obj_center(brand_label);
+
     lv_obj_t *title = lv_label_create(panel);
-    lv_label_set_text(title, "Face Recognition System");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xF5F8FC), 0);
+    lv_label_set_text(title, "Face Recognition");
+    lv_obj_set_style_text_color(title, lv_color_hex(primary_text), 0);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
 
     lv_obj_t *subtitle = lv_label_create(panel);
     lv_label_set_text(
         subtitle,
-        "Tap Start Camera to initialize the camera and open live recognition.");
+        "Secure local recognition with adaptive power management.");
     lv_label_set_long_mode(subtitle, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(subtitle, LV_PCT(82));
-    lv_obj_set_style_text_color(subtitle, lv_color_hex(0xA9B6C7), 0);
+    lv_obj_set_width(subtitle, LV_PCT(80));
+    lv_obj_set_style_text_color(subtitle, lv_color_hex(secondary_text), 0);
     lv_obj_set_style_text_align(subtitle, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_pad_top(subtitle, 12, 0);
-    lv_obj_set_style_pad_bottom(subtitle, 24, 0);
+
+    create_ready_pill(panel, dark, camera_ready);
 
     lv_obj_t *status_box = lv_obj_create(panel);
-    lv_obj_set_size(status_box, LV_PCT(72), 52);
+    lv_obj_set_size(status_box, LV_PCT(74), 60);
     lv_obj_remove_flag(status_box, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_radius(status_box, 18, 0);
-    lv_obj_set_style_bg_color(status_box, lv_color_hex(0x0B1525), 0);
-    lv_obj_set_style_bg_opa(status_box, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(status_box, 0, 0);
-    lv_obj_set_style_pad_all(status_box, 0, 0);
-    lv_obj_add_flag(status_box, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(status_box, launcher_press_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_set_style_bg_color(
+        status_box,
+        lv_color_hex(dark ? 0x0B1525 : 0xF8FAFC),
+        0);
+    lv_obj_set_style_border_color(status_box, lv_color_hex(border), 0);
+    lv_obj_set_style_border_width(status_box, 1, 0);
 
     s_status_label = lv_label_create(status_box);
-    lv_label_set_text(s_status_label, "Touch ready");
-    lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x75D59A), 0);
+    lv_label_set_text(
+        s_status_label,
+        !settings.camera_enabled
+            ? "Camera disabled in Settings"
+            : (!settings.sdcard_enabled
+                ? "Ready; microSD powers off after AI load"
+                : "Touch ready"));
+    lv_obj_set_style_text_color(
+        s_status_label,
+        lv_color_hex(
+            camera_ready
+                ? (dark ? 0x86EFAC : 0x15803D)
+                : (dark ? 0xFCD34D : 0xB45309)),
+        0);
     lv_obj_center(s_status_label);
 
     s_start_button = lv_button_create(panel);
-    lv_obj_set_size(s_start_button, 300, 86);
+    lv_obj_set_size(s_start_button, LV_PCT(74), 92);
     lv_obj_remove_flag(s_start_button, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(s_start_button, 20, 0);
+    lv_obj_set_style_radius(s_start_button, 22, 0);
     lv_obj_set_style_bg_color(s_start_button, lv_color_hex(0x2F80ED), 0);
-    lv_obj_set_style_bg_color(
-        s_start_button,
-        lv_color_hex(0x1D5FAF),
-        LV_STATE_PRESSED);
-    lv_obj_set_style_bg_color(
-        s_start_button,
-        lv_color_hex(0x435268),
-        LV_STATE_DISABLED);
-    lv_obj_set_style_pad_top(s_start_button, 20, 0);
-    lv_obj_set_style_pad_bottom(s_start_button, 20, 0);
-    lv_obj_add_event_cb(s_start_button, launcher_press_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_set_style_bg_color(s_start_button, lv_color_hex(0x1D5FAF), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(s_start_button, lv_color_hex(0x94A3B8), LV_STATE_DISABLED);
+    lv_obj_add_event_cb(s_start_button, launcher_start_event_cb, LV_EVENT_PRESSED, NULL);
+
+    if (!camera_ready) {
+        lv_obj_add_state(s_start_button, LV_STATE_DISABLED);
+    }
 
     s_start_button_label = lv_label_create(s_start_button);
-    lv_label_set_text(s_start_button_label, "Start Camera");
+    lv_label_set_text(
+        s_start_button_label,
+        camera_ready
+            ? "Start Camera"
+            : "Camera Off");
     lv_obj_set_style_text_color(s_start_button_label, lv_color_white(), 0);
     lv_obj_center(s_start_button_label);
+
+    s_settings_button = lv_button_create(panel);
+    lv_obj_set_size(s_settings_button, LV_PCT(74), 80);
+    lv_obj_remove_flag(s_settings_button, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(s_settings_button, 22, 0);
+    lv_obj_set_style_bg_color(s_settings_button, lv_color_hex(panel_bg), 0);
+    lv_obj_set_style_bg_color(
+        s_settings_button,
+        lv_color_hex(dark ? 0x1D2A3E : 0xEEF4F8),
+        LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(s_settings_button, lv_color_hex(panel_bg), LV_STATE_DISABLED);
+    lv_obj_set_style_border_color(s_settings_button, lv_color_hex(0x2F80ED), 0);
+    lv_obj_set_style_border_width(s_settings_button, 2, 0);
+    lv_obj_add_event_cb(
+        s_settings_button,
+        launcher_settings_event_cb,
+        LV_EVENT_PRESSED,
+        NULL);
+
+    s_settings_button_label = lv_label_create(s_settings_button);
+    lv_label_set_text(s_settings_button_label, "Settings");
+    lv_obj_set_style_text_color(s_settings_button_label, lv_color_hex(0x2F80ED), 0);
+    lv_obj_center(s_settings_button_label);
 
     lv_obj_t *hint = lv_label_create(panel);
     lv_label_set_text(
         hint,
-        "Press the button or tap anywhere on this launcher. GPIO3 remains available for deep sleep.");
+        "GPIO3 remains available for the configured sleep mode.");
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(hint, LV_PCT(86));
-    lv_obj_set_style_text_color(hint, lv_color_hex(0x75849A), 0);
+    lv_obj_set_width(hint, LV_PCT(82));
+    lv_obj_set_style_text_color(hint, lv_color_hex(secondary_text), 0);
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_pad_top(hint, 14, 0);
 
     bsp_display_unlock();
 }
@@ -25638,7 +28494,7 @@ void app_ui_set_status(const char *text)
 
     if (s_status_label) {
         lv_label_set_text(s_status_label, text);
-        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xB8C2CC), 0);
+        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x64748B), 0);
     }
 
     bsp_display_unlock();
@@ -25656,7 +28512,7 @@ void app_ui_show_error(const char *text)
 
     if (s_status_label) {
         lv_label_set_text(s_status_label, text);
-        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xFF7A7A), 0);
+        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xDC2626), 0);
     }
     if (s_start_button_label) {
         lv_label_set_text(s_start_button_label, "Restart device");
@@ -25676,9 +28532,12 @@ void app_ui_destroy(void)
     s_status_label = NULL;
     s_start_button = NULL;
     s_start_button_label = NULL;
+    s_settings_button = NULL;
+    s_settings_button_label = NULL;
     s_start_callback = NULL;
-    s_start_user_data = NULL;
-    s_start_dispatched = false;
+    s_settings_callback = NULL;
+    s_user_data = NULL;
+    s_action_dispatched = false;
 
     bsp_display_unlock();
 }
@@ -25694,9 +28553,13 @@ extern "C" {
 #endif
 
 typedef void (*app_ui_start_callback_t)(void *user_data);
+typedef void (*app_ui_settings_callback_t)(void *user_data);
 
-/** Create the launcher screen shown before the camera application starts. */
-void app_ui_create(app_ui_start_callback_t start_callback, void *user_data);
+/** Create the modern launcher shown before the camera application starts. */
+void app_ui_create(
+    app_ui_start_callback_t start_callback,
+    app_ui_settings_callback_t settings_callback,
+    void *user_data);
 
 /** Update the launcher status text from any FreeRTOS task. */
 void app_ui_set_status(const char *text);
@@ -25704,12 +28567,13 @@ void app_ui_set_status(const char *text);
 /** Show a startup failure on the launcher screen. */
 void app_ui_show_error(const char *text);
 
-/** Remove launcher objects before switching the display to camera dummy-draw mode. */
+/** Remove launcher objects before switching to Settings or camera mode. */
 void app_ui_destroy(void);
 
 #ifdef __cplusplus
 }
 #endif
+
 
 
 ==================================================
@@ -26184,6 +29048,768 @@ void pin_screen_hide(void);
 
 /** Return true while the PIN screen owns the active LVGL screen. */
 bool pin_screen_is_visible(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+==================================================
+FILE: src/main/ui/settings_screen.c
+==================================================
+#include "settings_screen.h"
+
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "bsp/display.h"
+#include "bsp/esp-bsp.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "lvgl.h"
+#include "settings/app_settings.h"
+
+typedef enum {
+    SETTINGS_TOGGLE_THEME,
+    SETTINGS_TOGGLE_ETHERNET,
+    SETTINGS_TOGGLE_WIFI,
+    SETTINGS_TOGGLE_CAMERA,
+    SETTINGS_TOGGLE_AUDIO,
+    SETTINGS_TOGGLE_SDCARD,
+    SETTINGS_TOGGLE_LIGHT_SLEEP,
+    SETTINGS_TOGGLE_DEEP_SLEEP,
+} settings_toggle_kind_t;
+
+#define SETTINGS_TOGGLE_CAPACITY       8U
+#define SETTINGS_TOGGLE_DEBOUNCE_US    250000LL
+
+typedef struct {
+    lv_obj_t *toggle;
+    settings_toggle_kind_t kind;
+    bool requested_enabled;
+} settings_toggle_request_t;
+
+typedef struct {
+    bool dark;
+    uint32_t screen_bg;
+    uint32_t header_bg;
+    uint32_t card_bg;
+    uint32_t row_bg;
+    uint32_t primary_text;
+    uint32_t secondary_text;
+    uint32_t border;
+    uint32_t accent;
+} settings_palette_t;
+
+static const char *TAG = "settings_screen";
+
+static settings_screen_back_callback_t s_back_callback;
+static void *s_user_data;
+static lv_obj_t *s_status_label;
+static lv_obj_t *s_back_button;
+static lv_obj_t *s_toggles[SETTINGS_TOGGLE_CAPACITY];
+static size_t s_toggle_count;
+static bool s_navigation_dispatched;
+static bool s_switch_update_in_progress;
+static volatile bool s_toggle_write_in_progress;
+static int64_t s_last_toggle_event_us;
+static settings_toggle_request_t s_pending_toggle;
+
+static esp_err_t settings_screen_lock(void)
+{
+    esp_err_t ret = ESP_FAIL;
+
+    for (int attempt = 1; attempt <= 20; attempt++) {
+        ret = bsp_display_lock(500);
+        if (ret == ESP_OK) {
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    ESP_LOGE(TAG, "Could not acquire LVGL lock: %s", esp_err_to_name(ret));
+    return ret;
+}
+
+static settings_palette_t palette_for(bool dark)
+{
+    settings_palette_t palette = {
+        .dark = dark,
+        .screen_bg = dark ? 0x08111F : 0xF3F7FA,
+        .header_bg = dark ? 0x0C1728 : 0xE9F7F5,
+        .card_bg = dark ? 0x111C2E : 0xFFFFFF,
+        .row_bg = dark ? 0x162338 : 0xF8FAFC,
+        .primary_text = dark ? 0xF8FAFC : 0x172033,
+        .secondary_text = dark ? 0xA9B6C7 : 0x64748B,
+        .border = dark ? 0x29415F : 0xDFE7EE,
+        .accent = 0x16B8A6,
+    };
+    return palette;
+}
+
+static void set_status(const char *text, bool is_error)
+{
+    if (s_status_label == NULL || text == NULL) {
+        return;
+    }
+
+    lv_label_set_text(s_status_label, text);
+    lv_obj_set_style_text_color(
+        s_status_label,
+        lv_color_hex(is_error ? 0xDC2626 : 0x16A34A),
+        0);
+}
+
+static lv_obj_t *create_section_label(
+    lv_obj_t *parent,
+    const char *text,
+    const settings_palette_t *palette)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_text(label, text);
+    lv_obj_set_width(label, LV_PCT(90));
+    lv_obj_set_style_text_color(label, lv_color_hex(palette->secondary_text), 0);
+    lv_obj_set_style_pad_left(label, 8, 0);
+    lv_obj_set_style_pad_top(label, 12, 0);
+    return label;
+}
+
+static lv_obj_t *create_card(
+    lv_obj_t *parent,
+    const settings_palette_t *palette)
+{
+    lv_obj_t *card = lv_obj_create(parent);
+    lv_obj_set_width(card, LV_PCT(90));
+    lv_obj_set_height(card, LV_SIZE_CONTENT);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(card, 26, 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(palette->card_bg), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(palette->border), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_shadow_color(card, lv_color_hex(0x0F172A), 0);
+    lv_obj_set_style_shadow_opa(card, palette->dark ? LV_OPA_20 : LV_OPA_10, 0);
+    lv_obj_set_style_shadow_width(card, 16, 0);
+    lv_obj_set_style_shadow_ofs_y(card, 5, 0);
+    lv_obj_set_style_pad_all(card, 20, 0);
+    lv_obj_set_style_pad_row(card, 10, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(
+        card,
+        LV_FLEX_ALIGN_START,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER);
+    return card;
+}
+
+static void create_divider(lv_obj_t *parent, const settings_palette_t *palette)
+{
+    lv_obj_t *divider = lv_obj_create(parent);
+    lv_obj_set_size(divider, LV_PCT(100), 1);
+    lv_obj_remove_flag(divider, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(divider, 0, 0);
+    lv_obj_set_style_border_width(divider, 0, 0);
+    lv_obj_set_style_bg_color(divider, lv_color_hex(palette->border), 0);
+    lv_obj_set_style_bg_opa(divider, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(divider, 0, 0);
+}
+
+static void create_user_row(
+    lv_obj_t *card,
+    const char *name,
+    const settings_palette_t *palette)
+{
+    lv_obj_t *row = lv_obj_create(card);
+    lv_obj_set_size(row, LV_PCT(100), 68);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(row, 18, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(palette->row_bg), 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_left(row, 14, 0);
+    lv_obj_set_style_pad_right(row, 16, 0);
+
+    lv_obj_t *avatar = lv_obj_create(row);
+    lv_obj_set_size(avatar, 44, 44);
+    lv_obj_align(avatar, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_remove_flag(avatar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(avatar, 22, 0);
+    lv_obj_set_style_border_width(avatar, 0, 0);
+    lv_obj_set_style_bg_color(avatar, lv_color_hex(palette->accent), 0);
+
+    char initial[2] = {
+        name[0] != '\0' ? (char)toupper((unsigned char)name[0]) : '?',
+        '\0',
+    };
+    lv_obj_t *initial_label = lv_label_create(avatar);
+    lv_label_set_text(initial_label, initial);
+    lv_obj_set_style_text_color(initial_label, lv_color_white(), 0);
+    lv_obj_center(initial_label);
+
+    lv_obj_t *name_label = lv_label_create(row);
+    lv_label_set_text(name_label, name);
+    lv_obj_set_style_text_color(name_label, lv_color_hex(palette->primary_text), 0);
+    lv_obj_align(name_label, LV_ALIGN_LEFT_MID, 62, 0);
+}
+
+static void create_authorized_users(
+    lv_obj_t *content,
+    const settings_palette_t *palette,
+    const app_settings_authorized_users_t *users,
+    esp_err_t users_ret)
+{
+    create_section_label(content, "AUTHORIZED USERS", palette);
+    lv_obj_t *card = create_card(content, palette);
+
+    lv_obj_t *caption = lv_label_create(card);
+    lv_label_set_text(caption, "Enrollment folders on microSD");
+    lv_obj_set_width(caption, LV_PCT(100));
+    lv_obj_set_style_text_color(caption, lv_color_hex(palette->secondary_text), 0);
+    lv_obj_set_style_pad_bottom(caption, 6, 0);
+
+    if (users_ret != ESP_OK) {
+        lv_obj_t *message = lv_label_create(card);
+        lv_label_set_text(
+            message,
+            users_ret == ESP_ERR_NOT_FOUND
+                ? "No /sdcard/enroll folder found."
+                : "microSD could not be read. Check the card and reopen Settings.");
+        lv_label_set_long_mode(message, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(message, LV_PCT(100));
+        lv_obj_set_style_text_color(message, lv_color_hex(0xDC2626), 0);
+        return;
+    }
+
+    if (users->count == 0) {
+        lv_obj_t *empty = lv_label_create(card);
+        lv_label_set_text(empty, "No authorized users found.");
+        lv_obj_set_style_text_color(empty, lv_color_hex(palette->secondary_text), 0);
+        return;
+    }
+
+    for (size_t index = 0; index < users->count; index++) {
+        create_user_row(card, users->names[index], palette);
+    }
+}
+
+static bool setting_value_for_kind(
+    const app_settings_snapshot_t *settings,
+    settings_toggle_kind_t kind)
+{
+    switch (kind) {
+    case SETTINGS_TOGGLE_THEME:
+        return settings->dark_mode;
+    case SETTINGS_TOGGLE_ETHERNET:
+        return settings->ethernet_enabled;
+    case SETTINGS_TOGGLE_WIFI:
+        return settings->wifi_enabled;
+    case SETTINGS_TOGGLE_CAMERA:
+        return settings->camera_enabled;
+    case SETTINGS_TOGGLE_AUDIO:
+        return settings->audio_enabled;
+    case SETTINGS_TOGGLE_SDCARD:
+        return settings->sdcard_enabled;
+    case SETTINGS_TOGGLE_LIGHT_SLEEP:
+        return settings->light_sleep_enabled;
+    case SETTINGS_TOGGLE_DEEP_SLEEP:
+        return settings->deep_sleep_enabled;
+    }
+
+    return false;
+}
+
+static esp_err_t apply_toggle_setting(
+    settings_toggle_kind_t kind,
+    bool enabled)
+{
+    switch (kind) {
+    case SETTINGS_TOGGLE_THEME:
+        return app_settings_set_dark_mode(enabled);
+    case SETTINGS_TOGGLE_ETHERNET:
+        return app_settings_set_ethernet_enabled(enabled);
+    case SETTINGS_TOGGLE_WIFI:
+        return app_settings_set_wifi_enabled(enabled);
+    case SETTINGS_TOGGLE_CAMERA:
+        return app_settings_set_camera_enabled(enabled);
+    case SETTINGS_TOGGLE_AUDIO:
+        return app_settings_set_audio_enabled(enabled);
+    case SETTINGS_TOGGLE_SDCARD:
+        return app_settings_set_sdcard_enabled(enabled);
+    case SETTINGS_TOGGLE_LIGHT_SLEEP:
+        return app_settings_set_light_sleep_enabled(enabled);
+    case SETTINGS_TOGGLE_DEEP_SLEEP:
+        return app_settings_set_deep_sleep_enabled(enabled);
+    }
+
+    return ESP_ERR_INVALID_ARG;
+}
+
+static const char *toggle_success_message(
+    settings_toggle_kind_t kind,
+    bool enabled)
+{
+    switch (kind) {
+    case SETTINGS_TOGGLE_THEME:
+        return enabled ? "Dark mode saved." : "Light mode saved.";
+    case SETTINGS_TOGGLE_ETHERNET:
+        return enabled
+            ? "Ethernet enabled and saved."
+            : "Ethernet powered down and saved.";
+    case SETTINGS_TOGGLE_WIFI:
+        return enabled
+            ? "Wi-Fi coprocessor enabled and saved."
+            : "Wi-Fi coprocessor disabled and saved.";
+    case SETTINGS_TOGGLE_CAMERA:
+        return enabled
+            ? "Camera enabled; Start Camera is available."
+            : "Camera disabled; its pipeline will remain off.";
+    case SETTINGS_TOGGLE_AUDIO:
+        return enabled
+            ? "Audio codec and amplifier enabled and saved."
+            : "Audio codec and amplifier powered down and saved.";
+    case SETTINGS_TOGGLE_SDCARD:
+        return enabled
+            ? "microSD power enabled, mounted, and saved."
+            : "microSD powers down after required SD access.";
+    case SETTINGS_TOGGLE_LIGHT_SLEEP:
+        return enabled
+            ? "Light-sleep mode enabled and saved."
+            : "Light-sleep mode disabled and saved.";
+    case SETTINGS_TOGGLE_DEEP_SLEEP:
+        return enabled
+            ? "Deep-sleep mode enabled and saved."
+            : "Deep-sleep mode disabled and saved.";
+    }
+
+    return "Setting saved.";
+}
+
+static void sync_toggle_state(lv_obj_t *toggle, bool enabled)
+{
+    if (toggle == NULL) {
+        return;
+    }
+
+    s_switch_update_in_progress = true;
+    if (enabled) {
+        lv_obj_add_state(toggle, LV_STATE_CHECKED);
+    } else {
+        lv_obj_remove_state(toggle, LV_STATE_CHECKED);
+    }
+    s_switch_update_in_progress = false;
+}
+
+static void set_settings_controls_enabled(bool enabled)
+{
+    for (size_t index = 0; index < s_toggle_count; index++) {
+        if (enabled) {
+            lv_obj_remove_state(s_toggles[index], LV_STATE_DISABLED);
+        } else {
+            lv_obj_add_state(s_toggles[index], LV_STATE_DISABLED);
+        }
+    }
+
+    if (s_back_button != NULL) {
+        if (enabled) {
+            lv_obj_remove_state(s_back_button, LV_STATE_DISABLED);
+        } else {
+            lv_obj_add_state(s_back_button, LV_STATE_DISABLED);
+        }
+    }
+}
+
+static void toggle_apply_task(void *arg)
+{
+    (void)arg;
+
+    const settings_toggle_request_t request = s_pending_toggle;
+    const esp_err_t ret = apply_toggle_setting(
+        request.kind,
+        request.requested_enabled);
+    const app_settings_snapshot_t settings = app_settings_get();
+    const bool saved_enabled = setting_value_for_kind(&settings, request.kind);
+    const bool rebuild_theme =
+        ret == ESP_OK && request.kind == SETTINGS_TOGGLE_THEME;
+
+    if (settings_screen_lock() == ESP_OK) {
+        sync_toggle_state(request.toggle, saved_enabled);
+
+        if (ret == ESP_OK) {
+            set_status(
+                toggle_success_message(request.kind, saved_enabled),
+                false);
+        } else {
+            set_status(
+                "Change failed and was not saved. Check the serial log.",
+                true);
+        }
+
+        if (!rebuild_theme) {
+            set_settings_controls_enabled(true);
+            s_toggle_write_in_progress = false;
+        }
+
+        bsp_display_unlock();
+    } else {
+        s_toggle_write_in_progress = false;
+    }
+
+    if (rebuild_theme) {
+        vTaskDelay(pdMS_TO_TICKS(40));
+        settings_screen_create(s_back_callback, s_user_data);
+    }
+
+    vTaskDelete(NULL);
+}
+
+static void toggle_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_VALUE_CHANGED ||
+        s_switch_update_in_progress) {
+        return;
+    }
+
+    lv_obj_t *toggle = lv_event_get_target_obj(event);
+    const settings_toggle_kind_t kind =
+        (settings_toggle_kind_t)(uintptr_t)lv_event_get_user_data(event);
+    const int64_t now_us = esp_timer_get_time();
+
+    if (s_toggle_write_in_progress ||
+        (s_last_toggle_event_us != 0 &&
+         now_us - s_last_toggle_event_us < SETTINGS_TOGGLE_DEBOUNCE_US)) {
+        const app_settings_snapshot_t settings = app_settings_get();
+        sync_toggle_state(toggle, setting_value_for_kind(&settings, kind));
+        return;
+    }
+
+    s_last_toggle_event_us = now_us;
+    s_toggle_write_in_progress = true;
+    s_pending_toggle.toggle = toggle;
+    s_pending_toggle.kind = kind;
+    s_pending_toggle.requested_enabled =
+        lv_obj_has_state(toggle, LV_STATE_CHECKED);
+
+    set_settings_controls_enabled(false);
+    set_status("Applying and saving setting...", false);
+
+    BaseType_t created = xTaskCreate(
+        toggle_apply_task,
+        "settings_apply",
+        6144,
+        NULL,
+        5,
+        NULL);
+
+    if (created != pdPASS) {
+        const app_settings_snapshot_t settings = app_settings_get();
+        sync_toggle_state(toggle, setting_value_for_kind(&settings, kind));
+        set_settings_controls_enabled(true);
+        s_toggle_write_in_progress = false;
+        set_status("Could not start the settings worker. Try again.", true);
+    }
+}
+
+static lv_obj_t *create_toggle_row(
+    lv_obj_t *card,
+    const char *title,
+    const char *detail,
+    bool enabled,
+    settings_toggle_kind_t kind,
+    const settings_palette_t *palette)
+{
+    lv_obj_t *row = lv_obj_create(card);
+    lv_obj_set_size(row, LV_PCT(100), 92);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(row, 0, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_left(row, 4, 0);
+    lv_obj_set_style_pad_right(row, 4, 0);
+
+    lv_obj_t *title_label = lv_label_create(row);
+    lv_label_set_text(title_label, title);
+    lv_obj_set_style_text_color(title_label, lv_color_hex(palette->primary_text), 0);
+    lv_obj_align(title_label, LV_ALIGN_LEFT_MID, 0, -13);
+
+    lv_obj_t *detail_label = lv_label_create(row);
+    lv_label_set_text(detail_label, detail);
+    lv_label_set_long_mode(detail_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(detail_label, LV_PCT(70));
+    lv_obj_set_style_text_color(detail_label, lv_color_hex(palette->secondary_text), 0);
+    lv_obj_align(detail_label, LV_ALIGN_LEFT_MID, 0, 16);
+
+    lv_obj_t *toggle = lv_switch_create(row);
+    lv_obj_set_size(toggle, 96, 52);
+    lv_obj_set_ext_click_area(toggle, 16);
+    lv_obj_align(toggle, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_bg_color(toggle, lv_color_hex(palette->border), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(
+        toggle,
+        lv_color_hex(palette->accent),
+        LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(toggle, lv_color_white(), LV_PART_KNOB);
+
+    if (enabled) {
+        lv_obj_add_state(toggle, LV_STATE_CHECKED);
+    }
+
+    lv_obj_add_event_cb(
+        toggle,
+        toggle_event_cb,
+        LV_EVENT_VALUE_CHANGED,
+        (void *)(uintptr_t)kind);
+
+    if (s_toggle_count < SETTINGS_TOGGLE_CAPACITY) {
+        s_toggles[s_toggle_count++] = toggle;
+    }
+
+    return toggle;
+}
+
+static void back_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_PRESSED || s_navigation_dispatched) {
+        return;
+    }
+
+    if (s_toggle_write_in_progress) {
+        set_status("Please wait for the current setting to finish.", false);
+        return;
+    }
+
+    s_navigation_dispatched = true;
+    ESP_LOGI(TAG, "Back pressed; returning to launcher");
+
+    if (s_back_callback) {
+        s_back_callback(s_user_data);
+    }
+}
+
+void settings_screen_create(
+    settings_screen_back_callback_t back_callback,
+    void *user_data)
+{
+    s_back_callback = back_callback;
+    s_user_data = user_data;
+    s_navigation_dispatched = false;
+    s_switch_update_in_progress = false;
+    s_toggle_write_in_progress = false;
+    s_last_toggle_event_us = 0;
+    s_back_button = NULL;
+    s_toggle_count = 0;
+
+    /* Required fresh read: this function is called for every Settings press. */
+    app_settings_authorized_users_t users;
+    const esp_err_t users_ret = app_settings_load_authorized_users(&users);
+    const app_settings_snapshot_t settings = app_settings_get();
+    const settings_palette_t palette = palette_for(settings.dark_mode);
+
+    if (settings_screen_lock() != ESP_OK) {
+        return;
+    }
+
+    lv_obj_t *screen = lv_screen_active();
+    lv_obj_clean(screen);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(palette.screen_bg), 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *header = lv_obj_create(screen);
+    lv_obj_set_size(header, LV_PCT(100), 112);
+    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_remove_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(header, 0, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_bg_color(header, lv_color_hex(palette.header_bg), 0);
+    lv_obj_set_style_bg_opa(header, LV_OPA_COVER, 0);
+
+    s_back_button = lv_button_create(header);
+    lv_obj_set_size(s_back_button, 76, 62);
+    lv_obj_align(s_back_button, LV_ALIGN_LEFT_MID, 28, 0);
+    lv_obj_set_style_radius(s_back_button, 20, 0);
+    lv_obj_set_style_bg_color(s_back_button, lv_color_hex(palette.card_bg), 0);
+    lv_obj_set_style_bg_color(
+        s_back_button,
+        lv_color_hex(palette.row_bg),
+        LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(s_back_button, lv_color_hex(palette.border), 0);
+    lv_obj_set_style_border_width(s_back_button, 1, 0);
+    lv_obj_add_event_cb(s_back_button, back_event_cb, LV_EVENT_PRESSED, NULL);
+
+    lv_obj_t *back_label = lv_label_create(s_back_button);
+    lv_label_set_text(back_label, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_label, lv_color_hex(palette.primary_text), 0);
+    lv_obj_center(back_label);
+
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "Settings");
+    lv_obj_set_style_text_color(title, lv_color_hex(palette.primary_text), 0);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, -10);
+
+    lv_obj_t *subtitle = lv_label_create(header);
+    lv_label_set_text(subtitle, "Device preferences and power policy");
+    lv_obj_set_style_text_color(subtitle, lv_color_hex(palette.secondary_text), 0);
+    lv_obj_align(subtitle, LV_ALIGN_CENTER, 0, 20);
+
+    lv_obj_t *content = lv_obj_create(screen);
+    lv_obj_set_size(content, LV_PCT(100), LV_PCT(91));
+    lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_radius(content, 0, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_top(content, 30, 0);
+    lv_obj_set_style_pad_bottom(content, 44, 0);
+    lv_obj_set_style_pad_row(content, 14, 0);
+    lv_obj_set_scroll_dir(content, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_ACTIVE);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(
+        content,
+        LV_FLEX_ALIGN_START,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER);
+
+    create_authorized_users(content, &palette, &users, users_ret);
+
+    create_section_label(content, "THEME", &palette);
+    lv_obj_t *theme_card = create_card(content, &palette);
+    create_toggle_row(
+        theme_card,
+        "Dark Mode",
+        "Light mode is the default",
+        settings.dark_mode,
+        SETTINGS_TOGGLE_THEME,
+        &palette);
+
+    create_section_label(content, "POWER MANAGEMENT", &palette);
+    lv_obj_t *power_card = create_card(content, &palette);
+    create_toggle_row(
+        power_card,
+        "Ethernet",
+        "IP101GRI PHY",
+        settings.ethernet_enabled,
+        SETTINGS_TOGGLE_ETHERNET,
+        &palette);
+    create_divider(power_card, &palette);
+    create_toggle_row(
+        power_card,
+        "Wi-Fi",
+        "ESP32-C6 coprocessor",
+        settings.wifi_enabled,
+        SETTINGS_TOGGLE_WIFI,
+        &palette);
+    create_divider(power_card, &palette);
+    create_toggle_row(
+        power_card,
+        "Camera",
+        "OV5647 capture and AI pipeline",
+        settings.camera_enabled,
+        SETTINGS_TOGGLE_CAMERA,
+        &palette);
+    create_divider(power_card, &palette);
+    create_toggle_row(
+        power_card,
+        "Audio",
+        "ES8311 codec and NS4150B amplifier",
+        settings.audio_enabled,
+        SETTINGS_TOGGLE_AUDIO,
+        &palette);
+    create_divider(power_card, &palette);
+    create_toggle_row(
+        power_card,
+        "microSD",
+        "GPIO45-controlled SD1_VDD rail",
+        settings.sdcard_enabled,
+        SETTINGS_TOGGLE_SDCARD,
+        &palette);
+
+    create_section_label(content, "POWER MODES", &palette);
+    lv_obj_t *power_modes_card = create_card(content, &palette);
+    create_toggle_row(
+        power_modes_card,
+        "Light Sleep",
+        "Reversible; touch or GPIO3 returns to Active",
+        settings.light_sleep_enabled,
+        SETTINGS_TOGGLE_LIGHT_SLEEP,
+        &palette);
+    create_divider(power_modes_card, &palette);
+    create_toggle_row(
+        power_modes_card,
+        "Deep Sleep",
+        "When both are ON, starts 10 s after Light Sleep",
+        settings.deep_sleep_enabled,
+        SETTINGS_TOGGLE_DEEP_SLEEP,
+        &palette);
+
+    s_status_label = lv_label_create(content);
+    lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_status_label, LV_PCT(86));
+    lv_obj_set_style_text_align(s_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_top(s_status_label, 8, 0);
+
+    if (users_ret == ESP_OK) {
+        char refresh_status[128];
+        snprintf(
+            refresh_status,
+            sizeof(refresh_status),
+            settings.sdcard_enabled
+                ? "%u authorized user%s refreshed from microSD."
+                : "%u authorized user%s refreshed; microSD returned to OFF.",
+            (unsigned)users.count,
+            users.count == 1 ? "" : "s");
+        set_status(refresh_status, false);
+    } else {
+        set_status("Authorized-user refresh failed. Power settings remain available.", true);
+    }
+
+    bsp_display_unlock();
+}
+
+void settings_screen_destroy(void)
+{
+    if (settings_screen_lock() != ESP_OK) {
+        return;
+    }
+
+    lv_obj_clean(lv_screen_active());
+    s_status_label = NULL;
+    s_back_button = NULL;
+    s_toggle_count = 0;
+    s_back_callback = NULL;
+    s_user_data = NULL;
+    s_navigation_dispatched = false;
+    s_switch_update_in_progress = false;
+    s_toggle_write_in_progress = false;
+
+    bsp_display_unlock();
+}
+
+
+==================================================
+FILE: src/main/ui/settings_screen.h
+==================================================
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef void (*settings_screen_back_callback_t)(void *user_data);
+
+/**
+ * Create Settings and perform a fresh /sdcard/enroll scan for authorized users.
+ */
+void settings_screen_create(
+    settings_screen_back_callback_t back_callback,
+    void *user_data);
+
+/** Remove all Settings objects before returning to the launcher. */
+void settings_screen_destroy(void);
 
 #ifdef __cplusplus
 }
