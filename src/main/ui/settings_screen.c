@@ -19,14 +19,12 @@ typedef enum {
     SETTINGS_TOGGLE_THEME,
     SETTINGS_TOGGLE_ETHERNET,
     SETTINGS_TOGGLE_WIFI,
-    SETTINGS_TOGGLE_CAMERA,
     SETTINGS_TOGGLE_AUDIO,
-    SETTINGS_TOGGLE_SDCARD,
     SETTINGS_TOGGLE_LIGHT_SLEEP,
     SETTINGS_TOGGLE_DEEP_SLEEP,
 } settings_toggle_kind_t;
 
-#define SETTINGS_TOGGLE_CAPACITY       8U
+#define SETTINGS_TOGGLE_CAPACITY       6U
 #define SETTINGS_TOGGLE_DEBOUNCE_US    250000LL
 
 typedef struct {
@@ -249,12 +247,8 @@ static bool setting_value_for_kind(
         return settings->ethernet_enabled;
     case SETTINGS_TOGGLE_WIFI:
         return settings->wifi_enabled;
-    case SETTINGS_TOGGLE_CAMERA:
-        return settings->camera_enabled;
     case SETTINGS_TOGGLE_AUDIO:
         return settings->audio_enabled;
-    case SETTINGS_TOGGLE_SDCARD:
-        return settings->sdcard_enabled;
     case SETTINGS_TOGGLE_LIGHT_SLEEP:
         return settings->light_sleep_enabled;
     case SETTINGS_TOGGLE_DEEP_SLEEP:
@@ -275,12 +269,8 @@ static esp_err_t apply_toggle_setting(
         return app_settings_set_ethernet_enabled(enabled);
     case SETTINGS_TOGGLE_WIFI:
         return app_settings_set_wifi_enabled(enabled);
-    case SETTINGS_TOGGLE_CAMERA:
-        return app_settings_set_camera_enabled(enabled);
     case SETTINGS_TOGGLE_AUDIO:
         return app_settings_set_audio_enabled(enabled);
-    case SETTINGS_TOGGLE_SDCARD:
-        return app_settings_set_sdcard_enabled(enabled);
     case SETTINGS_TOGGLE_LIGHT_SLEEP:
         return app_settings_set_light_sleep_enabled(enabled);
     case SETTINGS_TOGGLE_DEEP_SLEEP:
@@ -305,18 +295,10 @@ static const char *toggle_success_message(
         return enabled
             ? "Wi-Fi coprocessor enabled and saved."
             : "Wi-Fi coprocessor disabled and saved.";
-    case SETTINGS_TOGGLE_CAMERA:
-        return enabled
-            ? "Camera enabled; Start Camera is available."
-            : "Camera disabled; its pipeline will remain off.";
     case SETTINGS_TOGGLE_AUDIO:
         return enabled
             ? "Audio codec and amplifier enabled and saved."
             : "Audio codec and amplifier powered down and saved.";
-    case SETTINGS_TOGGLE_SDCARD:
-        return enabled
-            ? "microSD power enabled, mounted, and saved."
-            : "microSD powers down after required SD access.";
     case SETTINGS_TOGGLE_LIGHT_SLEEP:
         return enabled
             ? "Light-sleep mode enabled and saved."
@@ -647,26 +629,10 @@ void settings_screen_create(
     create_divider(power_card, &palette);
     create_toggle_row(
         power_card,
-        "Camera",
-        "OV5647 capture and AI pipeline",
-        settings.camera_enabled,
-        SETTINGS_TOGGLE_CAMERA,
-        &palette);
-    create_divider(power_card, &palette);
-    create_toggle_row(
-        power_card,
         "Audio",
         "ES8311 codec and NS4150B amplifier",
         settings.audio_enabled,
         SETTINGS_TOGGLE_AUDIO,
-        &palette);
-    create_divider(power_card, &palette);
-    create_toggle_row(
-        power_card,
-        "microSD",
-        "GPIO45-controlled SD1_VDD rail",
-        settings.sdcard_enabled,
-        SETTINGS_TOGGLE_SDCARD,
         &palette);
 
     create_section_label(content, "POWER MODES", &palette);
