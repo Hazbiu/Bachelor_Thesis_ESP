@@ -121,6 +121,89 @@ static esp_err_t write_marker(const char *path, const char *text)
     return ESP_OK;
 }
 
+static bool sleep_marker_is_verified_v2(void)
+{
+    FILE *f = fopen(SLEEP_FLASHED_PATH, "r");
+    if (f == NULL) {
+        return false;
+    }
+
+    char line[160] = {0};
+    const bool ok =
+        fgets(line, sizeof(line), f) != NULL &&
+        strstr(line, "verified-image-v2") != NULL;
+
+    fclose(f);
+    return ok;
+}
+
+
+static esp_loader_error_t verify_flash_memory_image(
+    const uint8_t *expected,
+    uint32_t image_size,
+    uint32_t flash_offset,
+    bool *matches_out)
+{
+    if (expected == NULL || matches_out == NULL || image_size == 0) {
+        return ESP_LOADER_ERROR_INVALID_PARAM;
+    }
+
+    *matches_out = false;
+
+    uint8_t *buffer = malloc(IO_CHUNK_SIZE);
+    if (buffer == NULL) {
+        ESP_LOGE(TAG, "Could not allocate C6 verification buffer");
+        return ESP_LOADER_ERROR_FAIL;
+    }
+
+    esp_loader_error_t result = ESP_LOADER_SUCCESS;
+
+    for (uint32_t offset = 0; offset < image_size; offset += IO_CHUNK_SIZE) {
+        const uint32_t amount =
+            (image_size - offset > IO_CHUNK_SIZE)
+                ? IO_CHUNK_SIZE
+                : image_size - offset;
+
+        result = esp_loader_flash_read(
+            &s_loader,
+            buffer,
+            flash_offset + offset,
+            amount);
+
+        if (result != ESP_LOADER_SUCCESS) {
+            ESP_LOGE(
+                TAG,
+                "C6 readback verification failed at 0x%08" PRIx32 ": %d",
+                flash_offset + offset,
+                (int)result);
+            break;
+        }
+
+        if (memcmp(buffer, expected + offset, amount) != 0) {
+            ESP_LOGW(
+                TAG,
+                "C6 readback differs from embedded sleep image at "
+                "0x%08" PRIx32,
+                flash_offset + offset);
+            result = ESP_LOADER_SUCCESS;
+            free(buffer);
+            return result;
+        }
+    }
+
+    free(buffer);
+
+    if (result == ESP_LOADER_SUCCESS) {
+        *matches_out = true;
+        ESP_LOGW(
+            TAG,
+            "C6 READBACK VERIFY COMPLETE: embedded sleep image matches flash");
+    }
+
+    return result;
+}
+
+
 static bool security_is_safe_for_diagnostic(
     const esp_loader_target_security_info_t *info)
 {
@@ -586,12 +669,48 @@ void app_main(void)
         flash_size);
 
     /*
-     * Safety gate #2: after a successful sleep firmware write, do not write it
-     * repeatedly on every P4 reset.
+     * Safety gate #2, hardened:
+     *
+     * The old implementation trusted /sdcard/C6SLEEP.TXT by itself. That file
+     * could outlive the actual C6 contents, causing a stale marker to suppress
+     * the very reflash needed for a power-regression test.
+     *
+     * Legacy markers are intentionally treated as unverified and force one
+     * real rewrite. A v2 marker is trusted only after the C6 flash is read back
+     * and byte-compared against the currently embedded merged image.
      */
     if (file_exists(SLEEP_FLASHED_PATH)) {
-        ESP_LOGW(TAG, "C6 sleep firmware was already marked as flashed.");
-        stop_forever("no further write required");
+        if (!sleep_marker_is_verified_v2()) {
+            ESP_LOGW(
+                TAG,
+                "Legacy C6 sleep marker found. It does not prove the current "
+                "C6 contents; forcing one real reflash.");
+            (void)unlink(SLEEP_FLASHED_PATH);
+        } else {
+            bool flash_matches = false;
+            err = verify_flash_memory_image(
+                c6_merged_start,
+                sleep_image_size,
+                0,
+                &flash_matches);
+
+            if (err != ESP_LOADER_SUCCESS) {
+                stop_forever("C6 readback verification failed");
+            }
+
+            if (flash_matches) {
+                ESP_LOGW(
+                    TAG,
+                    "C6 sleep firmware verified in flash; no rewrite required.");
+                stop_forever("verified C6 sleep image already installed");
+            }
+
+            ESP_LOGW(
+                TAG,
+                "C6 v2 marker exists but flash content does not match. "
+                "Removing marker and reflashing.");
+            (void)unlink(SLEEP_FLASHED_PATH);
+        }
     }
 
     /*
@@ -610,11 +729,31 @@ void app_main(void)
         stop_forever("C6 sleep firmware flash failed");
     }
 
+    /*
+     * Do an explicit byte-for-byte readback in addition to the flasher's MD5
+     * verification before creating the persistent marker.
+     */
+    bool flash_matches_after_write = false;
+    err = verify_flash_memory_image(
+        c6_merged_start,
+        sleep_image_size,
+        0,
+        &flash_matches_after_write);
+
+    if (err != ESP_LOADER_SUCCESS || !flash_matches_after_write) {
+        ESP_LOGE(
+            TAG,
+            "C6 post-write readback did not match the embedded sleep image.");
+        (void)unlink(SLEEP_FLASHED_PATH);
+        stop_forever("C6 post-write verification failed");
+    }
+
     if (write_marker(
             SLEEP_FLASHED_PATH,
-            "C6 self-Deep-sleep merged image flashed and MD5 verified.")
+            "verified-image-v2: C6 self-Deep-sleep merged image "
+            "flashed, MD5 verified, and byte-readback verified.")
         != ESP_OK) {
-        ESP_LOGW(TAG, "Could not write flash-complete marker to SD");
+        ESP_LOGW(TAG, "Could not write verified flash-complete marker to SD");
     }
 
     ESP_LOGW(TAG, "====================================================");
