@@ -14,13 +14,20 @@
 #include "esp_system.h"
 #include "driver/ppa.h"
 #include "platform/camera/video_capture.h"
+#include "platform/camera/camera_runtime.h"
+#include "platform/display/display_platform.h"
 #include "services/vision/face_detector.h"
 #include "services/vision/face_recognizer.h"
 #include "services/vision/recognition_policy.h"
 #include "services/vision/face_geometry.h"
+#include "services/vision/face_detection_result_processor.h"
+#include "services/vision/face_recognition_result_processor.h"
 #include "services/vision/face_result_store.h"
-#include "services/vision/ai_snapshot.h"
+#include "services/vision/ai_snapshot_buffer.h"
+#include "services/vision/ai_snapshot_scheduler.h"
 #include "services/vision/ai_worker_state.h"
+#include "services/vision/ai_worker_runtime.h"
+#include "services/vision/ai_inference_guard.h"
 #include "diagnostics/core_trace.h"
 #include "diagnostics/app_logging.h"
 #include "diagnostics/cpu_stats.h"
@@ -113,19 +120,6 @@ static uint32_t frame_count = 0;
  * one snapshot slot: while AI is busy, newer camera frames are displayed but
  * intentionally dropped from the AI path. This prevents an old-frame queue.
  */
-static uint8_t *ai_snapshot_buffer = NULL;
-static size_t ai_snapshot_capacity = 0;
-static TaskHandle_t ai_worker_task_handle = NULL;
-/*
- * Serialize the complete detector -> recognizer inference chain.
- *
- * Both AI backends (ESP-DL and TFLM-FP32) enter through the same public
- * face_detect_* / face_recognition_* APIs below, so one mutex guarantees that
- * detector and recognizer can never overlap or be invoked out of order.
- */
-static SemaphoreHandle_t ai_inference_mutex = NULL;
-
-i2c_master_bus_handle_t i2c_bus_;
 
 static bool dummy_draw_enabled = false;
 static bool application_start_requested = false;
@@ -540,7 +534,7 @@ static void ai_worker_task(void *arg)
              xPortGetCoreID(), pcTaskGetName(NULL));
 
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        vision_ai_worker_runtime_wait_for_notification();
 
         vision_ai_worker_job_t job = {0};
 
@@ -559,8 +553,7 @@ static void ai_worker_task(void *arg)
          * this ordering and high-performance policy applies identically to both
          * backend selections.
          */
-        if (ai_inference_mutex == NULL ||
-            xSemaphoreTake(ai_inference_mutex, portMAX_DELAY) != pdTRUE) {
+        if (!vision_ai_inference_guard_lock()) {
             ESP_LOGE(TAG, "Could not acquire AI inference mutex");
             vision_ai_worker_state_mark_idle();
             continue;
@@ -578,27 +571,21 @@ static void ai_worker_task(void *arg)
                      esp_err_to_name(boost_ret));
         }
 
-        if (data_cache_line_size > 0 && job.data_size > 0) {
-            const size_t sync_size = ALIGN_UP(job.data_size, data_cache_line_size);
-            (void)esp_cache_msync(
-                ai_snapshot_buffer,
-                sync_size,
-                ESP_CACHE_MSYNC_FLAG_DIR_M2C);
-        }
+        vision_ai_snapshot_buffer_sync_memory_to_cpu(job.data_size);
 
         face_box_t snapshot_boxes[APP_MAX_FACE_BOXES] = {0};
         diagnostics_ai_frame_sent_to_detector();
 
 #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
         const int face_count = face_detect_run_rgb565(
-            ai_snapshot_buffer,
+            vision_ai_snapshot_buffer_data(),
             job.width,
             job.height,
             snapshot_boxes,
             APP_MAX_FACE_BOXES);
 #else
         const int face_count = face_detect_run_rgb888(
-            ai_snapshot_buffer,
+            vision_ai_snapshot_buffer_data(),
             job.width,
             job.height,
             snapshot_boxes,
@@ -620,7 +607,7 @@ static void ai_worker_task(void *arg)
                 face_boost_release("face left camera");
             }
             face_boost_release("detector completed with no face");
-            xSemaphoreGive(ai_inference_mutex);
+            vision_ai_inference_guard_unlock();
             vision_ai_worker_state_mark_idle();
             continue;
         }
@@ -638,60 +625,28 @@ static void ai_worker_task(void *arg)
             idle_scan_display_is_suspended() ? 1 : 0);
 #endif
 
-        int update_count = face_count;
-        if (update_count > APP_MAX_FACE_BOXES) update_count = APP_MAX_FACE_BOXES;
-
-        face_box_t source_boxes[APP_MAX_FACE_BOXES] = {0};
-        for (int i = 0; i < update_count; i++) {
-            vision_face_geometry_scale_box_to_source(
-                &snapshot_boxes[i],
+        const int update_count =
+            vision_face_detection_result_process_and_publish(
+                snapshot_boxes,
+                face_count,
                 job.width,
                 job.height,
                 job.source_width,
-                job.source_height,
-                &source_boxes[i]);
-
-#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
-            vision_face_geometry_expand_box_for_display(
-                &source_boxes[i],
-                job.source_width,
-                job.source_height,
-                APP_TFLM_INT8_DISPLAY_BOX_MARGIN_RATIO);
-#endif
-
-            ESP_LOGI(TAG,
-                     "Face %d score=%.2f box=[%d,%d,%d,%d]",
-                     i,
-                     snapshot_boxes[i].score,
-                     source_boxes[i].x1,
-                     source_boxes[i].y1,
-                     source_boxes[i].x2,
-                     source_boxes[i].y2);
-        }
-
-        /* Publish red boxes immediately; recognition may take many seconds. */
-        vision_face_result_store_publish_detected_boxes(source_boxes, update_count, true);
+                job.source_height);
 
         if (job.idle_scan_frame || idle_scan_display_is_suspended()) {
             ESP_LOGI(TAG,
                      "IDLE-SCAN face detected; recognition deferred until display restore");
             face_boost_release("IDLE-SCAN detector completed");
-            xSemaphoreGive(ai_inference_mutex);
+            vision_ai_inference_guard_unlock();
             vision_ai_worker_state_mark_idle();
             continue;
         }
 
-#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
-        /*
-         * Every accepted INT8 face should immediately enter MobileFaceNet.
-         * The detector already runs asynchronously on CPU1 and the existing
-         * mutex/360-MHz lock stays held through this recognition call.
-         */
-        const bool run_recognition = true;
-#else
         const bool run_recognition =
-            (job.frame_id % APP_FACE_RECOG_INTERVAL_FRAMES) == 0;
-#endif
+            vision_recognition_policy_should_run_frame(
+                job.frame_id,
+                APP_FACE_RECOG_INTERVAL_FRAMES);
         bool pin_transition_requested = false;
 
         if (run_recognition) {
@@ -741,7 +696,7 @@ static void ai_worker_task(void *arg)
                 }
 
                 esp_err_t recog_ret = face_recognition_recognize(
-                    ai_snapshot_buffer,
+                    vision_ai_snapshot_buffer_data(),
                     job.width,
                     job.height,
                     &snapshot_boxes[i],
@@ -751,12 +706,12 @@ static void ai_worker_task(void *arg)
 
                 diagnostics_ai_recognition_result(recog_ret, name, recog_score);
 
-                if (recog_ret != ESP_OK) {
-                    snprintf(name, sizeof(name), "%s", "unknown");
-                    recog_score = 0.0f;
-                }
-
-                vision_face_result_store_publish_recognition_result(i, name, recog_score);
+                vision_face_recognition_result_normalize_and_publish(
+                    i,
+                    recog_ret,
+                    name,
+                    sizeof(name),
+                    &recog_score);
 
                 if (recog_ret == ESP_OK && authentication_request_pin(name)) {
                     pin_transition_requested = true;
@@ -800,106 +755,13 @@ static void ai_worker_task(void *arg)
                     : "detector completed without recognition");
         }
 
-        xSemaphoreGive(ai_inference_mutex);
+        vision_ai_inference_guard_unlock();
         vision_ai_worker_state_mark_idle();
 
         if (pin_transition_requested) {
             (void)authentication_launch_pin_transition();
         }
     }
-}
-
-static bool schedule_ai_snapshot(
-    const uint8_t *camera_buf,
-    size_t camera_buf_len,
-    uint32_t camera_width,
-    uint32_t camera_height,
-    uint32_t current_frame,
-    bool idle_scan_frame)
-{
-    if (ai_worker_task_handle == NULL || ai_snapshot_buffer == NULL ||
-        camera_buf == NULL || camera_width == 0 || camera_height == 0) {
-        return false;
-    }
-
-    if (!vision_ai_worker_state_try_reserve()) {
-        return false;
-    }
-
-    uint32_t snapshot_width = 0;
-    uint32_t snapshot_height = 0;
-    vision_ai_snapshot_dimensions(
-        camera_width,
-        camera_height,
-        &snapshot_width,
-        &snapshot_height);
-
-    size_t written_bytes = 0;
-    if (!vision_ai_snapshot_copy(
-            camera_buf,
-            camera_buf_len,
-            camera_width,
-            camera_height,
-            ai_snapshot_buffer,
-            ai_snapshot_capacity,
-            snapshot_width,
-            snapshot_height,
-            &written_bytes)) {
-        vision_ai_worker_state_cancel_reservation();
-        ESP_LOGE(TAG, "Could not copy camera frame into AI snapshot");
-        return false;
-    }
-
-    if (data_cache_line_size > 0) {
-        const size_t sync_size = ALIGN_UP(written_bytes, data_cache_line_size);
-        (void)esp_cache_msync(
-            ai_snapshot_buffer,
-            sync_size,
-            ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-    }
-
-    const vision_ai_worker_job_t job = {
-        .frame_id = current_frame,
-        .source_width = camera_width,
-        .source_height = camera_height,
-        .width = snapshot_width,
-        .height = snapshot_height,
-        .data_size = written_bytes,
-        .idle_scan_frame = idle_scan_frame,
-    };
-
-    vision_ai_worker_state_commit_job(&job);
-
-    xTaskNotifyGive(ai_worker_task_handle);
-    return true;
-}
-
-/*
- * Remove LVGL's performance and memory labels before the camera preview is
- * shown. Dummy draw mode then keeps LVGL from rendering over the video path.
- *
- * Keep these disabled in sdkconfig as well:
- *     CONFIG_LV_USE_PERF_MONITOR=n
- *     CONFIG_LV_USE_MEM_MONITOR=n
- */
-static void display_disable_lvgl_overlays(void)
-{
-#if LV_USE_SYSMON
-    if (bsp_display_lock(1000) != ESP_OK) {
-        ESP_LOGW(TAG, "Could not lock LVGL to hide system overlays");
-        return;
-    }
-
-#if LV_USE_PERF_MONITOR && LV_VERSION_CHECK(9, 2, 0)
-    lv_sysmon_hide_performance(disp);
-#endif
-
-#if LV_USE_MEM_MONITOR && LV_VERSION_CHECK(9, 2, 0)
-    lv_sysmon_hide_memory(disp);
-#endif
-
-    bsp_display_unlock();
-#endif
 }
 
 static void prepare_application_for_sleep(void *user_data)
@@ -972,14 +834,14 @@ static void idle_scan_touch_poll_task(void *arg)
 
     /* Discard a coordinate consumed immediately before LVGL was stopped. */
     bool touched = false;
-    (void)bsp_touch_poll_for_light_sleep(&touched);
+    (void)display_platform_poll_touch_for_light_sleep(&touched);
 
     while (idle_scan_display_is_suspended() &&
            !display_suspended_for_light_sleep &&
            !app_sleep_is_requested()) {
         vTaskDelay(pdMS_TO_TICKS(APP_LIGHT_SLEEP_TOUCH_POLL_MS));
 
-        esp_err_t ret = bsp_touch_poll_for_light_sleep(&touched);
+        esp_err_t ret = display_platform_poll_touch_for_light_sleep(&touched);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "IDLE-SCAN touch polling failed: %s",
                      esp_err_to_name(ret));
@@ -1022,10 +884,10 @@ static esp_err_t suspend_display_for_idle_scan(void *user_data)
     ESP_LOGI(TAG, "IDLE-SCAN suspending LVGL and MIPI-DSI; camera stays active");
 
     dummy_mode_delay_flag = true;
-    bsp_display_backlight_off();
+    display_platform_backlight_off();
     display_backlight_enabled = false;
 
-    esp_err_t ret = bsp_display_suspend_for_light_sleep();
+    esp_err_t ret = display_platform_suspend_for_light_sleep();
     if (ret != ESP_OK) {
         xSemaphoreGive(display_mode_mutex);
         ESP_LOGE(TAG, "IDLE-SCAN display suspend failed: %s",
@@ -1116,7 +978,7 @@ static void resume_display_from_idle_scan_task(void *arg)
     }
 
     log_psram_state("before_bsp_display_resume");
-    disp = bsp_display_resume_from_light_sleep();
+    disp = display_platform_resume_from_light_sleep();
     if (disp == NULL) {
         ESP_LOGE(TAG, "ACTIVE display restoration failed");
         xSemaphoreGive(display_mode_mutex);
@@ -1125,7 +987,7 @@ static void resume_display_from_idle_scan_task(void *arg)
 
     log_psram_state("after_bsp_display_resume");
     vTaskDelay(pdMS_TO_TICKS(150));
-    launcher_touch_indev = bsp_display_get_input_dev();
+    launcher_touch_indev = display_platform_get_input_device();
 
     ret = allocate_display_buffers();
     if (ret != ESP_OK) {
@@ -1145,7 +1007,7 @@ static void resume_display_from_idle_scan_task(void *arg)
 
     dummy_draw_enabled = true;
     display_buffer_index = 0;
-    display_disable_lvgl_overlays();
+    display_platform_disable_lvgl_overlays(disp);
     vision_face_result_store_clear();
 
     ret = app_video_stream_task_restart(video_cam_fd0);
@@ -1294,7 +1156,7 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
             xSemaphoreGive(display_mode_mutex);
             return ESP_ERR_INVALID_STATE;
         }
-        ret = bsp_display_suspend_for_light_sleep();
+        ret = display_platform_suspend_for_light_sleep();
         if (ret == ESP_OK) {
             trim_display_buffers_for_sleep();
         }
@@ -1359,7 +1221,7 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
     ESP_LOGI(TAG, "Restoring MIPI-DSI and camera after Light-sleep activity");
 
     log_psram_state("before_bsp_display_resume");
-    disp = bsp_display_resume_from_light_sleep();
+    disp = display_platform_resume_from_light_sleep();
     if (disp == NULL) {
         ESP_LOGE(TAG, "Display reinitialization after Light-sleep failed");
         xSemaphoreGive(display_mode_mutex);
@@ -1368,7 +1230,7 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
 
     log_psram_state("after_bsp_display_resume");
     vTaskDelay(pdMS_TO_TICKS(150));
-    launcher_touch_indev = bsp_display_get_input_dev();
+    launcher_touch_indev = display_platform_get_input_device();
 
     esp_err_t ret = allocate_display_buffers();
     if (ret != ESP_OK) {
@@ -1390,7 +1252,7 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
 
     dummy_draw_enabled = true;
     display_buffer_index = 0;
-    display_disable_lvgl_overlays();
+    display_platform_disable_lvgl_overlays(disp);
 
     ret = app_video_restore_sensor_after_light_sleep();
     if (ret != ESP_OK) {
@@ -1550,15 +1412,13 @@ static void camera_application_start_task(void *arg)
     }
 
     lcd_fb_size = ALIGN_UP(
-        (size_t)BSP_LCD_H_RES * BSP_LCD_V_RES *
+        (size_t)display_platform_width() * display_platform_height() *
             (APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? 2 : 3),
         data_cache_line_size);
 
     app_ui_set_status("Opening camera...");
 
-    i2c_bus_ = bsp_i2c_get_handle();
-
-    ret = app_video_main(i2c_bus_);
+    ret = camera_runtime_initialize();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Video initialization failed: %s", esp_err_to_name(ret));
         app_ui_show_error("Camera initialization failed. Restart the device.");
@@ -1615,42 +1475,29 @@ static void camera_application_start_task(void *arg)
         return;
     }
 
-    const size_t ai_snapshot_raw_capacity =
-        (size_t)APP_AI_SNAPSHOT_MAX_EDGE * APP_AI_SNAPSHOT_MAX_EDGE *
-        vision_ai_snapshot_bytes_per_pixel();
-    ai_snapshot_capacity = ALIGN_UP(ai_snapshot_raw_capacity, data_cache_line_size);
-    ai_snapshot_buffer = heap_caps_aligned_calloc(
-        data_cache_line_size,
-        1,
-        ai_snapshot_capacity,
-        MALLOC_CAP_SPIRAM);
-
-    if (ai_snapshot_buffer == NULL) {
+    if (vision_ai_snapshot_buffer_init(data_cache_line_size) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to allocate %u-byte AI snapshot buffer",
-                 (unsigned)ai_snapshot_capacity);
+                 (unsigned)vision_ai_snapshot_buffer_capacity());
         app_ui_show_error("AI snapshot allocation failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
-    ai_inference_mutex = xSemaphoreCreateMutex();
-    if (ai_inference_mutex == NULL) {
+    if (vision_ai_inference_guard_init() != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create AI inference mutex");
         app_ui_show_error("AI synchronization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
-    BaseType_t ai_created = xTaskCreatePinnedToCore(
+    bool ai_created = vision_ai_worker_runtime_start(
         ai_worker_task,
         "ai_worker",
         APP_AI_WORKER_STACK_SIZE,
-        NULL,
         APP_AI_WORKER_PRIORITY,
-        &ai_worker_task_handle,
         APP_AI_WORKER_CORE);
 
-    if (ai_created != pdPASS) {
+    if (!ai_created) {
         ESP_LOGE(TAG, "Failed to create asynchronous AI worker");
         app_ui_show_error("AI worker creation failed. Restart the device.");
         vTaskDelete(NULL);
@@ -1663,7 +1510,7 @@ static void camera_application_start_task(void *arg)
              APP_AI_WORKER_CORE,
              (unsigned)APP_AI_SNAPSHOT_MAX_EDGE,
              (unsigned)APP_AI_SNAPSHOT_MAX_EDGE,
-             (unsigned)ai_snapshot_capacity);
+             (unsigned)vision_ai_snapshot_buffer_capacity());
 
     display_mode_mutex = xSemaphoreCreateMutex();
     if (!display_mode_mutex) {
@@ -1700,7 +1547,7 @@ static void camera_application_start_task(void *arg)
     }
 
     /* Hide the launcher before granting direct display ownership to camera. */
-    bsp_display_backlight_off();
+    display_platform_backlight_off();
     display_backlight_enabled = false;
 
     /*
@@ -1718,7 +1565,7 @@ static void camera_application_start_task(void *arg)
     }
 
     dummy_draw_enabled = true;
-    display_disable_lvgl_overlays();
+    display_platform_disable_lvgl_overlays(disp);
 
     /* Start the 30-second face-inactivity window with the camera application. */
     ret = app_sleep_start_timeout();
@@ -1913,7 +1760,7 @@ void app_main(void)
      * Phase 1: normal LVGL rendering. The user sees a proper launcher and the
      * camera/AI pipeline is not initialized until Start Camera is pressed.
      */
-    disp = bsp_display_start();
+    disp = display_platform_start();
     if (!disp) {
         ESP_LOGE(TAG,
                  "Display/touch initialization failed. Check the selected Waveshare "
@@ -1937,13 +1784,13 @@ void app_main(void)
             esp_err_to_name(post_display_policy_ret));
     }
 
-    display_disable_lvgl_overlays();
+    display_platform_disable_lvgl_overlays(disp);
 
     /*
      * The BSP initializes GT911 and registers the LVGL input device inside
      * bsp_display_start(). Use the BSP-owned handle directly.
      */
-    launcher_touch_indev = bsp_display_get_input_dev();
+    launcher_touch_indev = display_platform_get_input_device();
     if (launcher_touch_indev) {
         ESP_LOGI(TAG,
                  "BSP touchscreen ready: type=%d",
@@ -1962,7 +1809,7 @@ void app_main(void)
             "Touch controller unavailable. Check the touch cable and BSP display selection.");
     }
 
-    bsp_display_backlight_on();
+    display_platform_backlight_on();
     display_backlight_enabled = true;
 
 
@@ -2075,8 +1922,8 @@ static void camera_video_frame_process(
     (void)camera_buf_index;
     (void)user_data;
 
-    const uint32_t display_width = BSP_LCD_H_RES;
-    const uint32_t display_height = BSP_LCD_V_RES;
+    const uint32_t display_width = display_platform_width();
+    const uint32_t display_height = display_platform_height();
     if (display_width == 0 || display_height == 0) {
         ESP_LOGE(TAG, "Display dimensions are invalid");
         return;
@@ -2217,7 +2064,7 @@ static void camera_video_frame_process(
                 (display_buffer_index + 1) % active_display_buffer_count;
 
             if (!display_backlight_enabled) {
-                bsp_display_backlight_on();
+                display_platform_backlight_on();
                 display_backlight_enabled = true;
             }
         }
@@ -2245,7 +2092,7 @@ static void camera_video_frame_process(
 
     if (detect_interval_frames > 0 &&
         (frame_count % detect_interval_frames) == 0U) {
-        (void)schedule_ai_snapshot(
+        (void)vision_ai_snapshot_scheduler_schedule(
             camera_buf,
             camera_buf_len,
             camera_buf_hes,

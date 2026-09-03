@@ -19,16 +19,30 @@ idf_component_register(
         "services/settings/app_settings.c"
 
         # Camera platform
+        "platform/camera/camera_runtime.c"
         "platform/camera/video_capture.c"
+
+        # Display platform
+        "platform/display/display_platform.c"
+
+        # Storage platform
+        "platform/storage/sd_card_storage.c"
+        "platform/storage/spiffs_storage.c"
 
         # Vision public dispatchers
         "services/vision/face_detection/face_detector.cpp"
         "services/vision/face_recognition/face_recognizer.cpp"
         "services/vision/recognition_policy.c"
         "services/vision/face_geometry.c"
+        "services/vision/face_detection_result_processor.c"
+        "services/vision/face_recognition_result_processor.c"
         "services/vision/face_result_store.c"
         "services/vision/ai_snapshot.c"
+        "services/vision/ai_snapshot_buffer.c"
+        "services/vision/ai_snapshot_scheduler.c"
         "services/vision/ai_worker_state.c"
+        "services/vision/ai_inference_guard.c"
+        "services/vision/ai_worker_runtime.c"
 
         # ESP-DL reference backend
         "services/vision/face_detection/face_detector_espdl.cpp"

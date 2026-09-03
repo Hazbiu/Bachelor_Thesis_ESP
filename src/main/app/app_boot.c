@@ -1,50 +1,23 @@
 #include <stdio.h>
 
 #include "app/app_boot.h"
-#include "bsp/esp-bsp.h"
+#include "platform/storage/sd_card_storage.h"
+#include "platform/storage/spiffs_storage.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "esp_spiffs.h"
 #include "services/vision/face_detector.h"
 #include "services/vision/face_recognizer.h"
 #include "config/app_features.h"
 
 static const char *TAG = "app_main";
 
-static esp_err_t mount_spiffs(void)
-{
-    esp_vfs_spiffs_conf_t conf = {
-        .base_path = "/spiffs",
-        .partition_label = "storage",
-        .max_files = 4,
-        .format_if_mount_failed = true,
-    };
-
-    esp_err_t ret = esp_vfs_spiffs_register(&conf);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "SPIFFS mount failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    size_t total = 0;
-    size_t used = 0;
-    ret = esp_spiffs_info("storage", &total, &used);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "SPIFFS mounted: total=%d used=%d", total, used);
-    } else {
-        ESP_LOGE(TAG, "SPIFFS info failed: %s", esp_err_to_name(ret));
-    }
-
-    return ESP_OK;
-}
-
 void app_boot_initialize_services(void)
 {
-    ESP_ERROR_CHECK(mount_spiffs());
+    ESP_ERROR_CHECK(spiffs_storage_mount());
 
     /* SD CARD TEST */
     /* Settings may already have mounted the card to refresh authorized users. */
-    esp_err_t sd_ret = bsp_sdcard != NULL ? ESP_OK : bsp_sdcard_mount();
+    esp_err_t sd_ret = sd_card_storage_ensure_mounted();
     if (sd_ret == ESP_OK) {
         ESP_LOGI(TAG, "SD card mounted at /sdcard");
 

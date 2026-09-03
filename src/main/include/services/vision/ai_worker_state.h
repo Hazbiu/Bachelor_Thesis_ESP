@@ -11,8 +11,8 @@ extern "C" {
 /*
  * Metadata for exactly one AI snapshot.
  *
- * The image bytes themselves remain owned by app_main's existing
- * ai_snapshot_buffer. This object contains metadata only.
+ * The image bytes themselves are owned by the vision snapshot-buffer service.
+ * This object contains metadata only.
  */
 typedef struct
 {
