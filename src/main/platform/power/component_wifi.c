@@ -1,4 +1,4 @@
-#include "power_save/component_wifi.h"
+#include "platform/power/component_wifi.h"
 
 #include <inttypes.h>
 #include <stdbool.h>

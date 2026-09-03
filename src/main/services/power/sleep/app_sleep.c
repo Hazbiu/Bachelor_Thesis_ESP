@@ -1,4 +1,4 @@
-#include "app_sleep.h"
+#include "services/power/sleep/app_sleep.h"
 
 #include <inttypes.h>
 #include <stdbool.h>
@@ -9,7 +9,7 @@
 #include "bsp/esp-bsp.h"
 #include "bsp/esp32_p4_platform.h"
 #include "config/app_config.h"
-#include "deep_sleep.h"
+#include "services/power/sleep/deep_sleep.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -17,15 +17,15 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "light_sleep.h"
+#include "services/power/sleep/light_sleep.h"
 #include "platform/camera/video_capture.h"
-#include "power_save/component_audio.h"
-#include "power_save/component_display.h"
-#include "power_save/component_ethernet.h"
-#include "power_save/component_sdcard.h"
-#include "power_save/component_wifi.h"
-#include "power_save/cpu_power.h"
-#include "settings/app_settings.h"
+#include "platform/power/component_audio.h"
+#include "platform/power/component_display.h"
+#include "platform/power/component_ethernet.h"
+#include "platform/power/component_sdcard.h"
+#include "platform/power/component_wifi.h"
+#include "platform/power/cpu_power.h"
+#include "services/settings/app_settings.h"
 
 #if APP_LIGHT_SLEEP_TOUCH_POLL_MS == 0
 #error "APP_LIGHT_SLEEP_TOUCH_POLL_MS must be greater than zero"

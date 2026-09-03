@@ -9,7 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
-#include "settings/app_settings.h"
+#include "services/settings/app_settings.h"
 
 static const char *TAG = "app_ui";
 

@@ -1,4 +1,4 @@
-#include "power_save/component_audio.h"
+#include "platform/power/component_audio.h"
 
 #include <inttypes.h>
 #include <stdbool.h>

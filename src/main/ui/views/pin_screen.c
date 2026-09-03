@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "app_sleep.h"
+#include "services/power/sleep/app_sleep.h"
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
 #include "esp_err.h"

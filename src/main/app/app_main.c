@@ -16,14 +16,22 @@
 #include "platform/camera/video_capture.h"
 #include "services/vision/face_detector.h"
 #include "services/vision/face_recognizer.h"
+#include "services/vision/recognition_policy.h"
+#include "services/vision/face_geometry.h"
+#include "services/vision/face_result_store.h"
+#include "services/vision/ai_snapshot.h"
+#include "services/vision/ai_worker_state.h"
 #include "diagnostics/core_trace.h"
 #include "diagnostics/app_logging.h"
 #include "diagnostics/cpu_stats.h"
 #include "diagnostics/ai_pipeline_status.h"
 #include "app/app_boot.h"
+#include "app/controller/app_controller.h"
+#include "services/authentication/authentication_session.h"
 #include "app_ui.h"
 #include "settings_screen.h"
 #include "pin_screen.h"
+#include "renderers/face_overlay_renderer.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "bsp/display.h"
@@ -31,17 +39,17 @@
 #include "bsp/esp32_p4_platform.h"
 #include "lvgl.h"
 #include "lv_demos.h"
-#include "wake_up.h"
+#include "services/power/sleep/wake_up.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "power_save/cpu_power.h"
+#include "platform/power/cpu_power.h"
 #include "config/app_config.h"
 #include "config/app_features.h"
 #include "config/log_config.h"
-#include "app_sleep.h"
-#include "power_save/component_runtime_policy.h"
-#include "settings/app_settings.h"
+#include "services/power/sleep/app_sleep.h"
+#include "services/power/component_runtime_policy.h"
+#include "services/settings/app_settings.h"
 
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 
@@ -60,288 +68,6 @@
  * is written by the CPU. Invalidate before the CPU touches a PPA-written buffer,
  * then write it back before the LCD reads it.
  */
-
-static int smooth_coord(int old_value, int new_value)
-{
-    return (old_value * 3 + new_value) / 4;
-}
-static void draw_rect_rgb565(
-    uint16_t *fb,
-    uint32_t fb_w,
-    uint32_t fb_h,
-    int x1,
-    int y1,
-    int x2,
-    int y2,
-    uint16_t color)
-{
-    if (!fb) {
-        return;
-    }
-
-    if (x1 < 0) x1 = 0;
-    if (y1 < 0) y1 = 0;
-    if (x2 < 0) x2 = 0;
-    if (y2 < 0) y2 = 0;
-
-    if (x1 >= (int)fb_w) x1 = fb_w - 1;
-    if (x2 >= (int)fb_w) x2 = fb_w - 1;
-    if (y1 >= (int)fb_h) y1 = fb_h - 1;
-    if (y2 >= (int)fb_h) y2 = fb_h - 1;
-
-    for (int x = x1; x <= x2; x++) {
-        fb[y1 * fb_w + x] = color;
-        fb[y2 * fb_w + x] = color;
-    }
-
-    for (int y = y1; y <= y2; y++) {
-        fb[y * fb_w + x1] = color;
-        fb[y * fb_w + x2] = color;
-    }
-}
-
-static void draw_filled_rect_rgb565(
-    uint16_t *fb,
-    uint32_t fb_w,
-    uint32_t fb_h,
-    int x1,
-    int y1,
-    int x2,
-    int y2,
-    uint16_t color)
-{
-    if (!fb || fb_w == 0 || fb_h == 0) {
-        return;
-    }
-
-    if (x1 > x2) {
-        int temp = x1;
-        x1 = x2;
-        x2 = temp;
-    }
-
-    if (y1 > y2) {
-        int temp = y1;
-        y1 = y2;
-        y2 = temp;
-    }
-
-    if (x2 < 0 || y2 < 0 || x1 >= (int)fb_w || y1 >= (int)fb_h) {
-        return;
-    }
-
-    if (x1 < 0) x1 = 0;
-    if (y1 < 0) y1 = 0;
-    if (x2 >= (int)fb_w) x2 = (int)fb_w - 1;
-    if (y2 >= (int)fb_h) y2 = (int)fb_h - 1;
-
-    for (int y = y1; y <= y2; y++) {
-        uint16_t *row = fb + y * fb_w;
-        for (int x = x1; x <= x2; x++) {
-            row[x] = color;
-        }
-    }
-}
-
-static void draw_thick_rect_rgb565(
-    uint16_t *fb,
-    uint32_t fb_w,
-    uint32_t fb_h,
-    int x1,
-    int y1,
-    int x2,
-    int y2,
-    int thickness,
-    uint16_t color)
-{
-    for (int inset = 0; inset < thickness; inset++) {
-        draw_rect_rgb565(
-            fb,
-            fb_w,
-            fb_h,
-            x1 + inset,
-            y1 + inset,
-            x2 - inset,
-            y2 - inset,
-            color
-        );
-    }
-}
-
-/* Five-pixel-wide uppercase font. Lowercase folder names are shown uppercase. */
-static const uint8_t s_font_5x7[36][7] = {
-    {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}, /* 0 */
-    {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}, /* 1 */
-    {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}, /* 2 */
-    {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E}, /* 3 */
-    {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}, /* 4 */
-    {0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E}, /* 5 */
-    {0x0E, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x0E}, /* 6 */
-    {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}, /* 7 */
-    {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}, /* 8 */
-    {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E}, /* 9 */
-    {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}, /* A */
-    {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}, /* B */
-    {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}, /* C */
-    {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E}, /* D */
-    {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}, /* E */
-    {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}, /* F */
-    {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}, /* G */
-    {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}, /* H */
-    {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}, /* I */
-    {0x01, 0x01, 0x01, 0x01, 0x11, 0x11, 0x0E}, /* J */
-    {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}, /* K */
-    {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}, /* L */
-    {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}, /* M */
-    {0x11, 0x19, 0x19, 0x15, 0x13, 0x13, 0x11}, /* N */
-    {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}, /* O */
-    {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}, /* P */
-    {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D}, /* Q */
-    {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}, /* R */
-    {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}, /* S */
-    {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}, /* T */
-    {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}, /* U */
-    {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04}, /* V */
-    {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A}, /* W */
-    {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11}, /* X */
-    {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}, /* Y */
-    {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}, /* Z */
-};
-
-static const uint8_t *font_5x7_glyph(char character)
-{
-    if (character >= 'a' && character <= 'z') {
-        character = (char)(character - 'a' + 'A');
-    }
-
-    if (character >= '0' && character <= '9') {
-        return s_font_5x7[character - '0'];
-    }
-
-    if (character >= 'A' && character <= 'Z') {
-        return s_font_5x7[10 + character - 'A'];
-    }
-
-    return NULL;
-}
-
-static void draw_large_text_rgb565(
-    uint16_t *fb,
-    uint32_t fb_w,
-    uint32_t fb_h,
-    int start_x,
-    int start_y,
-    const char *text,
-    int scale,
-    uint16_t color)
-{
-    if (!fb || !text || scale <= 0) {
-        return;
-    }
-
-    int cursor_x = start_x;
-
-    for (const char *cursor = text; *cursor != '\0'; cursor++) {
-        const uint8_t *glyph = font_5x7_glyph(*cursor);
-
-        if (glyph) {
-            for (int row = 0; row < 7; row++) {
-                for (int column = 0; column < 5; column++) {
-                    if ((glyph[row] & (1U << (4 - column))) == 0) {
-                        continue;
-                    }
-
-                    draw_filled_rect_rgb565(
-                        fb,
-                        fb_w,
-                        fb_h,
-                        cursor_x + column * scale,
-                        start_y + row * scale,
-                        cursor_x + (column + 1) * scale - 1,
-                        start_y + (row + 1) * scale - 1,
-                        color
-                    );
-                }
-            }
-        }
-
-        cursor_x += 6 * scale;
-    }
-}
-
-static void draw_face_label_rgb565(
-    uint16_t *fb,
-    uint32_t fb_w,
-    uint32_t fb_h,
-    int box_x2,
-    int box_y1,
-    const char *name,
-    uint16_t background_color)
-{
-    if (!name || name[0] == '\0') {
-        return;
-    }
-
-    const int scale = APP_FACE_LABEL_FONT_SCALE;
-    const int padding = 2 * scale;
-    const int text_width = (int)strlen(name) * 6 * scale - scale;
-    const int text_height = 7 * scale;
-    const int label_width = text_width + 2 * padding;
-    const int label_height = text_height + 2 * padding;
-
-    int label_x2 = box_x2;
-    if (label_x2 >= (int)fb_w) label_x2 = (int)fb_w - 1;
-    if (label_x2 < label_width - 1) label_x2 = label_width - 1;
-
-    int label_x1 = label_x2 - label_width + 1;
-    int label_y2 = box_y1 - 1;
-    int label_y1 = label_y2 - label_height + 1;
-
-    if (label_y1 < 0) {
-        label_y1 = box_y1;
-        label_y2 = label_y1 + label_height - 1;
-    }
-
-    draw_filled_rect_rgb565(
-        fb,
-        fb_w,
-        fb_h,
-        label_x1,
-        label_y1,
-        label_x2,
-        label_y2,
-        background_color
-    );
-
-    draw_large_text_rgb565(
-        fb,
-        fb_w,
-        fb_h,
-        label_x1 + padding,
-        label_y1 + padding,
-        name,
-        scale,
-        0xFFFF
-    );
-}
-
-static float face_box_iou(const face_box_t *a, const face_box_t *b)
-{
-    const int intersection_x1 = a->x1 > b->x1 ? a->x1 : b->x1;
-    const int intersection_y1 = a->y1 > b->y1 ? a->y1 : b->y1;
-    const int intersection_x2 = a->x2 < b->x2 ? a->x2 : b->x2;
-    const int intersection_y2 = a->y2 < b->y2 ? a->y2 : b->y2;
-    const int intersection_w = intersection_x2 > intersection_x1
-        ? intersection_x2 - intersection_x1 : 0;
-    const int intersection_h = intersection_y2 > intersection_y1
-        ? intersection_y2 - intersection_y1 : 0;
-    const int intersection_area = intersection_w * intersection_h;
-    const int area_a = (a->x2 - a->x1) * (a->y2 - a->y1);
-    const int area_b = (b->x2 - b->x1) * (b->y2 - b->y1);
-    const int union_area = area_a + area_b - intersection_area;
-
-    return union_area > 0 ? (float)intersection_area / (float)union_area : 0.0f;
-}
 
 static void camera_video_frame_operation(
     uint8_t *camera_buf,
@@ -381,28 +107,12 @@ static portMUX_TYPE idle_scan_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static uint32_t frame_count = 0;
 
-static face_box_t last_boxes[APP_MAX_FACE_BOXES];
-static char last_face_names[APP_MAX_FACE_BOXES][FACE_RECOG_MAX_NAME_LEN];
-static float last_recognition_scores[APP_MAX_FACE_BOXES];
-static int last_face_count = 0;
-static int no_face_frames = 0;
-
 /*
  * AI runs on CPU1 from a private, downscaled snapshot. The camera/display
  * task on CPU0 never waits for BlazeFace or MobileFaceNet. There is exactly
  * one snapshot slot: while AI is busy, newer camera frames are displayed but
  * intentionally dropped from the AI path. This prevents an old-frame queue.
  */
-typedef struct {
-    uint32_t frame_id;
-    uint32_t source_width;
-    uint32_t source_height;
-    uint32_t width;
-    uint32_t height;
-    size_t data_size;
-    bool idle_scan_frame;
-} ai_snapshot_job_t;
-
 static uint8_t *ai_snapshot_buffer = NULL;
 static size_t ai_snapshot_capacity = 0;
 static TaskHandle_t ai_worker_task_handle = NULL;
@@ -414,12 +124,6 @@ static TaskHandle_t ai_worker_task_handle = NULL;
  * detector and recognizer can never overlap or be invoked out of order.
  */
 static SemaphoreHandle_t ai_inference_mutex = NULL;
-static portMUX_TYPE ai_worker_state_lock = portMUX_INITIALIZER_UNLOCKED;
-static portMUX_TYPE ai_result_lock = portMUX_INITIALIZER_UNLOCKED;
-static bool ai_job_pending = false;
-static bool ai_worker_busy = false;
-static bool ai_worker_accepting = false;
-static ai_snapshot_job_t ai_pending_job = {0};
 
 i2c_master_bus_handle_t i2c_bus_;
 
@@ -433,13 +137,6 @@ static bool dummy_mode_delay_flag = false;
  * use this mutex to serialize the ownership hand-off.
  */
 static SemaphoreHandle_t display_mode_mutex;
-
-static portMUX_TYPE authentication_state_lock = portMUX_INITIALIZER_UNLOCKED;
-static bool pin_transition_pending;
-static bool pin_screen_active;
-static bool pin_rearm_required;
-static int pin_rearm_no_face_passes;
-static char pending_identity[FACE_RECOG_MAX_NAME_LEN];
 
 static void log_psram_state(const char *stage)
 {
@@ -532,17 +229,6 @@ static void trim_display_buffers_for_sleep(void)
 }
 
 
-static void ai_results_clear(void)
-{
-    portENTER_CRITICAL(&ai_result_lock);
-    last_face_count = 0;
-    no_face_frames = 0;
-    memset(last_boxes, 0, sizeof(last_boxes));
-    memset(last_face_names, 0, sizeof(last_face_names));
-    memset(last_recognition_scores, 0, sizeof(last_recognition_scores));
-    portEXIT_CRITICAL(&ai_result_lock);
-}
-
 static esp_err_t face_boost_release(const char *reason)
 {
     if (!cpu_power_is_face_boost_active()) {
@@ -561,52 +247,24 @@ static esp_err_t face_boost_release(const char *reason)
     return ret;
 }
 
-static bool authentication_blocks_camera(void)
-{
-    bool blocked;
-
-    portENTER_CRITICAL(&authentication_state_lock);
-    blocked = pin_transition_pending || pin_screen_active;
-    portEXIT_CRITICAL(&authentication_state_lock);
-
-    return blocked;
-}
-
-static void authentication_note_detection_result(int face_count)
-{
-    bool rearmed = false;
-
-    portENTER_CRITICAL(&authentication_state_lock);
-
-    if (face_count > 0) {
-        pin_rearm_no_face_passes = 0;
-    } else if (pin_rearm_required &&
-               !pin_transition_pending &&
-               !pin_screen_active) {
-        pin_rearm_no_face_passes++;
-
-        if (pin_rearm_no_face_passes >= APP_FACE_BOX_HOLD_MISSES) {
-            pin_rearm_required = false;
-            pin_rearm_no_face_passes = 0;
-            rearmed = true;
-        }
-    }
-
-    portEXIT_CRITICAL(&authentication_state_lock);
-
-    if (rearmed) {
-        ESP_LOGI(TAG, "Authentication rearmed after the face left the camera");
-    }
-}
-
 static void authentication_mark_transition_failed(void)
 {
-    portENTER_CRITICAL(&authentication_state_lock);
-    pin_transition_pending = false;
-    pin_screen_active = false;
-    portEXIT_CRITICAL(&authentication_state_lock);
+    authentication_session_mark_transition_failed();
 
     face_boost_release("PIN transition failed");
+
+    /*
+     * Camera operation remains the fallback when the PIN transition cannot
+     * be completed. Keep the FSM synchronized with that existing behavior.
+     */
+    if (app_controller_get_state() == APP_STATE_AUTHENTICATING) {
+        if (app_controller_handle_event(APP_EVENT_FACE_UNKNOWN)) {
+            ESP_LOGI(
+                TAG,
+                "[APP-STATE] AUTHENTICATING -> CAMERA_ACTIVE "
+                "(PIN transition failed)");
+        }
+    }
 }
 
 static void camera_resume_task(void *arg)
@@ -647,7 +305,7 @@ static void camera_resume_task(void *arg)
         return;
     }
 
-    ai_results_clear();
+    vision_face_result_store_clear();
     display_buffer_index = 0;
     dummy_draw_enabled = true;
 
@@ -662,10 +320,26 @@ static void camera_resume_task(void *arg)
         return;
     }
 
-    portENTER_CRITICAL(&authentication_state_lock);
-    pin_transition_pending = false;
-    pin_screen_active = false;
-    portEXIT_CRITICAL(&authentication_state_lock);
+    authentication_session_mark_camera_active_after_pin();
+
+    /*
+     * The PIN was accepted and the camera stream has now been
+     * successfully restored.
+     *
+     *     PIN_ENTRY -> CAMERA_ACTIVE
+     *
+     * Dispatch this only after app_video_stream_task_restart()
+     * succeeds so the FSM reflects the real application state.
+     */
+    if (app_controller_handle_event(APP_EVENT_PIN_COMPLETE)) {
+        ESP_LOGI(
+            TAG,
+            "[APP-STATE] PIN_ENTRY -> CAMERA_ACTIVE");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "[APP-STATE] PIN_COMPLETE did not cause a transition");
+    }
 
     app_sleep_notify_face_detected();
     xSemaphoreGive(display_mode_mutex);
@@ -732,7 +406,7 @@ static void pin_screen_transition_task(void *arg)
         return;
     }
 
-    ai_results_clear();
+    vision_face_result_store_clear();
     display_buffer_index = 0;
 
     ret = esp_lv_adapter_set_dummy_draw(disp, false);
@@ -749,7 +423,16 @@ static void pin_screen_transition_task(void *arg)
 
     dummy_draw_enabled = false;
 
-    ret = pin_screen_show(pending_identity, pin_accepted_callback, NULL);
+    char pending_identity[FACE_RECOG_MAX_NAME_LEN] = {0};
+
+    authentication_session_copy_pending_identity(
+        pending_identity,
+        sizeof(pending_identity));
+
+    ret = pin_screen_show(
+        pending_identity,
+        pin_accepted_callback,
+        NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Could not create PIN screen: %s", esp_err_to_name(ret));
 
@@ -769,10 +452,23 @@ static void pin_screen_transition_task(void *arg)
         return;
     }
 
-    portENTER_CRITICAL(&authentication_state_lock);
-    pin_transition_pending = false;
-    pin_screen_active = true;
-    portEXIT_CRITICAL(&authentication_state_lock);
+    authentication_session_mark_pin_active();
+
+    /*
+     * pin_screen_show() succeeded and completed its synchronous first
+     * full-screen render, so the PIN UI now genuinely owns the application.
+     *
+     *     AUTHENTICATING -> PIN_ENTRY
+     */
+    if (app_controller_handle_event(APP_EVENT_FACE_RECOGNIZED)) {
+        ESP_LOGI(
+            TAG,
+            "[APP-STATE] AUTHENTICATING -> PIN_ENTRY");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "[APP-STATE] FACE_RECOGNIZED did not cause a transition");
+    }
 
     /*
      * pin_screen_show() performs a synchronous full-screen LVGL refresh before
@@ -803,39 +499,18 @@ static void pin_screen_transition_task(void *arg)
  */
 static bool authentication_request_pin(const char *recognized_name)
 {
-    if (!recognized_name || recognized_name[0] == '\0' ||
-        strcmp(recognized_name, "unknown") == 0 ||
-        app_sleep_is_requested()) {
+    /*
+     * Sleep remains an application/power concern.
+     * Authentication state itself belongs to the session service.
+     */
+    if (app_sleep_is_requested()) {
         return false;
     }
 
-    bool reserved = false;
-
-    portENTER_CRITICAL(&authentication_state_lock);
-
-    if (!pin_transition_pending &&
-        !pin_screen_active &&
-        !pin_rearm_required) {
-        pin_transition_pending = true;
-        pin_rearm_required = true;
-        pin_rearm_no_face_passes = 0;
-        reserved = true;
-    }
-
-    portEXIT_CRITICAL(&authentication_state_lock);
-
-    if (!reserved) {
-        return false;
-    }
-
-    const size_t identity_length = strnlen(
-        recognized_name,
-        sizeof(pending_identity) - 1);
-    memcpy(pending_identity, recognized_name, identity_length);
-    pending_identity[identity_length] = '\0';
-
-    return true;
+    return authentication_session_reserve_pin_identity(
+        recognized_name);
 }
+
 
 static bool authentication_launch_pin_transition(void)
 {
@@ -857,302 +532,6 @@ static bool authentication_launch_pin_transition(void)
     return true;
 }
 
-static size_t ai_snapshot_bytes_per_pixel(void)
-{
-#if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
-    return 2U;
-#else
-    return 3U;
-#endif
-}
-
-static void ai_snapshot_dimensions(
-    uint32_t source_width,
-    uint32_t source_height,
-    uint32_t *snapshot_width,
-    uint32_t *snapshot_height)
-{
-    if (snapshot_width == NULL || snapshot_height == NULL ||
-        source_width == 0 || source_height == 0) {
-        return;
-    }
-
-    if (source_width >= source_height) {
-        *snapshot_width = APP_AI_SNAPSHOT_MAX_EDGE;
-        *snapshot_height =
-            (source_height * APP_AI_SNAPSHOT_MAX_EDGE + source_width / 2U) /
-            source_width;
-    } else {
-        *snapshot_height = APP_AI_SNAPSHOT_MAX_EDGE;
-        *snapshot_width =
-            (source_width * APP_AI_SNAPSHOT_MAX_EDGE + source_height / 2U) /
-            source_height;
-    }
-
-    if (*snapshot_width == 0) *snapshot_width = 1;
-    if (*snapshot_height == 0) *snapshot_height = 1;
-}
-
-static bool copy_camera_to_ai_snapshot(
-    const uint8_t *source,
-    size_t source_len,
-    uint32_t source_width,
-    uint32_t source_height,
-    uint32_t snapshot_width,
-    uint32_t snapshot_height,
-    size_t *written_bytes)
-{
-    if (source == NULL || ai_snapshot_buffer == NULL || written_bytes == NULL ||
-        source_width == 0 || source_height == 0 ||
-        snapshot_width == 0 || snapshot_height == 0) {
-        return false;
-    }
-
-    const size_t bytes_per_pixel = ai_snapshot_bytes_per_pixel();
-    const size_t required_source =
-        (size_t)source_width * source_height * bytes_per_pixel;
-    const size_t required_snapshot =
-        (size_t)snapshot_width * snapshot_height * bytes_per_pixel;
-
-    if (source_len < required_source || required_snapshot > ai_snapshot_capacity) {
-        return false;
-    }
-
-#if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
-    const uint16_t *src = (const uint16_t *)source;
-    uint16_t *dst = (uint16_t *)ai_snapshot_buffer;
-
-    for (uint32_t y = 0; y < snapshot_height; y++) {
-        const uint32_t src_y =
-            (uint32_t)(((uint64_t)y * source_height) / snapshot_height);
-        const uint16_t *src_row = src + (size_t)src_y * source_width;
-        uint16_t *dst_row = dst + (size_t)y * snapshot_width;
-
-        for (uint32_t x = 0; x < snapshot_width; x++) {
-            const uint32_t src_x =
-                (uint32_t)(((uint64_t)x * source_width) / snapshot_width);
-            dst_row[x] = src_row[src_x];
-        }
-    }
-#else
-    for (uint32_t y = 0; y < snapshot_height; y++) {
-        const uint32_t src_y =
-            (uint32_t)(((uint64_t)y * source_height) / snapshot_height);
-
-        for (uint32_t x = 0; x < snapshot_width; x++) {
-            const uint32_t src_x =
-                (uint32_t)(((uint64_t)x * source_width) / snapshot_width);
-            const size_t src_offset =
-                ((size_t)src_y * source_width + src_x) * 3U;
-            const size_t dst_offset =
-                ((size_t)y * snapshot_width + x) * 3U;
-            ai_snapshot_buffer[dst_offset + 0] = source[src_offset + 0];
-            ai_snapshot_buffer[dst_offset + 1] = source[src_offset + 1];
-            ai_snapshot_buffer[dst_offset + 2] = source[src_offset + 2];
-        }
-    }
-#endif
-
-    *written_bytes = required_snapshot;
-    return true;
-}
-
-static void scale_box_to_source(
-    const face_box_t *snapshot_box,
-    uint32_t snapshot_width,
-    uint32_t snapshot_height,
-    uint32_t source_width,
-    uint32_t source_height,
-    face_box_t *source_box)
-{
-    if (snapshot_box == NULL || source_box == NULL ||
-        snapshot_width == 0 || snapshot_height == 0) {
-        return;
-    }
-
-    *source_box = *snapshot_box;
-    source_box->x1 = (int)((int64_t)snapshot_box->x1 * source_width / snapshot_width);
-    source_box->x2 = (int)((int64_t)snapshot_box->x2 * source_width / snapshot_width);
-    source_box->y1 = (int)((int64_t)snapshot_box->y1 * source_height / snapshot_height);
-    source_box->y2 = (int)((int64_t)snapshot_box->y2 * source_height / snapshot_height);
-
-    for (int i = 0; i + 1 < source_box->keypoint_count && i + 1 < 10; i += 2) {
-        source_box->keypoints[i] =
-            (int)((int64_t)snapshot_box->keypoints[i] * source_width / snapshot_width);
-        source_box->keypoints[i + 1] =
-            (int)((int64_t)snapshot_box->keypoints[i + 1] * source_height / snapshot_height);
-    }
-}
-
-/*
- * Display-only expansion for the quantized BlazeFace box.
- *
- * The detector's keypoints and the snapshot-space box passed to MobileFaceNet
- * are deliberately NOT changed.  Only the source/display rectangle is widened.
- */
-static void expand_box_for_display(
-    face_box_t *box,
-    uint32_t source_width,
-    uint32_t source_height,
-    float margin_ratio)
-{
-    if (box == NULL || source_width == 0 || source_height == 0 ||
-        margin_ratio <= 0.0f) {
-        return;
-    }
-
-    const int width = box->x2 - box->x1;
-    const int height = box->y2 - box->y1;
-    if (width <= 0 || height <= 0) {
-        return;
-    }
-
-    const int margin_x = (int)((float)width * margin_ratio + 0.5f);
-    const int margin_y = (int)((float)height * margin_ratio + 0.5f);
-
-    box->x1 -= margin_x;
-    box->y1 -= margin_y;
-    box->x2 += margin_x;
-    box->y2 += margin_y;
-
-    if (box->x1 < 0) box->x1 = 0;
-    if (box->y1 < 0) box->y1 = 0;
-    if (box->x2 >= (int)source_width) box->x2 = (int)source_width - 1;
-    if (box->y2 >= (int)source_height) box->y2 = (int)source_height - 1;
-}
-
-static void publish_detected_boxes(
-    const face_box_t *boxes,
-    int count,
-    bool preserve_previous_names)
-{
-    if (count < 0) count = 0;
-    if (count > APP_MAX_FACE_BOXES) count = APP_MAX_FACE_BOXES;
-
-    face_box_t previous_boxes[APP_MAX_FACE_BOXES] = {0};
-    char previous_names[APP_MAX_FACE_BOXES][FACE_RECOG_MAX_NAME_LEN] = {{0}};
-    float previous_scores[APP_MAX_FACE_BOXES] = {0};
-    int previous_count = 0;
-
-    portENTER_CRITICAL(&ai_result_lock);
-    previous_count = last_face_count;
-    if (previous_count > APP_MAX_FACE_BOXES) previous_count = APP_MAX_FACE_BOXES;
-    memcpy(previous_boxes, last_boxes, sizeof(previous_boxes));
-    memcpy(previous_names, last_face_names, sizeof(previous_names));
-    memcpy(previous_scores, last_recognition_scores, sizeof(previous_scores));
-    portEXIT_CRITICAL(&ai_result_lock);
-
-    face_box_t updated_boxes[APP_MAX_FACE_BOXES] = {0};
-    char updated_names[APP_MAX_FACE_BOXES][FACE_RECOG_MAX_NAME_LEN] = {{0}};
-    float updated_scores[APP_MAX_FACE_BOXES] = {0};
-    bool previous_used[APP_MAX_FACE_BOXES] = {false};
-
-    for (int i = 0; i < count; i++) {
-        int matched_previous = -1;
-        float best_iou = 0.20f;
-
-        for (int previous = 0; previous < previous_count; previous++) {
-            if (previous_used[previous]) continue;
-            const float iou = face_box_iou(&boxes[i], &previous_boxes[previous]);
-            if (iou > best_iou) {
-                best_iou = iou;
-                matched_previous = previous;
-            }
-        }
-
-        updated_boxes[i] = boxes[i];
-
-        if (matched_previous >= 0) {
-            previous_used[matched_previous] = true;
-            updated_boxes[i].x1 = smooth_coord(previous_boxes[matched_previous].x1, boxes[i].x1);
-            updated_boxes[i].y1 = smooth_coord(previous_boxes[matched_previous].y1, boxes[i].y1);
-            updated_boxes[i].x2 = smooth_coord(previous_boxes[matched_previous].x2, boxes[i].x2);
-            updated_boxes[i].y2 = smooth_coord(previous_boxes[matched_previous].y2, boxes[i].y2);
-
-            if (preserve_previous_names) {
-                snprintf(updated_names[i], sizeof(updated_names[i]), "%s",
-                         previous_names[matched_previous]);
-                updated_scores[i] = previous_scores[matched_previous];
-            }
-        }
-    }
-
-    portENTER_CRITICAL(&ai_result_lock);
-    memcpy(last_boxes, updated_boxes, sizeof(updated_boxes));
-    memcpy(last_face_names, updated_names, sizeof(updated_names));
-    memcpy(last_recognition_scores, updated_scores, sizeof(updated_scores));
-    last_face_count = count;
-    no_face_frames = 0;
-    portEXIT_CRITICAL(&ai_result_lock);
-}
-
-static void publish_recognition_result(
-    int index,
-    const char *name,
-    float score)
-{
-    if (index < 0 || index >= APP_MAX_FACE_BOXES || name == NULL) {
-        return;
-    }
-
-    portENTER_CRITICAL(&ai_result_lock);
-    if (index < last_face_count) {
-        snprintf(last_face_names[index], sizeof(last_face_names[index]), "%s", name);
-        last_recognition_scores[index] = score;
-    }
-    portEXIT_CRITICAL(&ai_result_lock);
-}
-
-static void publish_no_face_result(void)
-{
-    bool release_boost = false;
-
-    portENTER_CRITICAL(&ai_result_lock);
-    no_face_frames++;
-    if (no_face_frames >= APP_FACE_BOX_HOLD_MISSES) {
-        last_face_count = 0;
-        memset(last_boxes, 0, sizeof(last_boxes));
-        memset(last_face_names, 0, sizeof(last_face_names));
-        memset(last_recognition_scores, 0, sizeof(last_recognition_scores));
-        release_boost = true;
-    }
-    portEXIT_CRITICAL(&ai_result_lock);
-
-    if (release_boost) {
-        face_boost_release("face left camera");
-    }
-}
-
-static void ai_worker_mark_idle(void)
-{
-    portENTER_CRITICAL(&ai_worker_state_lock);
-    ai_worker_busy = false;
-    portEXIT_CRITICAL(&ai_worker_state_lock);
-}
-
-/*
- * Preserve the existing >0.70 recognition gate for ESP-DL and TFLM-FP32.
- *
- * The INT8 detector's classifier output is quantized on a coarse grid. Its
- * candidate-generation threshold is exactly q=122 -> probability 0.50.
- * Accepted INT8 candidates must be allowed into MobileFaceNet so the second
- * stage can verify identity and request the PIN screen.
- */
-static bool ai_detection_allows_recognition(float detector_score)
-{
-#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
-    /*
-     * The INT8 detector has already applied its own candidate threshold.
-     * Do not filter the accepted candidate a second time before MobileFaceNet.
-     * This avoids float/grid edge cases around the exact q=122 -> 0.50 score.
-     */
-    (void)detector_score;
-    return true;
-#else
-    return detector_score > APP_FACE_RECOG_MIN_SCORE;
-#endif
-}
-
 static void ai_worker_task(void *arg)
 {
     (void)arg;
@@ -1163,24 +542,14 @@ static void ai_worker_task(void *arg)
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        ai_snapshot_job_t job = {0};
-        bool have_job = false;
+        vision_ai_worker_job_t job = {0};
 
-        portENTER_CRITICAL(&ai_worker_state_lock);
-        if (ai_job_pending) {
-            job = ai_pending_job;
-            ai_job_pending = false;
-            ai_worker_busy = true;
-            have_job = true;
-        }
-        portEXIT_CRITICAL(&ai_worker_state_lock);
-
-        if (!have_job) {
+        if (!vision_ai_worker_state_take_job(&job)) {
             continue;
         }
 
-        if (app_sleep_is_requested() || authentication_blocks_camera()) {
-            ai_worker_mark_idle();
+        if (app_sleep_is_requested() || authentication_session_blocks_camera()) {
+            vision_ai_worker_state_mark_idle();
             continue;
         }
 
@@ -1193,7 +562,7 @@ static void ai_worker_task(void *arg)
         if (ai_inference_mutex == NULL ||
             xSemaphoreTake(ai_inference_mutex, portMAX_DELAY) != pdTRUE) {
             ESP_LOGE(TAG, "Could not acquire AI inference mutex");
-            ai_worker_mark_idle();
+            vision_ai_worker_state_mark_idle();
             continue;
         }
 
@@ -1240,13 +609,19 @@ static void ai_worker_task(void *arg)
                  "AI worker detection complete: frame=%" PRIu32 " faces=%d",
                  job.frame_id, face_count);
         diagnostics_ai_detection_result(face_count);
-        authentication_note_detection_result(face_count);
+        if (authentication_session_note_detection_result(face_count)) {
+            ESP_LOGI(
+                TAG,
+                "Authentication rearmed after the face left the camera");
+        }
 
         if (face_count <= 0) {
-            publish_no_face_result();
+            if (vision_face_result_store_note_no_face()) {
+                face_boost_release("face left camera");
+            }
             face_boost_release("detector completed with no face");
             xSemaphoreGive(ai_inference_mutex);
-            ai_worker_mark_idle();
+            vision_ai_worker_state_mark_idle();
             continue;
         }
 
@@ -1268,7 +643,7 @@ static void ai_worker_task(void *arg)
 
         face_box_t source_boxes[APP_MAX_FACE_BOXES] = {0};
         for (int i = 0; i < update_count; i++) {
-            scale_box_to_source(
+            vision_face_geometry_scale_box_to_source(
                 &snapshot_boxes[i],
                 job.width,
                 job.height,
@@ -1277,7 +652,7 @@ static void ai_worker_task(void *arg)
                 &source_boxes[i]);
 
 #if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
-            expand_box_for_display(
+            vision_face_geometry_expand_box_for_display(
                 &source_boxes[i],
                 job.source_width,
                 job.source_height,
@@ -1295,14 +670,14 @@ static void ai_worker_task(void *arg)
         }
 
         /* Publish red boxes immediately; recognition may take many seconds. */
-        publish_detected_boxes(source_boxes, update_count, true);
+        vision_face_result_store_publish_detected_boxes(source_boxes, update_count, true);
 
         if (job.idle_scan_frame || idle_scan_display_is_suspended()) {
             ESP_LOGI(TAG,
                      "IDLE-SCAN face detected; recognition deferred until display restore");
             face_boost_release("IDLE-SCAN detector completed");
             xSemaphoreGive(ai_inference_mutex);
-            ai_worker_mark_idle();
+            vision_ai_worker_state_mark_idle();
             continue;
         }
 
@@ -1326,8 +701,9 @@ static void ai_worker_task(void *arg)
              * DET -> REC serial execution at maximum CPU frequency.
              */
             for (int i = 0; i < update_count; i++) {
-                if (!ai_detection_allows_recognition(
-                        snapshot_boxes[i].score)) {
+                if (!vision_recognition_policy_allows(
+                        snapshot_boxes[i].score,
+                        APP_FACE_RECOG_MIN_SCORE)) {
                     continue;
                 }
 
@@ -1342,6 +718,27 @@ static void ai_worker_task(void *arg)
                     i,
                     (double)snapshot_boxes[i].score);
 #endif
+
+                /*
+                 * A real recognition pass is starting now.
+                 *
+                 *     CAMERA_ACTIVE -> AUTHENTICATING
+                 *
+                 * Do not move this transition to the CPU boost acquisition:
+                 * the boost begins before detection and therefore also covers
+                 * frames where no face is found.
+                 */
+                if (app_controller_get_state() == APP_STATE_CAMERA_ACTIVE) {
+                    if (app_controller_handle_event(APP_EVENT_FACE_DETECTED)) {
+                        ESP_LOGI(
+                            TAG,
+                            "[APP-STATE] CAMERA_ACTIVE -> AUTHENTICATING");
+                    } else {
+                        ESP_LOGW(
+                            TAG,
+                            "[APP-STATE] FACE_DETECTED did not cause a transition");
+                    }
+                }
 
                 esp_err_t recog_ret = face_recognition_recognize(
                     ai_snapshot_buffer,
@@ -1359,10 +756,24 @@ static void ai_worker_task(void *arg)
                     recog_score = 0.0f;
                 }
 
-                publish_recognition_result(i, name, recog_score);
+                vision_face_result_store_publish_recognition_result(i, name, recog_score);
 
                 if (recog_ret == ESP_OK && authentication_request_pin(name)) {
                     pin_transition_requested = true;
+                } else if (app_controller_get_state() == APP_STATE_AUTHENTICATING) {
+                    /*
+                     * This recognition pass did not proceed to second-factor
+                     * authentication. Return to normal live-camera state.
+                     */
+                    if (app_controller_handle_event(APP_EVENT_FACE_UNKNOWN)) {
+                        ESP_LOGI(
+                            TAG,
+                            "[APP-STATE] AUTHENTICATING -> CAMERA_ACTIVE");
+                    } else {
+                        ESP_LOGW(
+                            TAG,
+                            "[APP-STATE] FACE_UNKNOWN did not cause a transition");
+                    }
                 }
 
                 ESP_LOGI(TAG,
@@ -1390,47 +801,12 @@ static void ai_worker_task(void *arg)
         }
 
         xSemaphoreGive(ai_inference_mutex);
-        ai_worker_mark_idle();
+        vision_ai_worker_state_mark_idle();
 
         if (pin_transition_requested) {
             (void)authentication_launch_pin_transition();
         }
     }
-}
-
-static bool ai_worker_pause_and_drain(uint32_t timeout_ms)
-{
-    const TickType_t start_tick = xTaskGetTickCount();
-    const TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
-
-    portENTER_CRITICAL(&ai_worker_state_lock);
-    ai_worker_accepting = false;
-    ai_job_pending = false;
-    portEXIT_CRITICAL(&ai_worker_state_lock);
-
-    for (;;) {
-        bool busy;
-        portENTER_CRITICAL(&ai_worker_state_lock);
-        busy = ai_worker_busy;
-        portEXIT_CRITICAL(&ai_worker_state_lock);
-
-        if (!busy) {
-            return true;
-        }
-
-        if ((xTaskGetTickCount() - start_tick) >= timeout_ticks) {
-            return false;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-
-static void ai_worker_resume_accepting(void)
-{
-    portENTER_CRITICAL(&ai_worker_state_lock);
-    ai_worker_accepting = true;
-    portEXIT_CRITICAL(&ai_worker_state_lock);
 }
 
 static bool schedule_ai_snapshot(
@@ -1446,38 +822,30 @@ static bool schedule_ai_snapshot(
         return false;
     }
 
-    bool reserved = false;
-    portENTER_CRITICAL(&ai_worker_state_lock);
-    if (ai_worker_accepting && !ai_worker_busy && !ai_job_pending) {
-        ai_job_pending = true;
-        reserved = true;
-    }
-    portEXIT_CRITICAL(&ai_worker_state_lock);
-
-    if (!reserved) {
+    if (!vision_ai_worker_state_try_reserve()) {
         return false;
     }
 
     uint32_t snapshot_width = 0;
     uint32_t snapshot_height = 0;
-    ai_snapshot_dimensions(
+    vision_ai_snapshot_dimensions(
         camera_width,
         camera_height,
         &snapshot_width,
         &snapshot_height);
 
     size_t written_bytes = 0;
-    if (!copy_camera_to_ai_snapshot(
+    if (!vision_ai_snapshot_copy(
             camera_buf,
             camera_buf_len,
             camera_width,
             camera_height,
+            ai_snapshot_buffer,
+            ai_snapshot_capacity,
             snapshot_width,
             snapshot_height,
             &written_bytes)) {
-        portENTER_CRITICAL(&ai_worker_state_lock);
-        ai_job_pending = false;
-        portEXIT_CRITICAL(&ai_worker_state_lock);
+        vision_ai_worker_state_cancel_reservation();
         ESP_LOGE(TAG, "Could not copy camera frame into AI snapshot");
         return false;
     }
@@ -1490,15 +858,17 @@ static bool schedule_ai_snapshot(
             ESP_CACHE_MSYNC_FLAG_DIR_C2M);
     }
 
-    portENTER_CRITICAL(&ai_worker_state_lock);
-    ai_pending_job.frame_id = current_frame;
-    ai_pending_job.source_width = camera_width;
-    ai_pending_job.source_height = camera_height;
-    ai_pending_job.width = snapshot_width;
-    ai_pending_job.height = snapshot_height;
-    ai_pending_job.data_size = written_bytes;
-    ai_pending_job.idle_scan_frame = idle_scan_frame;
-    portEXIT_CRITICAL(&ai_worker_state_lock);
+    const vision_ai_worker_job_t job = {
+        .frame_id = current_frame,
+        .source_width = camera_width,
+        .source_height = camera_height,
+        .width = snapshot_width,
+        .height = snapshot_height,
+        .data_size = written_bytes,
+        .idle_scan_frame = idle_scan_frame,
+    };
+
+    vision_ai_worker_state_commit_job(&job);
 
     xTaskNotifyGive(ai_worker_task_handle);
     return true;
@@ -1537,12 +907,44 @@ static void prepare_application_for_sleep(void *user_data)
     (void)user_data;
 
     /*
+     * The power service has accepted a real Deep-sleep request and is now
+     * beginning the destructive shutdown sequence.
+     *
+     * Valid sources include:
+     *
+     *     LAUNCHER
+     *     SETTINGS
+     *     CAMERA_ACTIVE
+     *     AUTHENTICATING
+     *     PIN_ENTRY
+     *     LIGHT_SLEEP
+     *
+     * All transition to:
+     *
+     *     DEEP_SLEEP
+     *
+     * The controller only records the application lifecycle here. It does
+     * not control or delay the existing hardware shutdown sequence.
+     */
+    if (app_controller_handle_event(APP_EVENT_DEEP_SLEEP_REQUEST)) {
+        ESP_LOGI(
+            TAG,
+            "[APP-STATE] -> DEEP_SLEEP");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "[APP-STATE] DEEP_SLEEP_REQUEST did not cause a transition "
+            "(current_state=%d)",
+            (int)app_controller_get_state());
+    }
+
+    /*
      * Stop the frame callback from starting more PPA, detection,
      * recognition or LCD operations during shutdown.
      */
     dummy_mode_delay_flag = true;
 
-    if (!ai_worker_pause_and_drain(APP_AI_WORKER_DRAIN_TIMEOUT_MS)) {
+    if (!vision_ai_worker_state_pause_and_drain(APP_AI_WORKER_DRAIN_TIMEOUT_MS)) {
         ESP_LOGW(TAG, "AI worker did not drain before Deep-sleep shutdown");
     }
 
@@ -1651,14 +1053,7 @@ static esp_err_t suspend_display_for_idle_scan(void *user_data)
     /* Permit camera-only callbacks now that no DSI object can be accessed. */
     dummy_mode_delay_flag = false;
 
-    portENTER_CRITICAL(&authentication_state_lock);
-    pin_transition_pending = false;
-    pin_screen_active = false;
-    pin_rearm_required = false;
-    pin_rearm_no_face_passes = 0;
-    pending_identity[0] = '\0';
-    portEXIT_CRITICAL(&authentication_state_lock);
-
+    authentication_session_reset();
     xSemaphoreGive(display_mode_mutex);
 
     BaseType_t created = xTaskCreatePinnedToCore(
@@ -1751,7 +1146,7 @@ static void resume_display_from_idle_scan_task(void *arg)
     dummy_draw_enabled = true;
     display_buffer_index = 0;
     display_disable_lvgl_overlays();
-    ai_results_clear();
+    vision_face_result_store_clear();
 
     ret = app_video_stream_task_restart(video_cam_fd0);
     if (ret != ESP_OK) {
@@ -1825,7 +1220,7 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (!ai_worker_pause_and_drain(APP_AI_WORKER_DRAIN_TIMEOUT_MS)) {
+    if (!vision_ai_worker_state_pause_and_drain(APP_AI_WORKER_DRAIN_TIMEOUT_MS)) {
         ESP_LOGE(TAG, "Timed out draining AI worker before Light-sleep");
         return ESP_ERR_TIMEOUT;
     }
@@ -1837,7 +1232,7 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
      * display/camera hardware is destroyed.
      */
     if (!app_sleep_light_sleep_is_due()) {
-        ai_worker_resume_accepting();
+        vision_ai_worker_state_resume_accepting();
         ESP_LOGI(TAG, "Light-sleep canceled because AI/user activity arrived");
         return ESP_ERR_INVALID_STATE;
     }
@@ -1911,14 +1306,7 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
     dummy_draw_enabled = false;
     display_suspended_for_light_sleep = true;
 
-    portENTER_CRITICAL(&authentication_state_lock);
-    pin_transition_pending = false;
-    pin_screen_active = false;
-    pin_rearm_required = false;
-    pin_rearm_no_face_passes = 0;
-    pending_identity[0] = '\0';
-    portEXIT_CRITICAL(&authentication_state_lock);
-
+    authentication_session_reset();
     xSemaphoreGive(display_mode_mutex);
 
     if (ret != ESP_OK) {
@@ -1927,6 +1315,25 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
             "Display suspend completed with errors: %s",
             esp_err_to_name(ret));
         return ret;
+    }
+
+    /*
+     * Application-owned camera/display resources are now genuinely
+     * suspended. The power service will continue with auxiliary
+     * peripheral suspension and the actual Light-sleep call.
+     *
+     *     CAMERA_ACTIVE/PIN_ENTRY -> LIGHT_SLEEP
+     */
+    if (app_controller_handle_event(APP_EVENT_LIGHT_SLEEP_REQUEST)) {
+        ESP_LOGI(
+            TAG,
+            "[APP-STATE] -> LIGHT_SLEEP");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "[APP-STATE] LIGHT_SLEEP_REQUEST did not cause a transition "
+            "(current_state=%d)",
+            (int)app_controller_get_state());
     }
 
     ESP_LOGI(TAG, "Camera and MIPI-DSI suspended for Light-sleep");
@@ -2009,8 +1416,8 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
     display_backlight_enabled = false;
     display_suspended_for_light_sleep = false;
     dummy_mode_delay_flag = false;
-    ai_results_clear();
-    ai_worker_resume_accepting();
+    vision_face_result_store_clear();
+    vision_ai_worker_state_resume_accepting();
 
     xSemaphoreGive(display_mode_mutex);
 
@@ -2022,6 +1429,24 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
             "Could not reapply saved power policy after Light-sleep: %s",
             esp_err_to_name(ret));
         return ret;
+    }
+
+    /*
+     * Display, camera sensor, video stream, AI worker and saved
+     * component policy have all been restored successfully.
+     *
+     *     LIGHT_SLEEP -> CAMERA_ACTIVE
+     */
+    if (app_controller_handle_event(APP_EVENT_WAKE)) {
+        ESP_LOGI(
+            TAG,
+            "[APP-STATE] LIGHT_SLEEP -> CAMERA_ACTIVE");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "[APP-STATE] WAKE did not cause a transition "
+            "(current_state=%d)",
+            (int)app_controller_get_state());
     }
 
     ESP_LOGI(TAG, "Camera and display restored after Light-sleep");
@@ -2192,7 +1617,7 @@ static void camera_application_start_task(void *arg)
 
     const size_t ai_snapshot_raw_capacity =
         (size_t)APP_AI_SNAPSHOT_MAX_EDGE * APP_AI_SNAPSHOT_MAX_EDGE *
-        ai_snapshot_bytes_per_pixel();
+        vision_ai_snapshot_bytes_per_pixel();
     ai_snapshot_capacity = ALIGN_UP(ai_snapshot_raw_capacity, data_cache_line_size);
     ai_snapshot_buffer = heap_caps_aligned_calloc(
         data_cache_line_size,
@@ -2232,7 +1657,7 @@ static void camera_application_start_task(void *arg)
         return;
     }
 
-    ai_worker_resume_accepting();
+    vision_ai_worker_state_resume_accepting();
     ESP_LOGI(TAG,
              "Async AI ready: core=%d snapshot_max=%ux%u bytes=%u",
              APP_AI_WORKER_CORE,
@@ -2304,6 +1729,23 @@ static void camera_application_start_task(void *arg)
             esp_err_to_name(ret));
     }
 
+    /*
+     * Camera, AI worker and live display path are now initialized.
+     *
+     *     LAUNCHER -> CAMERA_ACTIVE
+     *
+     * The event is intentionally dispatched only here, after successful
+     * camera startup. If initialization fails earlier, the controller
+     * remains in LAUNCHER.
+     */
+    if (app_controller_handle_event(APP_EVENT_START_CAMERA)) {
+        ESP_LOGI(TAG, "[APP-STATE] LAUNCHER -> CAMERA_ACTIVE");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "[APP-STATE] START_CAMERA did not cause a transition");
+    }
+
     ESP_LOGI(TAG, "Launcher completed; camera application is running");
     vTaskDelete(NULL);
 }
@@ -2346,6 +1788,20 @@ static void show_settings_task(void *arg)
     /* The launcher event has returned, so it is safe to take the LVGL mutex. */
     app_ui_destroy();
     settings_screen_create(settings_back_requested, NULL);
+
+    /*
+     * The Settings view now owns the application UI.
+     *
+     *     LAUNCHER -> SETTINGS
+     */
+    if (app_controller_handle_event(APP_EVENT_OPEN_SETTINGS)) {
+        ESP_LOGI(TAG, "[APP-STATE] LAUNCHER -> SETTINGS");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "[APP-STATE] OPEN_SETTINGS did not cause a transition");
+    }
+
     vTaskDelete(NULL);
 }
 
@@ -2359,6 +1815,20 @@ static void show_launcher_task(void *arg)
         launcher_start_requested,
         launcher_settings_requested,
         NULL);
+
+    /*
+     * The launcher view now owns the application UI again.
+     *
+     *     SETTINGS -> LAUNCHER
+     */
+    if (app_controller_handle_event(APP_EVENT_SETTINGS_BACK)) {
+        ESP_LOGI(TAG, "[APP-STATE] SETTINGS -> LAUNCHER");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "[APP-STATE] SETTINGS_BACK did not cause a transition");
+    }
+
     vTaskDelete(NULL);
 }
 
@@ -2402,6 +1872,8 @@ static void settings_back_requested(void *user_data)
 void app_main(void)
 {
     app_logging_init();
+
+    app_controller_init(NULL, NULL);
 
     esp_err_t settings_ret = app_settings_init();
     if (settings_ret != ESP_OK) {
@@ -2493,6 +1965,26 @@ void app_main(void)
     bsp_display_backlight_on();
     display_backlight_enabled = true;
 
+
+    /*
+     * The launcher is now fully initialized and visible.
+     * This is the first live application-state transition:
+     *
+     *     BOOTING -> LAUNCHER
+     *
+     * No camera, authentication or sleep behavior is
+     * controlled by the state machine yet.
+     */
+    if (app_controller_handle_event(APP_EVENT_BOOT_COMPLETE)) {
+        ESP_LOGI(
+            TAG,
+            "[APP-STATE] BOOTING -> LAUNCHER");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "[APP-STATE] BOOT_COMPLETE did not cause a transition");
+    }
+
     esp_err_t light_callbacks_ret =
         app_sleep_register_light_sleep_callbacks(
             suspend_application_for_light_sleep,
@@ -2576,7 +2068,7 @@ static void camera_video_frame_process(
 
     if ((!dummy_draw_enabled && !idle_scan_frame) ||
         (dummy_mode_delay_flag && !idle_scan_frame) ||
-        authentication_blocks_camera()) {
+        authentication_session_blocks_camera()) {
         return;
     }
 
@@ -2657,14 +2149,13 @@ static void camera_video_frame_process(
 #if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
         face_box_t overlay_boxes[APP_MAX_FACE_BOXES] = {0};
         char overlay_names[APP_MAX_FACE_BOXES][FACE_RECOG_MAX_NAME_LEN] = {{0}};
-        int overlay_count = 0;
 
-        portENTER_CRITICAL(&ai_result_lock);
-        overlay_count = last_face_count;
-        if (overlay_count > APP_MAX_FACE_BOXES) overlay_count = APP_MAX_FACE_BOXES;
-        memcpy(overlay_boxes, last_boxes, sizeof(overlay_boxes));
-        memcpy(overlay_names, last_face_names, sizeof(overlay_names));
-        portEXIT_CRITICAL(&ai_result_lock);
+        const int overlay_count =
+            vision_face_result_store_snapshot(
+                overlay_boxes,
+                overlay_names,
+                NULL,
+                APP_MAX_FACE_BOXES);
 
         if (overlay_count > 0) {
 #if APP_SYNC_CACHE_AROUND_OVERLAY
@@ -2681,7 +2172,7 @@ static void camera_video_frame_process(
                     strcmp(overlay_names[i], "unknown") != 0;
                 const uint16_t overlay_color = recognized ? 0x07E0 : 0xF800;
 
-                draw_thick_rect_rgb565(
+                face_overlay_renderer_draw_box_rgb565(
                     (uint16_t *)target_fb,
                     display_width,
                     display_height,
@@ -2692,7 +2183,7 @@ static void camera_video_frame_process(
                     APP_FACE_BOX_THICKNESS,
                     overlay_color);
 
-                draw_face_label_rgb565(
+                face_overlay_renderer_draw_label_rgb565(
                     (uint16_t *)target_fb,
                     display_width,
                     display_height,

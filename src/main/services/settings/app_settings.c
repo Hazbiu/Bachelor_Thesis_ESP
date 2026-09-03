@@ -1,4 +1,4 @@
-#include "settings/app_settings.h"
+#include "services/settings/app_settings.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -12,9 +12,9 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
-#include "power_save/component_ethernet.h"
-#include "power_save/component_runtime_policy.h"
-#include "power_save/component_wifi.h"
+#include "platform/power/component_ethernet.h"
+#include "services/power/component_runtime_policy.h"
+#include "platform/power/component_wifi.h"
 
 #define SETTINGS_NAMESPACE "app_settings"
 #define KEY_DARK_MODE       "dark"

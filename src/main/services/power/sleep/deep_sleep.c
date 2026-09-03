@@ -1,4 +1,4 @@
-#include "deep_sleep.h"
+#include "services/power/sleep/deep_sleep.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -12,10 +12,10 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
-#include "power_save/component_audio.h"
-#include "power_save/component_display.h"
-#include "power_save/component_ethernet.h"
-#include "power_save/component_wifi.h"
+#include "platform/power/component_audio.h"
+#include "platform/power/component_display.h"
+#include "platform/power/component_ethernet.h"
+#include "platform/power/component_wifi.h"
 #include "soc/soc_caps.h"
 
 static const char *TAG = "deep_sleep";

@@ -1,4 +1,4 @@
-#include "power_save/cpu_power.h"
+#include "platform/power/cpu_power.h"
 
 #include <inttypes.h>
 #include <stdbool.h>

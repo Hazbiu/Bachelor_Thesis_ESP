@@ -1,10 +1,10 @@
-#include "power_save/component_runtime_policy.h"
+#include "services/power/component_runtime_policy.h"
 
 #include "bsp/esp-bsp.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "power_save/component_audio.h"
-#include "power_save/component_sdcard.h"
+#include "platform/power/component_audio.h"
+#include "platform/power/component_sdcard.h"
 
 static const char *TAG = "runtime_policy";
 

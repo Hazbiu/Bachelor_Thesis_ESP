@@ -1,4 +1,4 @@
-#include "power_save/component_sdcard.h"
+#include "platform/power/component_sdcard.h"
 
 #include <inttypes.h>
 #include <stdbool.h>

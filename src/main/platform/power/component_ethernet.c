@@ -1,4 +1,4 @@
-#include "power_save/component_ethernet.h"
+#include "platform/power/component_ethernet.h"
 
 #include <inttypes.h>
 #include <stdbool.h>

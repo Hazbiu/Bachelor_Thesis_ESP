@@ -3,14 +3,20 @@ idf_component_register(
         # Application orchestration
         "app/app_main.c"
         "app/app_boot.c"
+        "app/state/app_state_machine.c"
+        "app/controller/app_controller.c"
 
         # User interface
-        "ui/app_ui.c"
-        "ui/settings_screen.c"
-        "ui/pin_screen.c"
+        "ui/views/app_ui.c"
+        "ui/views/settings_screen.c"
+        "ui/views/pin_screen.c"
+        "ui/renderers/face_overlay_renderer.c"
+
+        # Authentication session
+        "services/authentication/authentication_session.c"
 
         # Persistent application settings
-        "settings/app_settings.c"
+        "services/settings/app_settings.c"
 
         # Camera platform
         "platform/camera/video_capture.c"
@@ -18,6 +24,11 @@ idf_component_register(
         # Vision public dispatchers
         "services/vision/face_detection/face_detector.cpp"
         "services/vision/face_recognition/face_recognizer.cpp"
+        "services/vision/recognition_policy.c"
+        "services/vision/face_geometry.c"
+        "services/vision/face_result_store.c"
+        "services/vision/ai_snapshot.c"
+        "services/vision/ai_worker_state.c"
 
         # ESP-DL reference backend
         "services/vision/face_detection/face_detector_espdl.cpp"
@@ -32,17 +43,17 @@ idf_component_register(
         "services/vision/face_recognition/face_recognizer_tflm_int8.cpp"
 
         # Power management and sleep modes
-        "power/app_sleep.c"
-        "power/light_sleep.c"
-        "power/deep_sleep.c"
-        "power/wake_up.c"
-        "power/cpu_power.c"
-        "power/component_wifi.c"
-        "power/component_ethernet.c"
-        "power/component_runtime_policy.c"
-        "power/component_sdcard.c"
-        "power/component_audio.c"
-        "power/component_display.c"
+        "services/power/sleep/app_sleep.c"
+        "services/power/sleep/light_sleep.c"
+        "services/power/sleep/deep_sleep.c"
+        "services/power/sleep/wake_up.c"
+        "platform/power/cpu_power.c"
+        "platform/power/component_wifi.c"
+        "platform/power/component_ethernet.c"
+        "services/power/component_runtime_policy.c"
+        "platform/power/component_sdcard.c"
+        "platform/power/component_audio.c"
+        "platform/power/component_display.c"
 
         # Diagnostics
         "diagnostics/app_logging.c"
@@ -52,7 +63,7 @@ idf_component_register(
     INCLUDE_DIRS
         "include"
         "ui"
-        "power"
+        "ui/views"
 
     PRIV_REQUIRES
         nvs_flash

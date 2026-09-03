@@ -1,4 +1,4 @@
-#include "power_save/component_display.h"
+#include "platform/power/component_display.h"
 
 #include <stdbool.h>
 #include <stdint.h>
