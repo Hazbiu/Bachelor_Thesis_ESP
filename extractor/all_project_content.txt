@@ -1,5 +1,5 @@
 COMPLETE ESP32-P4 + ESP32-C6 PROJECT EXPORT
-Generated on: Thu Sep  3 08:23:29 PM CEST 2026
+Generated on: Thu Sep  3 08:55:18 PM CEST 2026
 Project: /home/admin/Programming/Bachelor_Thesis_ESP
 
 ==================================================
@@ -29,12 +29,12 @@ Excluded:
 FILE COUNTS
 ==================================================
 
-P4 main application : 104
+P4 main application : 116
 C6 firmware         : 5
 P4-C6 direct flasher: 8
 Utilities           : 6
 Other config files  : 12
-Total               : 135
+Total               : 147
 
 ==================================================
 DEEP-SLEEP ARCHITECTURE
@@ -100,7 +100,11 @@ src/components/waveshare__esp32_p4_platform/CMakeLists.txt
 src/deep_sleep_fix/main/CMakeLists.txt
 src/main/app/app_boot.c
 src/main/app/app_main.c
+src/main/app/app_runtime.c
+src/main/app/authentication/authentication_flow.c
+src/main/app/camera/camera_session.c
 src/main/app/controller/app_controller.c
+src/main/app/navigation/app_navigation.c
 src/main/app/state/app_state_machine.c
 src/main/CMakeLists.txt
 src/main/diagnostics/ai_pipeline_status.c
@@ -108,7 +112,11 @@ src/main/diagnostics/app_logging.c
 src/main/diagnostics/cpu_stats.c
 src/main/idf_component.yml
 src/main/include/app/app_boot.h
+src/main/include/app/app_runtime.h
+src/main/include/app/authentication/authentication_flow.h
+src/main/include/app/camera/camera_session.h
 src/main/include/app/controller/app_controller.h
+src/main/include/app/navigation/app_navigation.h
 src/main/include/app/state/app_state_machine.h
 src/main/include/config/ai_backend_selection.h
 src/main/include/config/app_config.h
@@ -134,6 +142,7 @@ src/main/include/platform/storage/sd_card_storage.h
 src/main/include/platform/storage/spiffs_storage.h
 src/main/include/services/authentication/authentication_session.h
 src/main/include/services/power/component_runtime_policy.h
+src/main/include/services/power/power_manager.h
 src/main/include/services/power/sleep/app_sleep.h
 src/main/include/services/power/sleep/deep_sleep.h
 src/main/include/services/power/sleep/light_sleep.h
@@ -143,6 +152,7 @@ src/main/include/services/vision/ai_inference_guard.h
 src/main/include/services/vision/ai_snapshot_buffer.h
 src/main/include/services/vision/ai_snapshot.h
 src/main/include/services/vision/ai_snapshot_scheduler.h
+src/main/include/services/vision/ai_worker_pipeline.h
 src/main/include/services/vision/ai_worker_runtime.h
 src/main/include/services/vision/ai_worker_state.h
 src/main/include/services/vision/backends/face_detector_backend.h
@@ -169,6 +179,7 @@ src/main/platform/storage/sd_card_storage.c
 src/main/platform/storage/spiffs_storage.c
 src/main/services/authentication/authentication_session.c
 src/main/services/power/component_runtime_policy.c
+src/main/services/power/power_manager.c
 src/main/services/power/sleep/app_sleep.c
 src/main/services/power/sleep/deep_sleep.c
 src/main/services/power/sleep/light_sleep.c
@@ -178,6 +189,7 @@ src/main/services/vision/ai_inference_guard.c
 src/main/services/vision/ai_snapshot_buffer.c
 src/main/services/vision/ai_snapshot.c
 src/main/services/vision/ai_snapshot_scheduler.c
+src/main/services/vision/ai_worker_pipeline.c
 src/main/services/vision/ai_worker_runtime.c
 src/main/services/vision/ai_worker_state.c
 src/main/services/vision/face_detection/face_detector.cpp
@@ -7497,6 +7509,510 @@ void app_boot_initialize_services(void)
 ==================================================
 FILE: src/main/app/app_main.c
 ==================================================
+#include "app/app_runtime.h"
+
+
+void app_main(void)
+{
+    app_runtime_start();
+}
+
+
+==================================================
+FILE: src/main/app/app_runtime.c
+==================================================
+#include "app/app_runtime.h"
+
+#include "app/camera/camera_session.h"
+#include "app/controller/app_controller.h"
+#include "app/navigation/app_navigation.h"
+#include "config/app_config.h"
+#include "config/log_config.h"
+#include "diagnostics/app_logging.h"
+#include "diagnostics/core_trace.h"
+#include "diagnostics/cpu_stats.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "platform/power/cpu_power.h"
+#include "services/power/sleep/wake_up.h"
+#include "services/settings/app_settings.h"
+
+
+static const char *TAG = "app_main";
+
+
+void app_runtime_start(void)
+{
+    app_logging_init();
+
+    app_controller_init(NULL, NULL);
+
+    esp_err_t settings_ret = app_settings_init();
+    if (settings_ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "Persistent settings unavailable; in-memory defaults are active: %s",
+                 esp_err_to_name(settings_ret));
+    }
+
+    esp_err_t power_policy_ret = app_settings_apply_power_policy();
+    if (power_policy_ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "Initial power policy application failed: %s",
+                 esp_err_to_name(power_policy_ret));
+    }
+
+    ESP_LOGI(TAG,
+             "[CORE-PROOF] Application split: system_cpu=%d ai_cpu=%d",
+             APP_SYSTEM_WORKER_CORE,
+             APP_AI_WORKER_CORE);
+
+    report_wake_reason();
+    core_trace(TAG, "APP_MAIN_START");
+
+    esp_err_t cpu_power_ret = cpu_power_init();
+    if (cpu_power_ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "CPU power management initialization failed: %s",
+            esp_err_to_name(cpu_power_ret));
+    }
+
+#if APP_DIAGNOSTICS_CPU_STATS_ENABLED
+    diagnostics_start_cpu_stats_monitor();
+#endif
+
+    if (app_navigation_start() != ESP_OK) {
+        return;
+    }
+
+    (void)camera_session_setup_power_management();
+}
+
+
+==================================================
+FILE: src/main/app/authentication/authentication_flow.c
+==================================================
+#include "app/authentication/authentication_flow.h"
+
+#include "app/controller/app_controller.h"
+#include "bsp/display.h"
+#include "bsp/esp-bsp.h"
+#include "bsp/esp32_p4_platform.h"
+#include "config/app_config.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "platform/camera/video_capture.h"
+#include "services/authentication/authentication_session.h"
+#include "services/power/sleep/app_sleep.h"
+#include "services/vision/face_recognizer.h"
+#include "services/vision/face_result_store.h"
+#include "pin_screen.h"
+
+
+static const char *TAG = "app_main";
+static authentication_flow_context_t s_context;
+
+
+void authentication_flow_initialize(
+    const authentication_flow_context_t *context)
+{
+    if (context != NULL) {
+        s_context = *context;
+    }
+}
+
+
+static SemaphoreHandle_t authentication_display_mode_mutex(void)
+{
+    return s_context.display_mode_mutex != NULL
+        ? *s_context.display_mode_mutex
+        : NULL;
+}
+
+
+static lv_display_t *authentication_display(void)
+{
+    return s_context.display != NULL
+        ? *s_context.display
+        : NULL;
+}
+
+
+static int authentication_video_fd(void)
+{
+    return s_context.video_fd != NULL
+        ? *s_context.video_fd
+        : -1;
+}
+
+
+static void authentication_set_display_buffer_index(
+    uint8_t index)
+{
+    if (s_context.display_buffer_index != NULL) {
+        *s_context.display_buffer_index = index;
+    }
+}
+
+
+static void authentication_set_dummy_draw_enabled(
+    bool enabled)
+{
+    if (s_context.dummy_draw_enabled != NULL) {
+        *s_context.dummy_draw_enabled = enabled;
+    }
+}
+
+
+static esp_err_t authentication_release_face_boost(
+    const char *reason)
+{
+    if (s_context.release_face_boost == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return s_context.release_face_boost(reason);
+}
+
+
+static void authentication_mark_transition_failed(void)
+{
+    authentication_session_mark_transition_failed();
+
+    authentication_release_face_boost("PIN transition failed");
+
+    /*
+     * Camera operation remains the fallback when the PIN transition cannot
+     * be completed. Keep the FSM synchronized with that existing behavior.
+     */
+    if (app_controller_get_state() == APP_STATE_AUTHENTICATING) {
+        if (app_controller_handle_event(APP_EVENT_FACE_UNKNOWN)) {
+            ESP_LOGI(
+                TAG,
+                "[APP-STATE] AUTHENTICATING -> CAMERA_ACTIVE "
+                "(PIN transition failed)");
+        }
+    }
+}
+
+static void camera_resume_task(void *arg)
+{
+    (void)arg;
+
+    /* Leave the success state visible briefly before restoring live video. */
+    vTaskDelay(pdMS_TO_TICKS(350));
+
+    if (app_sleep_is_requested()) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (!authentication_display_mode_mutex() ||
+        xSemaphoreTake(authentication_display_mode_mutex(), pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGE(TAG, "Timed out while waiting to restore camera display mode");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /*
+     * The camera stream is genuinely stopped for the PIN screen. Restore LVGL
+     * ownership first, then restart capture while authentication still blocks
+     * frame callbacks. Only after the stream is healthy do we reopen the
+     * camera/display path to normal frames.
+     */
+    pin_screen_hide();
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    esp_err_t ret = esp_lv_adapter_set_dummy_draw(authentication_display(), true);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "Could not restore camera display mode: %s",
+                 esp_err_to_name(ret));
+        xSemaphoreGive(authentication_display_mode_mutex());
+        vTaskDelete(NULL);
+        return;
+    }
+
+    vision_face_result_store_clear();
+    authentication_set_display_buffer_index(0);
+    authentication_set_dummy_draw_enabled(true);
+
+    ret = app_video_stream_task_restart(authentication_video_fd());
+    if (ret != ESP_OK) {
+        authentication_set_dummy_draw_enabled(false);
+        ESP_LOGE(TAG,
+                 "Could not restart camera after PIN screen: %s",
+                 esp_err_to_name(ret));
+        xSemaphoreGive(authentication_display_mode_mutex());
+        vTaskDelete(NULL);
+        return;
+    }
+
+    authentication_session_mark_camera_active_after_pin();
+
+    /*
+     * The PIN was accepted and the camera stream has now been
+     * successfully restored.
+     *
+     *     PIN_ENTRY -> CAMERA_ACTIVE
+     *
+     * Dispatch this only after app_video_stream_task_restart()
+     * succeeds so the FSM reflects the real application state.
+     */
+    if (app_controller_handle_event(APP_EVENT_PIN_COMPLETE)) {
+        ESP_LOGI(
+            TAG,
+            "[APP-STATE] PIN_ENTRY -> CAMERA_ACTIVE");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "[APP-STATE] PIN_COMPLETE did not cause a transition");
+    }
+
+    app_sleep_notify_face_detected();
+    xSemaphoreGive(authentication_display_mode_mutex());
+
+    ESP_LOGI(TAG, "PIN accepted; camera stream and display mode restored");
+    vTaskDelete(NULL);
+}
+
+static void pin_accepted_callback(void *user_data)
+{
+    (void)user_data;
+
+    if (app_sleep_is_requested()) {
+        return;
+    }
+
+    BaseType_t created = xTaskCreatePinnedToCore(
+        camera_resume_task,
+        "camera_resume",
+        4096,
+        NULL,
+        7,
+        NULL,
+        APP_SYSTEM_WORKER_CORE);
+
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create camera-resume task");
+    }
+}
+
+static void pin_screen_transition_task(void *arg)
+{
+    (void)arg;
+
+    if (!authentication_display_mode_mutex() ||
+        xSemaphoreTake(authentication_display_mode_mutex(), pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGE(TAG, "Timed out while waiting to show PIN screen");
+        authentication_mark_transition_failed();
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (app_sleep_is_requested()) {
+        authentication_mark_transition_failed();
+        xSemaphoreGive(authentication_display_mode_mutex());
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /*
+     * Stop the actual V4L2 stream for the PIN screen instead of merely ignoring
+     * frame callbacks. This removes camera/ISP work while LVGL handles touch
+     * input and prevents an old camera framebuffer/face box from being scanned
+     * out underneath the PIN UI.
+     */
+    esp_err_t ret = app_video_stream_task_stop(authentication_video_fd());
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "Could not pause camera for PIN screen: %s",
+                 esp_err_to_name(ret));
+        authentication_mark_transition_failed();
+        xSemaphoreGive(authentication_display_mode_mutex());
+        vTaskDelete(NULL);
+        return;
+    }
+
+    vision_face_result_store_clear();
+    authentication_set_display_buffer_index(0);
+
+    ret = esp_lv_adapter_set_dummy_draw(authentication_display(), false);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "Could not enable LVGL PIN-screen mode: %s",
+                 esp_err_to_name(ret));
+        (void)app_video_stream_task_restart(authentication_video_fd());
+        authentication_mark_transition_failed();
+        xSemaphoreGive(authentication_display_mode_mutex());
+        vTaskDelete(NULL);
+        return;
+    }
+
+    authentication_set_dummy_draw_enabled(false);
+
+    char pending_identity[FACE_RECOG_MAX_NAME_LEN] = {0};
+
+    authentication_session_copy_pending_identity(
+        pending_identity,
+        sizeof(pending_identity));
+
+    ret = pin_screen_show(
+        pending_identity,
+        pin_accepted_callback,
+        NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not create PIN screen: %s", esp_err_to_name(ret));
+
+        esp_err_t restore_ret = esp_lv_adapter_set_dummy_draw(authentication_display(), true);
+        if (restore_ret == ESP_OK) {
+            authentication_set_dummy_draw_enabled(true);
+            (void)app_video_stream_task_restart(authentication_video_fd());
+        } else {
+            ESP_LOGE(TAG,
+                     "Could not recover camera display mode: %s",
+                     esp_err_to_name(restore_ret));
+        }
+
+        authentication_mark_transition_failed();
+        xSemaphoreGive(authentication_display_mode_mutex());
+        vTaskDelete(NULL);
+        return;
+    }
+
+    authentication_session_mark_pin_active();
+
+    /*
+     * pin_screen_show() succeeded and completed its synchronous first
+     * full-screen render, so the PIN UI now genuinely owns the application.
+     *
+     *     AUTHENTICATING -> PIN_ENTRY
+     */
+    if (app_controller_handle_event(APP_EVENT_FACE_RECOGNIZED)) {
+        ESP_LOGI(
+            TAG,
+            "[APP-STATE] AUTHENTICATING -> PIN_ENTRY");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "[APP-STATE] FACE_RECOGNIZED did not cause a transition");
+    }
+
+    /*
+     * pin_screen_show() performs a synchronous full-screen LVGL refresh before
+     * returning. Keep the 360 MHz AI boost through that refresh, then return to
+     * the normal 180 MHz baseline exactly as before.
+     */
+    const esp_err_t boost_release_ret =
+        authentication_release_face_boost("PIN screen fully rendered");
+
+    xSemaphoreGive(authentication_display_mode_mutex());
+    ESP_LOGI(
+        TAG,
+        "Camera stream paused; PIN screen is active; CPU baseline release=%s",
+        esp_err_to_name(boost_release_ret));
+    vTaskDelete(NULL);
+}
+
+/*
+ * Reserve the authentication transition and copy the identity only.
+ *
+ * The AI worker deliberately launches the PIN task AFTER releasing the AI
+ * inference mutex. That creates a strict ordering:
+ *
+ *     detector -> recognizer -> unlock AI -> PIN transition
+ *
+ * and prevents the UI transition from racing the detector/recognizer chain
+ * while the shared inference lock is still owned by the AI worker.
+ */
+bool authentication_flow_request_pin(const char *recognized_name)
+{
+    /*
+     * Sleep remains an application/power concern.
+     * Authentication state itself belongs to the session service.
+     */
+    if (app_sleep_is_requested()) {
+        return false;
+    }
+
+    return authentication_session_reserve_pin_identity(
+        recognized_name);
+}
+
+
+bool authentication_flow_launch_pin_transition(void)
+{
+    BaseType_t created = xTaskCreatePinnedToCore(
+        pin_screen_transition_task,
+        "pin_screen",
+        6144,
+        NULL,
+        7,
+        NULL,
+        APP_SYSTEM_WORKER_CORE);
+
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create PIN-screen transition task");
+        authentication_mark_transition_failed();
+        return false;
+    }
+
+    return true;
+}
+
+void authentication_flow_on_recognition_started(void)
+{
+    /*
+     * A real recognition pass is starting now.
+     *
+     *     CAMERA_ACTIVE -> AUTHENTICATING
+     *
+     * Do not move this transition to the CPU boost acquisition:
+     * the boost begins before detection and therefore also covers
+     * frames where no face is found.
+     */
+    if (app_controller_get_state() == APP_STATE_CAMERA_ACTIVE) {
+        if (app_controller_handle_event(APP_EVENT_FACE_DETECTED)) {
+            ESP_LOGI(
+                TAG,
+                "[APP-STATE] CAMERA_ACTIVE -> AUTHENTICATING");
+        } else {
+            ESP_LOGW(
+                TAG,
+                "[APP-STATE] FACE_DETECTED did not cause a transition");
+        }
+    }
+}
+
+
+void authentication_flow_on_recognition_not_authenticated(void)
+{
+    if (app_controller_get_state() == APP_STATE_AUTHENTICATING) {
+        /*
+         * This recognition pass did not proceed to second-factor
+         * authentication. Return to normal live-camera state.
+         */
+        if (app_controller_handle_event(APP_EVENT_FACE_UNKNOWN)) {
+            ESP_LOGI(
+                TAG,
+                "[APP-STATE] AUTHENTICATING -> CAMERA_ACTIVE");
+        } else {
+            ESP_LOGW(
+                TAG,
+                "[APP-STATE] FACE_UNKNOWN did not cause a transition");
+        }
+    }
+}
+
+
+
+
+==================================================
+FILE: src/main/app/camera/camera_session.c
+==================================================
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -7526,13 +8042,16 @@ FILE: src/main/app/app_main.c
 #include "services/vision/ai_snapshot_scheduler.h"
 #include "services/vision/ai_worker_state.h"
 #include "services/vision/ai_worker_runtime.h"
+#include "services/vision/ai_worker_pipeline.h"
 #include "services/vision/ai_inference_guard.h"
 #include "diagnostics/core_trace.h"
 #include "diagnostics/app_logging.h"
 #include "diagnostics/cpu_stats.h"
 #include "diagnostics/ai_pipeline_status.h"
 #include "app/app_boot.h"
+#include "app/camera/camera_session.h"
 #include "app/controller/app_controller.h"
+#include "app/authentication/authentication_flow.h"
 #include "services/authentication/authentication_session.h"
 #include "app_ui.h"
 #include "settings_screen.h"
@@ -7555,6 +8074,7 @@ FILE: src/main/app/app_main.c
 #include "config/log_config.h"
 #include "services/power/sleep/app_sleep.h"
 #include "services/power/component_runtime_policy.h"
+#include "services/power/power_manager.h"
 #include "services/settings/app_settings.h"
 
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
@@ -7591,7 +8111,6 @@ static void camera_video_frame_process(
     size_t camera_buf_len,
     void *user_data);
 
-static bool authentication_request_pin(const char *recognized_name);
 static bool idle_scan_display_is_suspended(void);
 
 static const char *TAG = "app_main";
@@ -7630,6 +8149,68 @@ static bool dummy_mode_delay_flag = false;
  * use this mutex to serialize the ownership hand-off.
  */
 static SemaphoreHandle_t display_mode_mutex;
+
+
+esp_err_t camera_session_prepare_launcher_display(void)
+{
+    /*
+     * Phase 1: normal LVGL rendering. The user sees a proper launcher and the
+     * camera/AI pipeline is not initialized until Start Camera is pressed.
+     */
+    disp = display_platform_start();
+    if (!disp) {
+        ESP_LOGE(TAG,
+                 "Display/touch initialization failed. Check the selected Waveshare "
+                 "display in menuconfig and the touch cable.");
+        return ESP_FAIL;
+    }
+
+    /*
+     * bsp_display_start() starts the LVGL worker asynchronously. Normal LVGL
+     * mode is already active at boot, so do not force another dummy-mode
+     * transition here.
+     */
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    /* The display startup creates the shared BSP I2C bus used by ES8311. */
+    esp_err_t post_display_policy_ret = app_settings_apply_power_policy();
+    if (post_display_policy_ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Post-display power policy application failed: %s",
+            esp_err_to_name(post_display_policy_ret));
+    }
+
+    display_platform_disable_lvgl_overlays(disp);
+
+    /*
+     * The BSP initializes GT911 and registers the LVGL input device inside
+     * bsp_display_start(). Use the BSP-owned handle directly.
+     */
+    launcher_touch_indev = display_platform_get_input_device();
+    if (launcher_touch_indev) {
+        ESP_LOGI(TAG,
+                 "BSP touchscreen ready: type=%d",
+                 (int)lv_indev_get_type(launcher_touch_indev));
+    } else {
+        ESP_LOGE(TAG, "BSP did not return an LVGL touchscreen input device");
+    }
+
+    return ESP_OK;
+}
+
+
+bool camera_session_launcher_touch_ready(void)
+{
+    return launcher_touch_indev != NULL;
+}
+
+
+void camera_session_enable_launcher_backlight(void)
+{
+    display_platform_backlight_on();
+    display_backlight_enabled = true;
+}
 
 static void log_psram_state(const char *stage)
 {
@@ -7721,7 +8302,6 @@ static void trim_display_buffers_for_sleep(void)
     log_psram_state("display_buffers_trimmed_for_sleep");
 }
 
-
 static esp_err_t face_boost_release(const char *reason)
 {
     if (!cpu_power_is_face_boost_active()) {
@@ -7740,553 +8320,8 @@ static esp_err_t face_boost_release(const char *reason)
     return ret;
 }
 
-static void authentication_mark_transition_failed(void)
+static void power_manager_on_deep_sleep_state_requested(void)
 {
-    authentication_session_mark_transition_failed();
-
-    face_boost_release("PIN transition failed");
-
-    /*
-     * Camera operation remains the fallback when the PIN transition cannot
-     * be completed. Keep the FSM synchronized with that existing behavior.
-     */
-    if (app_controller_get_state() == APP_STATE_AUTHENTICATING) {
-        if (app_controller_handle_event(APP_EVENT_FACE_UNKNOWN)) {
-            ESP_LOGI(
-                TAG,
-                "[APP-STATE] AUTHENTICATING -> CAMERA_ACTIVE "
-                "(PIN transition failed)");
-        }
-    }
-}
-
-static void camera_resume_task(void *arg)
-{
-    (void)arg;
-
-    /* Leave the success state visible briefly before restoring live video. */
-    vTaskDelay(pdMS_TO_TICKS(350));
-
-    if (app_sleep_is_requested()) {
-        vTaskDelete(NULL);
-        return;
-    }
-
-    if (!display_mode_mutex ||
-        xSemaphoreTake(display_mode_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        ESP_LOGE(TAG, "Timed out while waiting to restore camera display mode");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    /*
-     * The camera stream is genuinely stopped for the PIN screen. Restore LVGL
-     * ownership first, then restart capture while authentication still blocks
-     * frame callbacks. Only after the stream is healthy do we reopen the
-     * camera/display path to normal frames.
-     */
-    pin_screen_hide();
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    esp_err_t ret = esp_lv_adapter_set_dummy_draw(disp, true);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "Could not restore camera display mode: %s",
-                 esp_err_to_name(ret));
-        xSemaphoreGive(display_mode_mutex);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    vision_face_result_store_clear();
-    display_buffer_index = 0;
-    dummy_draw_enabled = true;
-
-    ret = app_video_stream_task_restart(video_cam_fd0);
-    if (ret != ESP_OK) {
-        dummy_draw_enabled = false;
-        ESP_LOGE(TAG,
-                 "Could not restart camera after PIN screen: %s",
-                 esp_err_to_name(ret));
-        xSemaphoreGive(display_mode_mutex);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    authentication_session_mark_camera_active_after_pin();
-
-    /*
-     * The PIN was accepted and the camera stream has now been
-     * successfully restored.
-     *
-     *     PIN_ENTRY -> CAMERA_ACTIVE
-     *
-     * Dispatch this only after app_video_stream_task_restart()
-     * succeeds so the FSM reflects the real application state.
-     */
-    if (app_controller_handle_event(APP_EVENT_PIN_COMPLETE)) {
-        ESP_LOGI(
-            TAG,
-            "[APP-STATE] PIN_ENTRY -> CAMERA_ACTIVE");
-    } else {
-        ESP_LOGW(
-            TAG,
-            "[APP-STATE] PIN_COMPLETE did not cause a transition");
-    }
-
-    app_sleep_notify_face_detected();
-    xSemaphoreGive(display_mode_mutex);
-
-    ESP_LOGI(TAG, "PIN accepted; camera stream and display mode restored");
-    vTaskDelete(NULL);
-}
-
-static void pin_accepted_callback(void *user_data)
-{
-    (void)user_data;
-
-    if (app_sleep_is_requested()) {
-        return;
-    }
-
-    BaseType_t created = xTaskCreatePinnedToCore(
-        camera_resume_task,
-        "camera_resume",
-        4096,
-        NULL,
-        7,
-        NULL,
-        APP_SYSTEM_WORKER_CORE);
-
-    if (created != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create camera-resume task");
-    }
-}
-
-static void pin_screen_transition_task(void *arg)
-{
-    (void)arg;
-
-    if (!display_mode_mutex ||
-        xSemaphoreTake(display_mode_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        ESP_LOGE(TAG, "Timed out while waiting to show PIN screen");
-        authentication_mark_transition_failed();
-        vTaskDelete(NULL);
-        return;
-    }
-
-    if (app_sleep_is_requested()) {
-        authentication_mark_transition_failed();
-        xSemaphoreGive(display_mode_mutex);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    /*
-     * Stop the actual V4L2 stream for the PIN screen instead of merely ignoring
-     * frame callbacks. This removes camera/ISP work while LVGL handles touch
-     * input and prevents an old camera framebuffer/face box from being scanned
-     * out underneath the PIN UI.
-     */
-    esp_err_t ret = app_video_stream_task_stop(video_cam_fd0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "Could not pause camera for PIN screen: %s",
-                 esp_err_to_name(ret));
-        authentication_mark_transition_failed();
-        xSemaphoreGive(display_mode_mutex);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    vision_face_result_store_clear();
-    display_buffer_index = 0;
-
-    ret = esp_lv_adapter_set_dummy_draw(disp, false);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "Could not enable LVGL PIN-screen mode: %s",
-                 esp_err_to_name(ret));
-        (void)app_video_stream_task_restart(video_cam_fd0);
-        authentication_mark_transition_failed();
-        xSemaphoreGive(display_mode_mutex);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    dummy_draw_enabled = false;
-
-    char pending_identity[FACE_RECOG_MAX_NAME_LEN] = {0};
-
-    authentication_session_copy_pending_identity(
-        pending_identity,
-        sizeof(pending_identity));
-
-    ret = pin_screen_show(
-        pending_identity,
-        pin_accepted_callback,
-        NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Could not create PIN screen: %s", esp_err_to_name(ret));
-
-        esp_err_t restore_ret = esp_lv_adapter_set_dummy_draw(disp, true);
-        if (restore_ret == ESP_OK) {
-            dummy_draw_enabled = true;
-            (void)app_video_stream_task_restart(video_cam_fd0);
-        } else {
-            ESP_LOGE(TAG,
-                     "Could not recover camera display mode: %s",
-                     esp_err_to_name(restore_ret));
-        }
-
-        authentication_mark_transition_failed();
-        xSemaphoreGive(display_mode_mutex);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    authentication_session_mark_pin_active();
-
-    /*
-     * pin_screen_show() succeeded and completed its synchronous first
-     * full-screen render, so the PIN UI now genuinely owns the application.
-     *
-     *     AUTHENTICATING -> PIN_ENTRY
-     */
-    if (app_controller_handle_event(APP_EVENT_FACE_RECOGNIZED)) {
-        ESP_LOGI(
-            TAG,
-            "[APP-STATE] AUTHENTICATING -> PIN_ENTRY");
-    } else {
-        ESP_LOGW(
-            TAG,
-            "[APP-STATE] FACE_RECOGNIZED did not cause a transition");
-    }
-
-    /*
-     * pin_screen_show() performs a synchronous full-screen LVGL refresh before
-     * returning. Keep the 360 MHz AI boost through that refresh, then return to
-     * the normal 180 MHz baseline exactly as before.
-     */
-    const esp_err_t boost_release_ret =
-        face_boost_release("PIN screen fully rendered");
-
-    xSemaphoreGive(display_mode_mutex);
-    ESP_LOGI(
-        TAG,
-        "Camera stream paused; PIN screen is active; CPU baseline release=%s",
-        esp_err_to_name(boost_release_ret));
-    vTaskDelete(NULL);
-}
-
-/*
- * Reserve the authentication transition and copy the identity only.
- *
- * The AI worker deliberately launches the PIN task AFTER releasing the AI
- * inference mutex. That creates a strict ordering:
- *
- *     detector -> recognizer -> unlock AI -> PIN transition
- *
- * and prevents the UI transition from racing the detector/recognizer chain
- * while the shared inference lock is still owned by the AI worker.
- */
-static bool authentication_request_pin(const char *recognized_name)
-{
-    /*
-     * Sleep remains an application/power concern.
-     * Authentication state itself belongs to the session service.
-     */
-    if (app_sleep_is_requested()) {
-        return false;
-    }
-
-    return authentication_session_reserve_pin_identity(
-        recognized_name);
-}
-
-
-static bool authentication_launch_pin_transition(void)
-{
-    BaseType_t created = xTaskCreatePinnedToCore(
-        pin_screen_transition_task,
-        "pin_screen",
-        6144,
-        NULL,
-        7,
-        NULL,
-        APP_SYSTEM_WORKER_CORE);
-
-    if (created != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create PIN-screen transition task");
-        authentication_mark_transition_failed();
-        return false;
-    }
-
-    return true;
-}
-
-static void ai_worker_task(void *arg)
-{
-    (void)arg;
-
-    ESP_LOGI(TAG, "[CORE-PROOF] AI worker running: actual_cpu=%d task=%s",
-             xPortGetCoreID(), pcTaskGetName(NULL));
-
-    for (;;) {
-        vision_ai_worker_runtime_wait_for_notification();
-
-        vision_ai_worker_job_t job = {0};
-
-        if (!vision_ai_worker_state_take_job(&job)) {
-            continue;
-        }
-
-        if (app_sleep_is_requested() || authentication_session_blocks_camera()) {
-            vision_ai_worker_state_mark_idle();
-            continue;
-        }
-
-        /*
-         * One mutex owns the complete detector -> recognizer chain. The shared
-         * public APIs below dispatch to either ESP-DL or TFLM-FP32, therefore
-         * this ordering and high-performance policy applies identically to both
-         * backend selections.
-         */
-        if (!vision_ai_inference_guard_lock()) {
-            ESP_LOGE(TAG, "Could not acquire AI inference mutex");
-            vision_ai_worker_state_mark_idle();
-            continue;
-        }
-
-        /*
-         * Request 360 MHz BEFORE the detector starts. The previous code waited
-         * for a positive detection before boosting, which meant the detector
-         * itself ran at the 180 MHz baseline. Keep the same PM lock through the
-         * recognizer when recognition follows.
-         */
-        esp_err_t boost_ret = cpu_power_face_boost_begin();
-        if (boost_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Could not request AI high-performance CPU lock: %s",
-                     esp_err_to_name(boost_ret));
-        }
-
-        vision_ai_snapshot_buffer_sync_memory_to_cpu(job.data_size);
-
-        face_box_t snapshot_boxes[APP_MAX_FACE_BOXES] = {0};
-        diagnostics_ai_frame_sent_to_detector();
-
-#if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
-        const int face_count = face_detect_run_rgb565(
-            vision_ai_snapshot_buffer_data(),
-            job.width,
-            job.height,
-            snapshot_boxes,
-            APP_MAX_FACE_BOXES);
-#else
-        const int face_count = face_detect_run_rgb888(
-            vision_ai_snapshot_buffer_data(),
-            job.width,
-            job.height,
-            snapshot_boxes,
-            APP_MAX_FACE_BOXES);
-#endif
-
-        ESP_LOGI(TAG,
-                 "AI worker detection complete: frame=%" PRIu32 " faces=%d",
-                 job.frame_id, face_count);
-        diagnostics_ai_detection_result(face_count);
-        if (authentication_session_note_detection_result(face_count)) {
-            ESP_LOGI(
-                TAG,
-                "Authentication rearmed after the face left the camera");
-        }
-
-        if (face_count <= 0) {
-            if (vision_face_result_store_note_no_face()) {
-                face_boost_release("face left camera");
-            }
-            face_boost_release("detector completed with no face");
-            vision_ai_inference_guard_unlock();
-            vision_ai_worker_state_mark_idle();
-            continue;
-        }
-
-        /* A positive detector result is real activity even if recognition fails. */
-        app_sleep_notify_face_detected();
-
-#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
-        printf(
-            "[INT8-POSITIVE-PATH] frame=%" PRIu32
-            " faces=%d idle_scan=%d display_suspended=%d\n",
-            job.frame_id,
-            face_count,
-            job.idle_scan_frame ? 1 : 0,
-            idle_scan_display_is_suspended() ? 1 : 0);
-#endif
-
-        const int update_count =
-            vision_face_detection_result_process_and_publish(
-                snapshot_boxes,
-                face_count,
-                job.width,
-                job.height,
-                job.source_width,
-                job.source_height);
-
-        if (job.idle_scan_frame || idle_scan_display_is_suspended()) {
-            ESP_LOGI(TAG,
-                     "IDLE-SCAN face detected; recognition deferred until display restore");
-            face_boost_release("IDLE-SCAN detector completed");
-            vision_ai_inference_guard_unlock();
-            vision_ai_worker_state_mark_idle();
-            continue;
-        }
-
-        const bool run_recognition =
-            vision_recognition_policy_should_run_frame(
-                job.frame_id,
-                APP_FACE_RECOG_INTERVAL_FRAMES);
-        bool pin_transition_requested = false;
-
-        if (run_recognition) {
-            /*
-             * Do not release either the inference mutex or the 360 MHz PM lock
-             * between detection and recognition. This guarantees the requested
-             * DET -> REC serial execution at maximum CPU frequency.
-             */
-            for (int i = 0; i < update_count; i++) {
-                if (!vision_recognition_policy_allows(
-                        snapshot_boxes[i].score,
-                        APP_FACE_RECOG_MIN_SCORE)) {
-                    continue;
-                }
-
-                char name[FACE_RECOG_MAX_NAME_LEN] = "unknown";
-                float recog_score = 0.0f;
-
-#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
-                printf(
-                    "[INT8-RECOG-TRIGGER] frame=%" PRIu32
-                    " face=%d detector_score=%.6f\n",
-                    job.frame_id,
-                    i,
-                    (double)snapshot_boxes[i].score);
-#endif
-
-                /*
-                 * A real recognition pass is starting now.
-                 *
-                 *     CAMERA_ACTIVE -> AUTHENTICATING
-                 *
-                 * Do not move this transition to the CPU boost acquisition:
-                 * the boost begins before detection and therefore also covers
-                 * frames where no face is found.
-                 */
-                if (app_controller_get_state() == APP_STATE_CAMERA_ACTIVE) {
-                    if (app_controller_handle_event(APP_EVENT_FACE_DETECTED)) {
-                        ESP_LOGI(
-                            TAG,
-                            "[APP-STATE] CAMERA_ACTIVE -> AUTHENTICATING");
-                    } else {
-                        ESP_LOGW(
-                            TAG,
-                            "[APP-STATE] FACE_DETECTED did not cause a transition");
-                    }
-                }
-
-                esp_err_t recog_ret = face_recognition_recognize(
-                    vision_ai_snapshot_buffer_data(),
-                    job.width,
-                    job.height,
-                    &snapshot_boxes[i],
-                    name,
-                    sizeof(name),
-                    &recog_score);
-
-                diagnostics_ai_recognition_result(recog_ret, name, recog_score);
-
-                vision_face_recognition_result_normalize_and_publish(
-                    i,
-                    recog_ret,
-                    name,
-                    sizeof(name),
-                    &recog_score);
-
-                if (recog_ret == ESP_OK && authentication_request_pin(name)) {
-                    pin_transition_requested = true;
-                } else if (app_controller_get_state() == APP_STATE_AUTHENTICATING) {
-                    /*
-                     * This recognition pass did not proceed to second-factor
-                     * authentication. Return to normal live-camera state.
-                     */
-                    if (app_controller_handle_event(APP_EVENT_FACE_UNKNOWN)) {
-                        ESP_LOGI(
-                            TAG,
-                            "[APP-STATE] AUTHENTICATING -> CAMERA_ACTIVE");
-                    } else {
-                        ESP_LOGW(
-                            TAG,
-                            "[APP-STATE] FACE_UNKNOWN did not cause a transition");
-                    }
-                }
-
-                ESP_LOGI(TAG,
-                         "Face %d recognition: name=%s similarity=%.3f result=%s",
-                         i, name, recog_score, esp_err_to_name(recog_ret));
-
-                if (pin_transition_requested) {
-                    break;
-                }
-            }
-        }
-
-        /*
-         * Every AI model call is finished at this point. Release the inference
-         * mutex before the PIN task is allowed to start. If authentication was
-         * accepted, keep the 360 MHz PM lock only through the PIN screen's
-         * synchronous first full render; pin_screen_transition_task() releases
-         * it immediately afterwards.
-         */
-        if (!pin_transition_requested) {
-            face_boost_release(
-                run_recognition
-                    ? "detector/recognizer chain completed without PIN transition"
-                    : "detector completed without recognition");
-        }
-
-        vision_ai_inference_guard_unlock();
-        vision_ai_worker_state_mark_idle();
-
-        if (pin_transition_requested) {
-            (void)authentication_launch_pin_transition();
-        }
-    }
-}
-
-static void prepare_application_for_sleep(void *user_data)
-{
-    (void)user_data;
-
-    /*
-     * The power service has accepted a real Deep-sleep request and is now
-     * beginning the destructive shutdown sequence.
-     *
-     * Valid sources include:
-     *
-     *     LAUNCHER
-     *     SETTINGS
-     *     CAMERA_ACTIVE
-     *     AUTHENTICATING
-     *     PIN_ENTRY
-     *     LIGHT_SLEEP
-     *
-     * All transition to:
-     *
-     *     DEEP_SLEEP
-     *
-     * The controller only records the application lifecycle here. It does
-     * not control or delay the existing hardware shutdown sequence.
-     */
     if (app_controller_handle_event(APP_EVENT_DEEP_SLEEP_REQUEST)) {
         ESP_LOGI(
             TAG,
@@ -8298,24 +8333,53 @@ static void prepare_application_for_sleep(void *user_data)
             "(current_state=%d)",
             (int)app_controller_get_state());
     }
+}
 
-    /*
-     * Stop the frame callback from starting more PPA, detection,
-     * recognition or LCD operations during shutdown.
-     */
+static void power_manager_block_new_work(void)
+{
     dummy_mode_delay_flag = true;
+}
 
-    if (!vision_ai_worker_state_pause_and_drain(APP_AI_WORKER_DRAIN_TIMEOUT_MS)) {
-        ESP_LOGW(TAG, "AI worker did not drain before Deep-sleep shutdown");
-    }
-
-    face_boost_release("application sleep requested");
-
-    /*
-     * app_sleep.c switches the physical backlight off. Keep this
-     * module's software state synchronized with the hardware state.
-     */
+static void power_manager_mark_backlight_off(void)
+{
     display_backlight_enabled = false;
+}
+
+static void power_manager_on_setup_error(
+    power_manager_setup_stage_t stage,
+    esp_err_t error)
+{
+    switch (stage) {
+    case POWER_MANAGER_SETUP_LIGHT_SLEEP_CALLBACKS:
+        ESP_LOGE(
+            TAG,
+            "Failed to register Light-sleep transitions: %s",
+            esp_err_to_name(error));
+        app_ui_show_error(
+            "Light-sleep setup failed. Restart the device.");
+        break;
+
+    case POWER_MANAGER_SETUP_IDLE_SCAN_CALLBACKS:
+        ESP_LOGE(
+            TAG,
+            "Failed to register adaptive IDLE-SCAN transitions: %s",
+            esp_err_to_name(error));
+        app_ui_show_error(
+            "Adaptive CPU power setup failed. Restart the device.");
+        break;
+
+    case POWER_MANAGER_SETUP_BUTTON_MONITOR:
+        ESP_LOGE(
+            TAG,
+            "Failed to start deep-sleep button monitor: %s",
+            esp_err_to_name(error));
+        app_ui_show_error(
+            "Deep-sleep button task failed. Restart the device.");
+        break;
+
+    default:
+        break;
+    }
 }
 
 static bool idle_scan_display_is_suspended(void)
@@ -8357,11 +8421,6 @@ static void idle_scan_touch_poll_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/*
- * Called by cpu_power before it applies the first 180 MHz idle baseline. The
- * camera task remains active, but no future callback is allowed to submit a
- * display buffer. The later 90 MHz stage reuses this suspended display.
- */
 static esp_err_t suspend_display_for_idle_scan(void *user_data)
 {
     (void)user_data;
@@ -8535,7 +8594,6 @@ static void resume_display_from_idle_scan_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/* Called after cpu_power has restored the ACTIVE baseline/max DFS policy. */
 static esp_err_t request_display_resume_from_idle_scan(void *user_data)
 {
     (void)user_data;
@@ -8989,12 +9047,30 @@ static void camera_application_start_task(void *arg)
         return;
     }
 
-    bool ai_created = vision_ai_worker_runtime_start(
-        ai_worker_task,
-        "ai_worker",
-        APP_AI_WORKER_STACK_SIZE,
-        APP_AI_WORKER_PRIORITY,
-        APP_AI_WORKER_CORE);
+    const authentication_flow_context_t authentication_flow_context = {
+        .display_mode_mutex = &display_mode_mutex,
+        .display = &disp,
+        .video_fd = &video_cam_fd0,
+        .display_buffer_index = &display_buffer_index,
+        .dummy_draw_enabled = &dummy_draw_enabled,
+        .release_face_boost = face_boost_release,
+    };
+    authentication_flow_initialize(&authentication_flow_context);
+
+    const vision_ai_worker_pipeline_hooks_t ai_worker_hooks = {
+        .idle_scan_display_is_suspended = idle_scan_display_is_suspended,
+        .recognition_started =
+            authentication_flow_on_recognition_started,
+        .request_pin = authentication_flow_request_pin,
+        .recognition_not_authenticated =
+            authentication_flow_on_recognition_not_authenticated,
+        .launch_pin_transition =
+            authentication_flow_launch_pin_transition,
+        .release_face_boost = face_boost_release,
+    };
+
+    bool ai_created =
+        vision_ai_worker_pipeline_start(&ai_worker_hooks);
 
     if (!ai_created) {
         ESP_LOGE(TAG, "Failed to create asynchronous AI worker");
@@ -9067,7 +9143,7 @@ static void camera_application_start_task(void *arg)
     display_platform_disable_lvgl_overlays(disp);
 
     /* Start the 30-second face-inactivity window with the camera application. */
-    ret = app_sleep_start_timeout();
+    ret = power_manager_start_inactivity_policy();
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -9096,7 +9172,7 @@ static void camera_application_start_task(void *arg)
     vTaskDelete(NULL);
 }
 
-static void launcher_start_requested(void *user_data)
+void camera_session_launcher_start_requested(void *user_data)
 {
     (void)user_data;
 
@@ -9124,258 +9200,23 @@ static void launcher_start_requested(void *user_data)
     }
 }
 
-static void launcher_settings_requested(void *user_data);
-static void settings_back_requested(void *user_data);
 
-static void show_settings_task(void *arg)
+esp_err_t camera_session_setup_power_management(void)
 {
-    (void)arg;
+    const power_manager_hooks_t power_manager_hooks = {
+        .light_sleep_suspend = suspend_application_for_light_sleep,
+        .light_sleep_resume = resume_application_from_light_sleep,
+        .idle_scan_suspend = suspend_display_for_idle_scan,
+        .idle_scan_resume = request_display_resume_from_idle_scan,
+        .deep_sleep_state_requested =
+            power_manager_on_deep_sleep_state_requested,
+        .block_new_work = power_manager_block_new_work,
+        .release_face_boost = face_boost_release,
+        .mark_backlight_off = power_manager_mark_backlight_off,
+        .setup_error = power_manager_on_setup_error,
+    };
 
-    /* The launcher event has returned, so it is safe to take the LVGL mutex. */
-    app_ui_destroy();
-    settings_screen_create(settings_back_requested, NULL);
-
-    /*
-     * The Settings view now owns the application UI.
-     *
-     *     LAUNCHER -> SETTINGS
-     */
-    if (app_controller_handle_event(APP_EVENT_OPEN_SETTINGS)) {
-        ESP_LOGI(TAG, "[APP-STATE] LAUNCHER -> SETTINGS");
-    } else {
-        ESP_LOGW(
-            TAG,
-            "[APP-STATE] OPEN_SETTINGS did not cause a transition");
-    }
-
-    vTaskDelete(NULL);
-}
-
-static void show_launcher_task(void *arg)
-{
-    (void)arg;
-
-    /* Reload the launcher using the currently saved light/dark theme. */
-    settings_screen_destroy();
-    app_ui_create(
-        launcher_start_requested,
-        launcher_settings_requested,
-        NULL);
-
-    /*
-     * The launcher view now owns the application UI again.
-     *
-     *     SETTINGS -> LAUNCHER
-     */
-    if (app_controller_handle_event(APP_EVENT_SETTINGS_BACK)) {
-        ESP_LOGI(TAG, "[APP-STATE] SETTINGS -> LAUNCHER");
-    } else {
-        ESP_LOGW(
-            TAG,
-            "[APP-STATE] SETTINGS_BACK did not cause a transition");
-    }
-
-    vTaskDelete(NULL);
-}
-
-static void launcher_settings_requested(void *user_data)
-{
-    (void)user_data;
-
-    BaseType_t created = xTaskCreatePinnedToCore(
-        show_settings_task,
-        "show_settings",
-        6144,
-        NULL,
-        5,
-        NULL,
-        APP_SYSTEM_WORKER_CORE);
-
-    if (created != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create Settings navigation task");
-    }
-}
-
-static void settings_back_requested(void *user_data)
-{
-    (void)user_data;
-
-    BaseType_t created = xTaskCreatePinnedToCore(
-        show_launcher_task,
-        "show_launcher",
-        4096,
-        NULL,
-        5,
-        NULL,
-        APP_SYSTEM_WORKER_CORE);
-
-    if (created != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create launcher navigation task");
-    }
-}
-
-
-void app_main(void)
-{
-    app_logging_init();
-
-    app_controller_init(NULL, NULL);
-
-    esp_err_t settings_ret = app_settings_init();
-    if (settings_ret != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "Persistent settings unavailable; in-memory defaults are active: %s",
-                 esp_err_to_name(settings_ret));
-    }
-
-    esp_err_t power_policy_ret = app_settings_apply_power_policy();
-    if (power_policy_ret != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "Initial power policy application failed: %s",
-                 esp_err_to_name(power_policy_ret));
-    }
-
-    ESP_LOGI(TAG,
-             "[CORE-PROOF] Application split: system_cpu=%d ai_cpu=%d",
-             APP_SYSTEM_WORKER_CORE,
-             APP_AI_WORKER_CORE);
-
-    report_wake_reason();
-    core_trace(TAG, "APP_MAIN_START");
-
-    esp_err_t cpu_power_ret = cpu_power_init();
-    if (cpu_power_ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "CPU power management initialization failed: %s",
-            esp_err_to_name(cpu_power_ret));
-    }
-
-#if APP_DIAGNOSTICS_CPU_STATS_ENABLED
-    diagnostics_start_cpu_stats_monitor();
-#endif
-
-    /*
-     * Phase 1: normal LVGL rendering. The user sees a proper launcher and the
-     * camera/AI pipeline is not initialized until Start Camera is pressed.
-     */
-    disp = display_platform_start();
-    if (!disp) {
-        ESP_LOGE(TAG,
-                 "Display/touch initialization failed. Check the selected Waveshare "
-                 "display in menuconfig and the touch cable.");
-        return;
-    }
-
-    /*
-     * bsp_display_start() starts the LVGL worker asynchronously. Normal LVGL
-     * mode is already active at boot, so do not force another dummy-mode
-     * transition here.
-     */
-    vTaskDelay(pdMS_TO_TICKS(150));
-
-    /* The display startup creates the shared BSP I2C bus used by ES8311. */
-    esp_err_t post_display_policy_ret = app_settings_apply_power_policy();
-    if (post_display_policy_ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "Post-display power policy application failed: %s",
-            esp_err_to_name(post_display_policy_ret));
-    }
-
-    display_platform_disable_lvgl_overlays(disp);
-
-    /*
-     * The BSP initializes GT911 and registers the LVGL input device inside
-     * bsp_display_start(). Use the BSP-owned handle directly.
-     */
-    launcher_touch_indev = display_platform_get_input_device();
-    if (launcher_touch_indev) {
-        ESP_LOGI(TAG,
-                 "BSP touchscreen ready: type=%d",
-                 (int)lv_indev_get_type(launcher_touch_indev));
-    } else {
-        ESP_LOGE(TAG, "BSP did not return an LVGL touchscreen input device");
-    }
-
-    app_ui_create(
-        launcher_start_requested,
-        launcher_settings_requested,
-        NULL);
-
-    if (!launcher_touch_indev) {
-        app_ui_show_error(
-            "Touch controller unavailable. Check the touch cable and BSP display selection.");
-    }
-
-    display_platform_backlight_on();
-    display_backlight_enabled = true;
-
-
-    /*
-     * The launcher is now fully initialized and visible.
-     * This is the first live application-state transition:
-     *
-     *     BOOTING -> LAUNCHER
-     *
-     * No camera, authentication or sleep behavior is
-     * controlled by the state machine yet.
-     */
-    if (app_controller_handle_event(APP_EVENT_BOOT_COMPLETE)) {
-        ESP_LOGI(
-            TAG,
-            "[APP-STATE] BOOTING -> LAUNCHER");
-    } else {
-        ESP_LOGW(
-            TAG,
-            "[APP-STATE] BOOT_COMPLETE did not cause a transition");
-    }
-
-    esp_err_t light_callbacks_ret =
-        app_sleep_register_light_sleep_callbacks(
-            suspend_application_for_light_sleep,
-            resume_application_from_light_sleep,
-            NULL);
-
-    if (light_callbacks_ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "Failed to register Light-sleep transitions: %s",
-            esp_err_to_name(light_callbacks_ret));
-
-        app_ui_show_error(
-            "Light-sleep setup failed. Restart the device.");
-    }
-
-    esp_err_t idle_callbacks_ret =
-        cpu_power_register_idle_scan_callbacks(
-            suspend_display_for_idle_scan,
-            request_display_resume_from_idle_scan,
-            NULL);
-
-    if (idle_callbacks_ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "Failed to register adaptive IDLE-SCAN transitions: %s",
-            esp_err_to_name(idle_callbacks_ret));
-        app_ui_show_error(
-            "Adaptive CPU power setup failed. Restart the device.");
-    }
-
-    /* The physical button works both on the launcher and in camera mode. */
-    esp_err_t sleep_button_ret = app_sleep_start_button_monitor(
-        prepare_application_for_sleep,
-        NULL);
-
-    if (sleep_button_ret != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "Failed to start deep-sleep button monitor: %s",
-            esp_err_to_name(sleep_button_ret));
-
-        app_ui_show_error(
-            "Deep-sleep button task failed. Restart the device.");
-    }
+    return power_manager_setup(&power_manager_hooks);
 }
 
 static void camera_video_frame_operation(
@@ -9602,6 +9443,7 @@ static void camera_video_frame_process(
 }
 
 
+
 ==================================================
 FILE: src/main/app/controller/app_controller.c
 ==================================================
@@ -9736,6 +9578,151 @@ bool app_controller_is_initialized(void)
     portEXIT_CRITICAL(&s_controller_lock);
 
     return initialized;
+}
+
+
+==================================================
+FILE: src/main/app/navigation/app_navigation.c
+==================================================
+#include "app/navigation/app_navigation.h"
+
+#include "app/camera/camera_session.h"
+#include "app/controller/app_controller.h"
+#include "config/app_config.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "app_ui.h"
+#include "settings_screen.h"
+
+
+static const char *TAG = "app_main";
+
+static void launcher_settings_requested(void *user_data);
+static void settings_back_requested(void *user_data);
+
+static void show_settings_task(void *arg)
+{
+    (void)arg;
+
+    /* The launcher event has returned, so it is safe to take the LVGL mutex. */
+    app_ui_destroy();
+    settings_screen_create(settings_back_requested, NULL);
+
+    /*
+     * The Settings view now owns the application UI.
+     *
+     *     LAUNCHER -> SETTINGS
+     */
+    if (app_controller_handle_event(APP_EVENT_OPEN_SETTINGS)) {
+        ESP_LOGI(TAG, "[APP-STATE] LAUNCHER -> SETTINGS");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "[APP-STATE] OPEN_SETTINGS did not cause a transition");
+    }
+
+    vTaskDelete(NULL);
+}
+
+static void show_launcher_task(void *arg)
+{
+    (void)arg;
+
+    /* Reload the launcher using the currently saved light/dark theme. */
+    settings_screen_destroy();
+    app_ui_create(
+        camera_session_launcher_start_requested,
+        launcher_settings_requested,
+        NULL);
+
+    /*
+     * The launcher view now owns the application UI again.
+     *
+     *     SETTINGS -> LAUNCHER
+     */
+    if (app_controller_handle_event(APP_EVENT_SETTINGS_BACK)) {
+        ESP_LOGI(TAG, "[APP-STATE] SETTINGS -> LAUNCHER");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "[APP-STATE] SETTINGS_BACK did not cause a transition");
+    }
+
+    vTaskDelete(NULL);
+}
+
+static void launcher_settings_requested(void *user_data)
+{
+    (void)user_data;
+
+    BaseType_t created = xTaskCreatePinnedToCore(
+        show_settings_task,
+        "show_settings",
+        6144,
+        NULL,
+        5,
+        NULL,
+        APP_SYSTEM_WORKER_CORE);
+
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create Settings navigation task");
+    }
+}
+
+static void settings_back_requested(void *user_data)
+{
+    (void)user_data;
+
+    BaseType_t created = xTaskCreatePinnedToCore(
+        show_launcher_task,
+        "show_launcher",
+        4096,
+        NULL,
+        5,
+        NULL,
+        APP_SYSTEM_WORKER_CORE);
+
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create launcher navigation task");
+    }
+}
+
+
+esp_err_t app_navigation_start(void)
+{
+    if (camera_session_prepare_launcher_display() != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    app_ui_create(
+        camera_session_launcher_start_requested,
+        launcher_settings_requested,
+        NULL);
+
+    if (!camera_session_launcher_touch_ready()) {
+        app_ui_show_error(
+            "Touch controller unavailable. Check the touch cable and BSP display selection.");
+    }
+
+    camera_session_enable_launcher_backlight();
+
+    /*
+     * The launcher is now fully initialized and visible.
+     *
+     *     BOOTING -> LAUNCHER
+     */
+    if (app_controller_handle_event(APP_EVENT_BOOT_COMPLETE)) {
+        ESP_LOGI(
+            TAG,
+            "[APP-STATE] BOOTING -> LAUNCHER");
+    } else {
+        ESP_LOGW(
+            TAG,
+            "[APP-STATE] BOOT_COMPLETE did not cause a transition");
+    }
+
+    return ESP_OK;
 }
 
 
@@ -9971,9 +9958,13 @@ idf_component_register(
     SRCS
         # Application orchestration
         "app/app_main.c"
+        "app/app_runtime.c"
         "app/app_boot.c"
         "app/state/app_state_machine.c"
         "app/controller/app_controller.c"
+        "app/authentication/authentication_flow.c"
+        "app/camera/camera_session.c"
+        "app/navigation/app_navigation.c"
 
         # User interface
         "ui/views/app_ui.c"
@@ -10012,6 +10003,7 @@ idf_component_register(
         "services/vision/ai_worker_state.c"
         "services/vision/ai_inference_guard.c"
         "services/vision/ai_worker_runtime.c"
+        "services/vision/ai_worker_pipeline.c"
 
         # ESP-DL reference backend
         "services/vision/face_detection/face_detector_espdl.cpp"
@@ -10026,6 +10018,7 @@ idf_component_register(
         "services/vision/face_recognition/face_recognizer_tflm_int8.cpp"
 
         # Power management and sleep modes
+        "services/power/power_manager.c"
         "services/power/sleep/app_sleep.c"
         "services/power/sleep/light_sleep.c"
         "services/power/sleep/deep_sleep.c"
@@ -10440,6 +10433,108 @@ FILE: src/main/include/app/app_boot.h
 void app_boot_initialize_services(void);
 
 ==================================================
+FILE: src/main/include/app/app_runtime.h
+==================================================
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void app_runtime_start(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+==================================================
+FILE: src/main/include/app/authentication/authentication_flow.h
+==================================================
+#pragma once
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "lvgl.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    SemaphoreHandle_t *display_mode_mutex;
+    lv_display_t **display;
+    int *video_fd;
+    uint8_t *display_buffer_index;
+    bool *dummy_draw_enabled;
+    esp_err_t (*release_face_boost)(const char *reason);
+} authentication_flow_context_t;
+
+void authentication_flow_initialize(
+    const authentication_flow_context_t *context);
+
+void authentication_flow_on_recognition_started(void);
+
+bool authentication_flow_request_pin(
+    const char *recognized_name);
+
+void authentication_flow_on_recognition_not_authenticated(void);
+
+bool authentication_flow_launch_pin_transition(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+==================================================
+FILE: src/main/include/app/camera/camera_session.h
+==================================================
+#pragma once
+
+#include <stdbool.h>
+
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * Application-level live camera/display session.
+ *
+ * Owns the stateful coordination that must remain ordered across:
+ * - launcher display ownership;
+ * - camera/PPA/display buffers;
+ * - CPU1 Vision worker startup;
+ * - Authentication Flow context;
+ * - reversible Light-sleep and idle-scan transitions;
+ * - Power Manager callback ports;
+ * - live frame rendering and AI snapshot scheduling.
+ *
+ * Physical drivers remain behind platform adapters and application state
+ * transitions remain in the App Controller/FSM.
+ */
+esp_err_t camera_session_prepare_launcher_display(void);
+
+bool camera_session_launcher_touch_ready(void);
+
+void camera_session_enable_launcher_backlight(void);
+
+void camera_session_launcher_start_requested(void *user_data);
+
+esp_err_t camera_session_setup_power_management(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+==================================================
 FILE: src/main/include/app/controller/app_controller.h
 ==================================================
 #pragma once
@@ -10499,6 +10594,24 @@ app_state_t app_controller_get_state(void);
  */
 bool app_controller_is_initialized(void);
 
+
+#ifdef __cplusplus
+}
+#endif
+
+
+==================================================
+FILE: src/main/include/app/navigation/app_navigation.h
+==================================================
+#pragma once
+
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+esp_err_t app_navigation_start(void);
 
 #ifdef __cplusplus
 }
@@ -12142,6 +12255,52 @@ esp_err_t component_runtime_set_sdcard_enabled(bool enabled);
 
 
 ==================================================
+FILE: src/main/include/services/power/power_manager.h
+==================================================
+#pragma once
+
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef esp_err_t (*power_manager_transition_callback_t)(
+    void *user_data);
+
+typedef enum {
+    POWER_MANAGER_SETUP_LIGHT_SLEEP_CALLBACKS = 0,
+    POWER_MANAGER_SETUP_IDLE_SCAN_CALLBACKS,
+    POWER_MANAGER_SETUP_BUTTON_MONITOR,
+} power_manager_setup_stage_t;
+
+typedef struct {
+    power_manager_transition_callback_t light_sleep_suspend;
+    power_manager_transition_callback_t light_sleep_resume;
+    power_manager_transition_callback_t idle_scan_suspend;
+    power_manager_transition_callback_t idle_scan_resume;
+
+    void (*deep_sleep_state_requested)(void);
+    void (*block_new_work)(void);
+    esp_err_t (*release_face_boost)(const char *reason);
+    void (*mark_backlight_off)(void);
+
+    void (*setup_error)(
+        power_manager_setup_stage_t stage,
+        esp_err_t error);
+} power_manager_hooks_t;
+
+esp_err_t power_manager_setup(
+    const power_manager_hooks_t *hooks);
+
+esp_err_t power_manager_start_inactivity_policy(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+==================================================
 FILE: src/main/include/services/power/sleep/app_sleep.h
 ==================================================
 #pragma once
@@ -12568,6 +12727,59 @@ bool vision_ai_snapshot_scheduler_schedule(
     uint32_t camera_height,
     uint32_t current_frame,
     bool idle_scan_frame);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+==================================================
+FILE: src/main/include/services/vision/ai_worker_pipeline.h
+==================================================
+#pragma once
+
+#include <stdbool.h>
+
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * Application-side ports used by the CPU1 Vision pipeline.
+ *
+ * The Vision service owns detector/recognizer execution, worker-state
+ * synchronization, result processing and the exact CPU1 sequence.
+ *
+ * It deliberately does NOT own:
+ * - application FSM transitions;
+ * - display idle-scan state;
+ * - PIN reservation/launch;
+ * - the application-level face-boost release wrapper.
+ *
+ * Those concerns are supplied as callbacks so dependency direction remains:
+ *
+ *     app -> services -> platform
+ *
+ * rather than services depending upward on the app layer.
+ */
+typedef struct {
+    bool (*idle_scan_display_is_suspended)(void);
+    void (*recognition_started)(void);
+    bool (*request_pin)(const char *recognized_name);
+    void (*recognition_not_authenticated)(void);
+    bool (*launch_pin_transition)(void);
+    esp_err_t (*release_face_boost)(const char *reason);
+} vision_ai_worker_pipeline_hooks_t;
+
+
+/*
+ * Start the existing single CPU1 worker using the unchanged task name,
+ * stack size, priority and CPU core.
+ */
+bool vision_ai_worker_pipeline_start(
+    const vision_ai_worker_pipeline_hooks_t *hooks);
 
 #ifdef __cplusplus
 }
@@ -20640,6 +20852,135 @@ esp_err_t component_runtime_set_sdcard_enabled(bool enabled)
 
 
 ==================================================
+FILE: src/main/services/power/power_manager.c
+==================================================
+#include "services/power/power_manager.h"
+
+#include <stdbool.h>
+
+#include "config/app_config.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "platform/power/cpu_power.h"
+#include "services/power/sleep/app_sleep.h"
+#include "services/vision/ai_worker_state.h"
+
+
+static const char *TAG = "app_main";
+static power_manager_hooks_t s_hooks;
+
+
+static bool hooks_are_complete(
+    const power_manager_hooks_t *hooks)
+{
+    return hooks != NULL &&
+        hooks->light_sleep_suspend != NULL &&
+        hooks->light_sleep_resume != NULL &&
+        hooks->idle_scan_suspend != NULL &&
+        hooks->idle_scan_resume != NULL &&
+        hooks->deep_sleep_state_requested != NULL &&
+        hooks->block_new_work != NULL &&
+        hooks->release_face_boost != NULL &&
+        hooks->mark_backlight_off != NULL;
+}
+
+
+static void report_setup_error(
+    power_manager_setup_stage_t stage,
+    esp_err_t error)
+{
+    if (error != ESP_OK && s_hooks.setup_error != NULL) {
+        s_hooks.setup_error(stage, error);
+    }
+}
+
+
+static void prepare_application_for_deep_sleep(
+    void *user_data)
+{
+    (void)user_data;
+
+    s_hooks.deep_sleep_state_requested();
+    s_hooks.block_new_work();
+
+    if (!vision_ai_worker_state_pause_and_drain(
+            APP_AI_WORKER_DRAIN_TIMEOUT_MS)) {
+        ESP_LOGW(
+            TAG,
+            "AI worker did not drain before Deep-sleep shutdown");
+    }
+
+    (void)s_hooks.release_face_boost(
+        "application sleep requested");
+
+    s_hooks.mark_backlight_off();
+}
+
+
+esp_err_t power_manager_setup(
+    const power_manager_hooks_t *hooks)
+{
+    if (!hooks_are_complete(hooks)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_hooks = *hooks;
+
+    esp_err_t first_error = ESP_OK;
+
+    esp_err_t ret =
+        app_sleep_register_light_sleep_callbacks(
+            s_hooks.light_sleep_suspend,
+            s_hooks.light_sleep_resume,
+            NULL);
+
+    if (ret != ESP_OK) {
+        first_error = ret;
+        report_setup_error(
+            POWER_MANAGER_SETUP_LIGHT_SLEEP_CALLBACKS,
+            ret);
+    }
+
+    ret = cpu_power_register_idle_scan_callbacks(
+        s_hooks.idle_scan_suspend,
+        s_hooks.idle_scan_resume,
+        NULL);
+
+    if (ret != ESP_OK) {
+        if (first_error == ESP_OK) {
+            first_error = ret;
+        }
+
+        report_setup_error(
+            POWER_MANAGER_SETUP_IDLE_SCAN_CALLBACKS,
+            ret);
+    }
+
+    ret = app_sleep_start_button_monitor(
+        prepare_application_for_deep_sleep,
+        NULL);
+
+    if (ret != ESP_OK) {
+        if (first_error == ESP_OK) {
+            first_error = ret;
+        }
+
+        report_setup_error(
+            POWER_MANAGER_SETUP_BUTTON_MONITOR,
+            ret);
+    }
+
+    return first_error;
+}
+
+
+esp_err_t power_manager_start_inactivity_policy(void)
+{
+    return app_sleep_start_timeout();
+}
+
+
+==================================================
 FILE: src/main/services/power/sleep/app_sleep.c
 ==================================================
 #include "services/power/sleep/app_sleep.h"
@@ -24330,6 +24671,266 @@ bool vision_ai_snapshot_scheduler_schedule(
 
     vision_ai_worker_runtime_notify();
     return true;
+}
+
+
+==================================================
+FILE: src/main/services/vision/ai_worker_pipeline.c
+==================================================
+#include "services/vision/ai_worker_pipeline.h"
+
+#include <inttypes.h>
+#include <stdio.h>
+
+#include "config/app_config.h"
+#include "config/app_features.h"
+#include "diagnostics/ai_pipeline_status.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "platform/power/cpu_power.h"
+#include "services/authentication/authentication_session.h"
+#include "services/power/sleep/app_sleep.h"
+#include "services/vision/ai_inference_guard.h"
+#include "services/vision/ai_snapshot_buffer.h"
+#include "services/vision/ai_worker_runtime.h"
+#include "services/vision/ai_worker_state.h"
+#include "services/vision/face_detection_result_processor.h"
+#include "services/vision/face_detector.h"
+#include "services/vision/face_recognition_result_processor.h"
+#include "services/vision/face_recognizer.h"
+#include "services/vision/face_result_store.h"
+#include "services/vision/recognition_policy.h"
+
+
+static const char *TAG = "app_main";
+static vision_ai_worker_pipeline_hooks_t s_hooks;
+
+
+static bool hooks_are_complete(
+    const vision_ai_worker_pipeline_hooks_t *hooks)
+{
+    return hooks != NULL &&
+        hooks->idle_scan_display_is_suspended != NULL &&
+        hooks->recognition_started != NULL &&
+        hooks->request_pin != NULL &&
+        hooks->recognition_not_authenticated != NULL &&
+        hooks->launch_pin_transition != NULL &&
+        hooks->release_face_boost != NULL;
+}
+
+
+static void ai_worker_task(void *arg)
+{
+    (void)arg;
+
+    ESP_LOGI(TAG, "[CORE-PROOF] AI worker running: actual_cpu=%d task=%s",
+             xPortGetCoreID(), pcTaskGetName(NULL));
+
+    for (;;) {
+        vision_ai_worker_runtime_wait_for_notification();
+
+        vision_ai_worker_job_t job = {0};
+
+        if (!vision_ai_worker_state_take_job(&job)) {
+            continue;
+        }
+
+        if (app_sleep_is_requested() || authentication_session_blocks_camera()) {
+            vision_ai_worker_state_mark_idle();
+            continue;
+        }
+
+        if (!vision_ai_inference_guard_lock()) {
+            ESP_LOGE(TAG, "Could not acquire AI inference mutex");
+            vision_ai_worker_state_mark_idle();
+            continue;
+        }
+
+        esp_err_t boost_ret = cpu_power_face_boost_begin();
+        if (boost_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Could not request AI high-performance CPU lock: %s",
+                     esp_err_to_name(boost_ret));
+        }
+
+        vision_ai_snapshot_buffer_sync_memory_to_cpu(job.data_size);
+
+        face_box_t snapshot_boxes[APP_MAX_FACE_BOXES] = {0};
+        diagnostics_ai_frame_sent_to_detector();
+
+#if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+        const int face_count = face_detect_run_rgb565(
+            vision_ai_snapshot_buffer_data(),
+            job.width,
+            job.height,
+            snapshot_boxes,
+            APP_MAX_FACE_BOXES);
+#else
+        const int face_count = face_detect_run_rgb888(
+            vision_ai_snapshot_buffer_data(),
+            job.width,
+            job.height,
+            snapshot_boxes,
+            APP_MAX_FACE_BOXES);
+#endif
+
+        ESP_LOGI(TAG,
+                 "AI worker detection complete: frame=%" PRIu32 " faces=%d",
+                 job.frame_id, face_count);
+        diagnostics_ai_detection_result(face_count);
+
+        if (authentication_session_note_detection_result(face_count)) {
+            ESP_LOGI(
+                TAG,
+                "Authentication rearmed after the face left the camera");
+        }
+
+        if (face_count <= 0) {
+            if (vision_face_result_store_note_no_face()) {
+                (void)s_hooks.release_face_boost("face left camera");
+            }
+
+            (void)s_hooks.release_face_boost("detector completed with no face");
+            vision_ai_inference_guard_unlock();
+            vision_ai_worker_state_mark_idle();
+            continue;
+        }
+
+        app_sleep_notify_face_detected();
+
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+        printf(
+            "[INT8-POSITIVE-PATH] frame=%" PRIu32
+            " faces=%d idle_scan=%d display_suspended=%d\n",
+            job.frame_id,
+            face_count,
+            job.idle_scan_frame ? 1 : 0,
+            s_hooks.idle_scan_display_is_suspended() ? 1 : 0);
+#endif
+
+        const int update_count =
+            vision_face_detection_result_process_and_publish(
+                snapshot_boxes,
+                face_count,
+                job.width,
+                job.height,
+                job.source_width,
+                job.source_height);
+
+        if (job.idle_scan_frame ||
+            s_hooks.idle_scan_display_is_suspended()) {
+            ESP_LOGI(
+                TAG,
+                "IDLE-SCAN face detected; recognition deferred until display restore");
+            (void)s_hooks.release_face_boost(
+                "IDLE-SCAN detector completed");
+            vision_ai_inference_guard_unlock();
+            vision_ai_worker_state_mark_idle();
+            continue;
+        }
+
+        const bool run_recognition =
+            vision_recognition_policy_should_run_frame(
+                job.frame_id,
+                APP_FACE_RECOG_INTERVAL_FRAMES);
+
+        bool pin_transition_requested = false;
+
+        if (run_recognition) {
+            for (int i = 0; i < update_count; i++) {
+                if (!vision_recognition_policy_allows(
+                        snapshot_boxes[i].score,
+                        APP_FACE_RECOG_MIN_SCORE)) {
+                    continue;
+                }
+
+                char name[FACE_RECOG_MAX_NAME_LEN] = "unknown";
+                float recog_score = 0.0f;
+
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+                printf(
+                    "[INT8-RECOG-TRIGGER] frame=%" PRIu32
+                    " face=%d detector_score=%.6f\n",
+                    job.frame_id,
+                    i,
+                    (double)snapshot_boxes[i].score);
+#endif
+
+                s_hooks.recognition_started();
+
+                esp_err_t recog_ret = face_recognition_recognize(
+                    vision_ai_snapshot_buffer_data(),
+                    job.width,
+                    job.height,
+                    &snapshot_boxes[i],
+                    name,
+                    sizeof(name),
+                    &recog_score);
+
+                diagnostics_ai_recognition_result(
+                    recog_ret,
+                    name,
+                    recog_score);
+
+                vision_face_recognition_result_normalize_and_publish(
+                    i,
+                    recog_ret,
+                    name,
+                    sizeof(name),
+                    &recog_score);
+
+                if (recog_ret == ESP_OK && s_hooks.request_pin(name)) {
+                    pin_transition_requested = true;
+                } else {
+                    s_hooks.recognition_not_authenticated();
+                }
+
+                ESP_LOGI(TAG,
+                         "Face %d recognition: name=%s similarity=%.3f result=%s",
+                         i,
+                         name,
+                         recog_score,
+                         esp_err_to_name(recog_ret));
+
+                if (pin_transition_requested) {
+                    break;
+                }
+            }
+        }
+
+        if (!pin_transition_requested) {
+            (void)s_hooks.release_face_boost(
+                run_recognition
+                    ? "detector/recognizer chain completed without PIN transition"
+                    : "detector completed without recognition");
+        }
+
+        vision_ai_inference_guard_unlock();
+        vision_ai_worker_state_mark_idle();
+
+        if (pin_transition_requested) {
+            (void)s_hooks.launch_pin_transition();
+        }
+    }
+}
+
+
+bool vision_ai_worker_pipeline_start(
+    const vision_ai_worker_pipeline_hooks_t *hooks)
+{
+    if (!hooks_are_complete(hooks)) {
+        return false;
+    }
+
+    s_hooks = *hooks;
+
+    return vision_ai_worker_runtime_start(
+        ai_worker_task,
+        "ai_worker",
+        APP_AI_WORKER_STACK_SIZE,
+        APP_AI_WORKER_PRIORITY,
+        APP_AI_WORKER_CORE);
 }
 
 
