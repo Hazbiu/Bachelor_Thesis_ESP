@@ -95,8 +95,8 @@ static const deep_sleep_rail_t s_audited_rails[] = {
     {
         .gpio_num = APP_PWR_ETHERNET_PHY_RESET_GPIO,
         .description = "IP101GRI PHY RESET",
-        .expected_level = APP_PWR_ETHERNET_RESET_RELEASED_LEVEL,
-        .consequence_if_wrong = "RESET LOW would clear BMCR Power Down",
+        .expected_level = APP_PWR_ETHERNET_RESET_ACTIVE_LEVEL,
+        .consequence_if_wrong = "PHY reset released; Ethernet can draw active current",
     },
     {
         .gpio_num = APP_PWR_AUDIO_AMP_GPIO,
@@ -155,18 +155,18 @@ static void audit_rails_before_deep_sleep(void)
     ESP_LOGI(AUDIT_TAG, "---- Pre-Deep-sleep rail audit ----------------------");
 
     /*
-    * GPIO51 alone no longer proves the Ethernet PHY is low-power. RESET is
-    * intentionally released so BMCR bit11 remains latched; re-read BMCR over
-    * MDC/MDIO and verify the actual IP101GRI Power Down state.
+    * Hybrid continuity policy: keep the PHY in the same electrical state that
+    * produced the lower Light-sleep plateau. GPIO51 must remain LOW/held all
+    * the way into P4 Deep-sleep; do not release RESET to program BMCR.
     */
     esp_err_t ethernet_ret = component_ethernet_verify_power_down();
     if (ethernet_ret == ESP_OK) {
-        ESP_LOGI(AUDIT_TAG, "IP101GRI BMCR Power Down (bit11)        OK");
+        ESP_LOGI(AUDIT_TAG, "IP101GRI hardware RESET LOW/held          OK");
     } else {
         mismatches++;
         ESP_LOGE(
             AUDIT_TAG,
-            "IP101GRI BMCR Power Down (bit11)        FAILED (%s)",
+            "IP101GRI hardware RESET LOW/held          FAILED (%s)",
             esp_err_to_name(ethernet_ret));
     }
 
@@ -237,10 +237,10 @@ static void audit_rails_before_deep_sleep(void)
         ESP_LOGI(
             AUDIT_TAG,
             "All software-controlled Deep-sleep states verified: "
-            "C6 self-sleep policy armed, IP101GRI BMCR Power Down, "
+            "C6 self-sleep policy armed, IP101GRI RESET LOW held, "
             "ES8311 suspend, NS4150B off, GT911 FULL SLEEP, microSD rail off "
-            "and shared I2C high. V19 keeps the V18 P4 domain/GPIO cleanup and "
-            "replaces GT911 Green mode with verified full Sleep.");
+            "and shared I2C high. Hybrid display continuity also guarantees "
+            "LCD SLEEP_IN before the Light-sleep transport is destroyed.");
     } else {
         ESP_LOGE(AUDIT_TAG,
                 "%u rail(s) are NOT in their Deep-sleep state; expect "
@@ -665,7 +665,7 @@ static void power_down_flash_for_deep_sleep(void)
 }
 #endif
 
-void enter_deep_sleep(void)
+void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
 {
     /*
     * Button wiring:
@@ -732,51 +732,78 @@ void enter_deep_sleep(void)
             1ULL << WAKE_BUTTON_GPIO,
             ESP_GPIO_WAKEUP_GPIO_LOW));
 
+    ESP_LOGI(
+        TAG,
+        "Deep-sleep boundary profile=%s",
+        profile == DEEP_SLEEP_PROFILE_LIGHT_COMPATIBLE
+            ? "LIGHT_COMPATIBLE"
+            : "AGGRESSIVE");
+
 #if APP_PWR_DEEP_SLEEP_FORCE_DOMAINS_OFF
-    configure_final_p4_power_domains();
+    if (profile == DEEP_SLEEP_PROFILE_AGGRESSIVE) {
+        configure_final_p4_power_domains();
+    } else {
+        ESP_LOGI(
+            TAG,
+            "Light-compatible Deep-sleep: manual P4 power-domain OFF "
+            "overrides skipped; ESP-IDF Deep-sleep policy retained");
+    }
 #endif
 
-    /*
-    * Report the state of every controlled rail while the pads can still be
-    * read. This is the last point at which a released hold is observable in
-    * software.
-    */
-    audit_rails_before_deep_sleep();
+    if (profile == DEEP_SLEEP_PROFILE_AGGRESSIVE) {
+        /*
+         * Existing full/destructive Deep-only boundary remains available.
+         */
+        audit_rails_before_deep_sleep();
 
 #if APP_PWR_ISOLATE_SDMMC_PINS
-    float_sdmmc_pins_for_deep_sleep();
+        float_sdmmc_pins_for_deep_sleep();
 #endif
 
 #if APP_PWR_DEEP_SLEEP_POWER_DOWN_FLASH
-    power_down_flash_for_deep_sleep();
+        power_down_flash_for_deep_sleep();
 #endif
 
-    /*
-    * All camera/display teardown has completed before this function is
-    * called. Isolate the shared I2C pins at this final boundary so the GT911
-    * Light-sleep polling path is not affected.
-    */
-    esp_err_t i2c_ret = isolate_shared_i2c_for_deep_sleep();
-    if (i2c_ret != ESP_OK) {
-        /*
-        * Continue into Deep-sleep even if one isolation operation failed.
-        * Remaining active would consume far more current than sleeping, and
-        * the ESP32-P4 powers down its digital I2C peripheral in Deep-sleep.
-        */
-        ESP_LOGW(
-            TAG,
-            "I2C pin isolation completed with errors: %s; continuing",
-            esp_err_to_name(i2c_ret));
-    }
+        esp_err_t i2c_ret =
+            isolate_shared_i2c_for_deep_sleep();
+
+        if (i2c_ret != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "I2C pin isolation completed with errors: %s; continuing",
+                esp_err_to_name(i2c_ret));
+        }
 
 #if APP_PWR_QUIESCE_PERIPHERAL_SIGNAL_PINS
-    /*
-    * The owning peripherals are all quiesced by this point and their audits
-    * have completed. Release the remaining board signal pins so the sleeping
-    * P4 cannot source/sink current into still-powered external devices.
-    */
-    quiesce_peripheral_signal_pins_for_deep_sleep();
+        quiesce_peripheral_signal_pins_for_deep_sleep();
 #endif
+    } else {
+        /*
+         * Hybrid Light->Deep:
+         * preserve the already-low-current external Light-sleep state.
+         */
+        ESP_LOGI(
+            TAG,
+            "Light-compatible Deep-sleep boundary: "
+            "external Light-sleep peripheral state preserved");
+
+        ESP_LOGI(
+            TAG,
+            "Skipping Deep-only teardown: microSD rail cut, GT911 full sleep, "
+            "ES8311 suspend, shared-I2C isolation, SDMMC/peripheral GPIO "
+            "floating and UART detach");
+
+        ESP_LOGI(
+            "PWR_AUDIT",
+            "LIGHT-COMPAT: GPIO54(C6)=%d GPIO51(ETH_RESET)=%d "
+            "GPIO53(AMP_EN)=%d SDA=%d SCL=%d "
+            "microSD=PRESERVED",
+            gpio_get_level(APP_PWR_WIFI_C6_CHIP_PU_GPIO),
+            gpio_get_level(APP_PWR_ETHERNET_PHY_RESET_GPIO),
+            gpio_get_level(APP_PWR_AUDIO_AMP_GPIO),
+            gpio_get_level(SHARED_I2C_SDA_GPIO),
+            gpio_get_level(SHARED_I2C_SCL_GPIO));
+    }
 
     /*
     * FINAL C6 CLAMP
@@ -833,8 +860,17 @@ void enter_deep_sleep(void)
     fflush(stdout);
 
 #if APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY
-    float_uart0_at_final_boundary();
+    if (profile == DEEP_SLEEP_PROFILE_AGGRESSIVE) {
+        float_uart0_at_final_boundary();
+    }
 #endif
 
     esp_deep_sleep_start();
+}
+
+
+void enter_deep_sleep(void)
+{
+    enter_deep_sleep_with_profile(
+        DEEP_SLEEP_PROFILE_AGGRESSIVE);
 }

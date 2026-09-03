@@ -94,6 +94,14 @@ void app_sleep_notify_face_detected(void);
 */
 bool app_sleep_light_sleep_is_due(void);
 
+/**
+ * Return true when the saved runtime policy has Deep-sleep enabled.
+ *
+ * Camera/display session code uses this only to select the Hybrid-safe panel
+ * teardown strategy; the power service remains the source of truth for policy.
+ */
+bool app_sleep_deep_mode_is_enabled(void);
+
 /** Request the existing ordered Deep-sleep shutdown sequence. */
 void app_sleep_request(const char *reason);
 

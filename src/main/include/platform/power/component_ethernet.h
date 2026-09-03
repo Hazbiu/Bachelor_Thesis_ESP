@@ -10,14 +10,19 @@ extern "C" {
 
 /**
  * Apply the system-wide Ethernet policy immediately.
- * Disabled sets IP101GRI BMCR Power Down; enabled restores normal operation.
+ *
+ * Disabled keeps the IP101GRI in hardware RESET (GPIO51 LOW).
+ * Enabled releases RESET (GPIO51 HIGH).
+ *
+ * Hardware RESET is intentionally used as the low-current policy because the
+ * measured Hybrid Light->Deep transition showed higher current when Deep-sleep
+ * released RESET and relied on BMCR Power Down.
  */
 esp_err_t component_ethernet_set_enabled(bool enabled);
 bool component_ethernet_is_enabled(void);
 
 /**
- * Reversible Light-sleep path: preserve the project's previous behavior by
- * holding the onboard IP101GRI PHY in hardware reset.
+ * Reversible Light-sleep path: hold the onboard IP101GRI PHY in hardware reset.
  *
  * ESP32-P4-NANO:
  *   GPIO51 LOW  = PHY reset asserted
@@ -27,25 +32,24 @@ esp_err_t component_ethernet_hold_reset_for_light_sleep(void);
 esp_err_t component_ethernet_restore_after_light_sleep(void);
 
 /**
- * Deep-sleep path: release RESET and use Clause-22 MDC/MDIO to set BMCR bit 11
- * (Power Down). The IP101GRI datasheet specifies that this powers down the PHY
- * and its internal crystal while MDC/MDIO remain accessible.
+ * Deep-sleep path: preserve the same proven Light-sleep electrical state by
+ * re-applying and holding GPIO51 LOW.
  *
- * RESET is deliberately left released after programming; asserting RESET would
- * restore BMCR defaults and clear the Power Down bit.
+ * Deep-sleep wake is a reboot, so there is no need to keep BMCR state alive
+ * across sleep. Keeping RESET asserted also avoids waking the PHY for an MDIO
+ * transaction during the Light->Deep transition.
  */
 esp_err_t component_ethernet_disable_for_deep_sleep(void);
 
-/** Re-read BMCR and verify that bit 11 is still set. */
+/** Verify that GPIO51 still reads LOW immediately before Deep-sleep. */
 esp_err_t component_ethernet_verify_power_down(void);
 
 /**
  * Recovery hook used only if esp_deep_sleep_start() unexpectedly returns.
- * Restores the pre-sleep BMCR value captured before Power Down.
+ * Releases RESET when the saved Ethernet policy is ON; otherwise keeps it LOW.
  */
 esp_err_t component_ethernet_restore_after_failed_sleep(void);
 
 #ifdef __cplusplus
 }
 #endif
-

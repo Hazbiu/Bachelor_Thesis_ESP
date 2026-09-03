@@ -30,15 +30,16 @@ extern "C" {
  */
 
 /**
- * Put the active LCD controller itself into full DCS Sleep-In before the BSP
- * destroys the panel and MIPI-DSI handles.
+ * Ensure the active LCD controller has received full DCS Sleep-In.
  *
- * V20 sequence:
- *   backlight OFF -> DISPLAY_OFF (0x28) -> SLEEP_IN (0x10) -> settle.
+ * Direct Deep-sleep:
+ *   sends backlight OFF -> DISPLAY_OFF (0x28) -> SLEEP_IN (0x10) while the
+ *   panel handle is still alive.
  *
- * IMPORTANT: call this BEFORE bsp_display_shutdown_for_deep_sleep(). The
- * managed Waveshare JD9365 v2.0.0 driver is patched by the V20 installer so
- * esp_lcd_panel_disp_sleep() has a real JD9365 Sleep-In implementation.
+ * Hybrid Light->Deep:
+ *   the display platform sends SLEEP_IN before the Light-sleep teardown
+ *   destroys the panel handle. This call is then idempotent and accepts the
+ *   previously committed panel-sleep state.
  */
 esp_err_t component_display_panel_enter_full_sleep(void);
 

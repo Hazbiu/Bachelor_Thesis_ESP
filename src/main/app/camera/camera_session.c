@@ -430,7 +430,7 @@ static esp_err_t suspend_display_for_idle_scan(void *user_data)
     display_platform_backlight_off();
     display_backlight_enabled = false;
 
-    esp_err_t ret = display_platform_suspend_for_light_sleep();
+    esp_err_t ret = display_platform_suspend_for_light_sleep(false);
     if (ret != ESP_OK) {
         xSemaphoreGive(display_mode_mutex);
         ESP_LOGE(TAG, "IDLE-SCAN display suspend failed: %s",
@@ -698,7 +698,8 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
             xSemaphoreGive(display_mode_mutex);
             return ESP_ERR_INVALID_STATE;
         }
-        ret = display_platform_suspend_for_light_sleep();
+        ret = display_platform_suspend_for_light_sleep(
+            app_sleep_deep_mode_is_enabled());
         if (ret == ESP_OK) {
             trim_display_buffers_for_sleep();
         }
@@ -1426,4 +1427,3 @@ static void camera_video_frame_process(
             idle_scan_frame);
     }
 }
-

@@ -228,11 +228,16 @@
 #define APP_PWR_WIFI_C6_ENABLED_LEVEL               1
 
 /*
- * IP101GRI real Deep-sleep power-down.
+ * IP101GRI low-current policy.
  *
- * Waveshare documents MDC=GPIO31, MDIO=GPIO52 and RESET=GPIO51. The PHY
- * address used by the ESP-IDF/Waveshare ESP32-P4 configuration is 1.
- * BMCR bit11 is programmed over these pins immediately before Deep-sleep.
+ * Waveshare documents MDC=GPIO31, MDIO=GPIO52 and RESET=GPIO51. Earlier
+ * Deep-sleep code released RESET and programmed BMCR bit11. Bench measurement
+ * of the Hybrid Light->Deep path showed the lower plateau while RESET stayed
+ * asserted in Light-sleep, so Deep-sleep now preserves that electrical state:
+ * GPIO51 stays LOW and held until the P4 actually enters Deep-sleep.
+ *
+ * MDC/MDIO definitions are retained for board documentation and future
+ * diagnostics, but normal low-power entry no longer wakes the PHY for MDIO.
  */
 #define APP_PWR_ETHERNET_MDC_GPIO                   GPIO_NUM_31
 #define APP_PWR_ETHERNET_MDIO_GPIO                  GPIO_NUM_52
@@ -356,9 +361,10 @@
  *   GPIO28,29,30,34,35,49,50 IP101GRI RMII
  *   GPIO46,47                CSI side-channel pins
  *
- * Ethernet MDC/MDIO/RESET (31/52/51) are already released by the Ethernet
- * module after BMCR power-down. SDMMC 39..44 are handled separately. GPIO7/8
- * are RTC-isolated separately. GPIO45/53/54 must retain their control policy.
+ * Ethernet MDC/MDIO (31/52) are not driven by the low-current path. RESET
+ * GPIO51 is a control rail and must stay LOW/held, so it is deliberately not
+ * part of the floating list. SDMMC 39..44 are handled separately. GPIO7/8 are
+ * RTC-isolated separately. GPIO45/51/53/54 must retain their control policy.
  */
 #define APP_PWR_PERIPHERAL_SIGNAL_PIN_LIST          \
     { 6, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, \

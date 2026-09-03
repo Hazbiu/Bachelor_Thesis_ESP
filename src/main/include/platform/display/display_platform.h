@@ -35,7 +35,26 @@ void display_platform_backlight_off(void);
  * error recovery, sleep state and UI sequencing.
  */
 lv_display_t *display_platform_start(void);
-esp_err_t display_platform_suspend_for_light_sleep(void);
+
+/*
+ * Put the physical LCD controller into DISPLAY_OFF + SLEEP_IN while the BSP
+ * panel handle still exists. If a Hybrid Light->Deep transition already issued
+ * this command before tearing DSI down, a later Deep-sleep call is idempotent.
+ */
+esp_err_t display_platform_panel_enter_full_sleep(void);
+bool display_platform_panel_sleep_committed(void);
+
+/*
+ * Suspend the BSP display transport for Light-sleep.
+ *
+ * prepare_panel_for_deep=true is used only by the Hybrid policy. It sends the
+ * LCD controller's strongest software sleep command before the Light-sleep
+ * teardown destroys the panel handle, so the later Deep-sleep phase cannot
+ * lose that power-saving step.
+ */
+esp_err_t display_platform_suspend_for_light_sleep(
+    bool prepare_panel_for_deep);
+
 lv_display_t *display_platform_resume_from_light_sleep(void);
 lv_indev_t *display_platform_get_input_device(void);
 
