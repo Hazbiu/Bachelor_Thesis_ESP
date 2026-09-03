@@ -2,9 +2,11 @@ idf_component_register(
     SRCS
         # Application orchestration
         "app/app_main.c"
+        "app/app_runtime.c"
         "app/app_boot.c"
         "app/state/app_state_machine.c"
         "app/controller/app_controller.c"
+        "app/authentication/authentication_flow.c"
 
         # User interface
         "ui/views/app_ui.c"
@@ -58,6 +60,7 @@ idf_component_register(
         "services/vision/face_recognition/face_recognizer_tflm_int8.cpp"
 
         # Power management and sleep modes
+        "services/power/power_manager.c"
         "services/power/sleep/app_sleep.c"
         "services/power/sleep/light_sleep.c"
         "services/power/sleep/deep_sleep.c"
