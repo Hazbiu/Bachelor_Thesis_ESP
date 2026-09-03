@@ -7,6 +7,8 @@ idf_component_register(
         "app/state/app_state_machine.c"
         "app/controller/app_controller.c"
         "app/authentication/authentication_flow.c"
+        "app/camera/camera_session.c"
+        "app/navigation/app_navigation.c"
 
         # User interface
         "ui/views/app_ui.c"
