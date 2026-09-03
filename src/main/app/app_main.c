@@ -27,6 +27,7 @@
 #include "services/vision/ai_snapshot_scheduler.h"
 #include "services/vision/ai_worker_state.h"
 #include "services/vision/ai_worker_runtime.h"
+#include "services/vision/ai_worker_pipeline.h"
 #include "services/vision/ai_inference_guard.h"
 #include "diagnostics/core_trace.h"
 #include "diagnostics/app_logging.h"
@@ -526,243 +527,50 @@ static bool authentication_launch_pin_transition(void)
     return true;
 }
 
-static void ai_worker_task(void *arg)
+static void ai_worker_on_recognition_started(void)
 {
-    (void)arg;
-
-    ESP_LOGI(TAG, "[CORE-PROOF] AI worker running: actual_cpu=%d task=%s",
-             xPortGetCoreID(), pcTaskGetName(NULL));
-
-    for (;;) {
-        vision_ai_worker_runtime_wait_for_notification();
-
-        vision_ai_worker_job_t job = {0};
-
-        if (!vision_ai_worker_state_take_job(&job)) {
-            continue;
-        }
-
-        if (app_sleep_is_requested() || authentication_session_blocks_camera()) {
-            vision_ai_worker_state_mark_idle();
-            continue;
-        }
-
-        /*
-         * One mutex owns the complete detector -> recognizer chain. The shared
-         * public APIs below dispatch to either ESP-DL or TFLM-FP32, therefore
-         * this ordering and high-performance policy applies identically to both
-         * backend selections.
-         */
-        if (!vision_ai_inference_guard_lock()) {
-            ESP_LOGE(TAG, "Could not acquire AI inference mutex");
-            vision_ai_worker_state_mark_idle();
-            continue;
-        }
-
-        /*
-         * Request 360 MHz BEFORE the detector starts. The previous code waited
-         * for a positive detection before boosting, which meant the detector
-         * itself ran at the 180 MHz baseline. Keep the same PM lock through the
-         * recognizer when recognition follows.
-         */
-        esp_err_t boost_ret = cpu_power_face_boost_begin();
-        if (boost_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Could not request AI high-performance CPU lock: %s",
-                     esp_err_to_name(boost_ret));
-        }
-
-        vision_ai_snapshot_buffer_sync_memory_to_cpu(job.data_size);
-
-        face_box_t snapshot_boxes[APP_MAX_FACE_BOXES] = {0};
-        diagnostics_ai_frame_sent_to_detector();
-
-#if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
-        const int face_count = face_detect_run_rgb565(
-            vision_ai_snapshot_buffer_data(),
-            job.width,
-            job.height,
-            snapshot_boxes,
-            APP_MAX_FACE_BOXES);
-#else
-        const int face_count = face_detect_run_rgb888(
-            vision_ai_snapshot_buffer_data(),
-            job.width,
-            job.height,
-            snapshot_boxes,
-            APP_MAX_FACE_BOXES);
-#endif
-
-        ESP_LOGI(TAG,
-                 "AI worker detection complete: frame=%" PRIu32 " faces=%d",
-                 job.frame_id, face_count);
-        diagnostics_ai_detection_result(face_count);
-        if (authentication_session_note_detection_result(face_count)) {
+    /*
+     * A real recognition pass is starting now.
+     *
+     *     CAMERA_ACTIVE -> AUTHENTICATING
+     *
+     * Do not move this transition to the CPU boost acquisition:
+     * the boost begins before detection and therefore also covers
+     * frames where no face is found.
+     */
+    if (app_controller_get_state() == APP_STATE_CAMERA_ACTIVE) {
+        if (app_controller_handle_event(APP_EVENT_FACE_DETECTED)) {
             ESP_LOGI(
                 TAG,
-                "Authentication rearmed after the face left the camera");
-        }
-
-        if (face_count <= 0) {
-            if (vision_face_result_store_note_no_face()) {
-                face_boost_release("face left camera");
-            }
-            face_boost_release("detector completed with no face");
-            vision_ai_inference_guard_unlock();
-            vision_ai_worker_state_mark_idle();
-            continue;
-        }
-
-        /* A positive detector result is real activity even if recognition fails. */
-        app_sleep_notify_face_detected();
-
-#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
-        printf(
-            "[INT8-POSITIVE-PATH] frame=%" PRIu32
-            " faces=%d idle_scan=%d display_suspended=%d\n",
-            job.frame_id,
-            face_count,
-            job.idle_scan_frame ? 1 : 0,
-            idle_scan_display_is_suspended() ? 1 : 0);
-#endif
-
-        const int update_count =
-            vision_face_detection_result_process_and_publish(
-                snapshot_boxes,
-                face_count,
-                job.width,
-                job.height,
-                job.source_width,
-                job.source_height);
-
-        if (job.idle_scan_frame || idle_scan_display_is_suspended()) {
-            ESP_LOGI(TAG,
-                     "IDLE-SCAN face detected; recognition deferred until display restore");
-            face_boost_release("IDLE-SCAN detector completed");
-            vision_ai_inference_guard_unlock();
-            vision_ai_worker_state_mark_idle();
-            continue;
-        }
-
-        const bool run_recognition =
-            vision_recognition_policy_should_run_frame(
-                job.frame_id,
-                APP_FACE_RECOG_INTERVAL_FRAMES);
-        bool pin_transition_requested = false;
-
-        if (run_recognition) {
-            /*
-             * Do not release either the inference mutex or the 360 MHz PM lock
-             * between detection and recognition. This guarantees the requested
-             * DET -> REC serial execution at maximum CPU frequency.
-             */
-            for (int i = 0; i < update_count; i++) {
-                if (!vision_recognition_policy_allows(
-                        snapshot_boxes[i].score,
-                        APP_FACE_RECOG_MIN_SCORE)) {
-                    continue;
-                }
-
-                char name[FACE_RECOG_MAX_NAME_LEN] = "unknown";
-                float recog_score = 0.0f;
-
-#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
-                printf(
-                    "[INT8-RECOG-TRIGGER] frame=%" PRIu32
-                    " face=%d detector_score=%.6f\n",
-                    job.frame_id,
-                    i,
-                    (double)snapshot_boxes[i].score);
-#endif
-
-                /*
-                 * A real recognition pass is starting now.
-                 *
-                 *     CAMERA_ACTIVE -> AUTHENTICATING
-                 *
-                 * Do not move this transition to the CPU boost acquisition:
-                 * the boost begins before detection and therefore also covers
-                 * frames where no face is found.
-                 */
-                if (app_controller_get_state() == APP_STATE_CAMERA_ACTIVE) {
-                    if (app_controller_handle_event(APP_EVENT_FACE_DETECTED)) {
-                        ESP_LOGI(
-                            TAG,
-                            "[APP-STATE] CAMERA_ACTIVE -> AUTHENTICATING");
-                    } else {
-                        ESP_LOGW(
-                            TAG,
-                            "[APP-STATE] FACE_DETECTED did not cause a transition");
-                    }
-                }
-
-                esp_err_t recog_ret = face_recognition_recognize(
-                    vision_ai_snapshot_buffer_data(),
-                    job.width,
-                    job.height,
-                    &snapshot_boxes[i],
-                    name,
-                    sizeof(name),
-                    &recog_score);
-
-                diagnostics_ai_recognition_result(recog_ret, name, recog_score);
-
-                vision_face_recognition_result_normalize_and_publish(
-                    i,
-                    recog_ret,
-                    name,
-                    sizeof(name),
-                    &recog_score);
-
-                if (recog_ret == ESP_OK && authentication_request_pin(name)) {
-                    pin_transition_requested = true;
-                } else if (app_controller_get_state() == APP_STATE_AUTHENTICATING) {
-                    /*
-                     * This recognition pass did not proceed to second-factor
-                     * authentication. Return to normal live-camera state.
-                     */
-                    if (app_controller_handle_event(APP_EVENT_FACE_UNKNOWN)) {
-                        ESP_LOGI(
-                            TAG,
-                            "[APP-STATE] AUTHENTICATING -> CAMERA_ACTIVE");
-                    } else {
-                        ESP_LOGW(
-                            TAG,
-                            "[APP-STATE] FACE_UNKNOWN did not cause a transition");
-                    }
-                }
-
-                ESP_LOGI(TAG,
-                         "Face %d recognition: name=%s similarity=%.3f result=%s",
-                         i, name, recog_score, esp_err_to_name(recog_ret));
-
-                if (pin_transition_requested) {
-                    break;
-                }
-            }
-        }
-
-        /*
-         * Every AI model call is finished at this point. Release the inference
-         * mutex before the PIN task is allowed to start. If authentication was
-         * accepted, keep the 360 MHz PM lock only through the PIN screen's
-         * synchronous first full render; pin_screen_transition_task() releases
-         * it immediately afterwards.
-         */
-        if (!pin_transition_requested) {
-            face_boost_release(
-                run_recognition
-                    ? "detector/recognizer chain completed without PIN transition"
-                    : "detector completed without recognition");
-        }
-
-        vision_ai_inference_guard_unlock();
-        vision_ai_worker_state_mark_idle();
-
-        if (pin_transition_requested) {
-            (void)authentication_launch_pin_transition();
+                "[APP-STATE] CAMERA_ACTIVE -> AUTHENTICATING");
+        } else {
+            ESP_LOGW(
+                TAG,
+                "[APP-STATE] FACE_DETECTED did not cause a transition");
         }
     }
 }
+
+
+static void ai_worker_on_recognition_not_authenticated(void)
+{
+    if (app_controller_get_state() == APP_STATE_AUTHENTICATING) {
+        /*
+         * This recognition pass did not proceed to second-factor
+         * authentication. Return to normal live-camera state.
+         */
+        if (app_controller_handle_event(APP_EVENT_FACE_UNKNOWN)) {
+            ESP_LOGI(
+                TAG,
+                "[APP-STATE] AUTHENTICATING -> CAMERA_ACTIVE");
+        } else {
+            ESP_LOGW(
+                TAG,
+                "[APP-STATE] FACE_UNKNOWN did not cause a transition");
+        }
+    }
+}
+
 
 static void prepare_application_for_sleep(void *user_data)
 {
@@ -1490,12 +1298,18 @@ static void camera_application_start_task(void *arg)
         return;
     }
 
-    bool ai_created = vision_ai_worker_runtime_start(
-        ai_worker_task,
-        "ai_worker",
-        APP_AI_WORKER_STACK_SIZE,
-        APP_AI_WORKER_PRIORITY,
-        APP_AI_WORKER_CORE);
+    const vision_ai_worker_pipeline_hooks_t ai_worker_hooks = {
+        .idle_scan_display_is_suspended = idle_scan_display_is_suspended,
+        .recognition_started = ai_worker_on_recognition_started,
+        .request_pin = authentication_request_pin,
+        .recognition_not_authenticated =
+            ai_worker_on_recognition_not_authenticated,
+        .launch_pin_transition = authentication_launch_pin_transition,
+        .release_face_boost = face_boost_release,
+    };
+
+    bool ai_created =
+        vision_ai_worker_pipeline_start(&ai_worker_hooks);
 
     if (!ai_created) {
         ESP_LOGE(TAG, "Failed to create asynchronous AI worker");

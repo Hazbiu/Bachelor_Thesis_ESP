@@ -43,6 +43,7 @@ idf_component_register(
         "services/vision/ai_worker_state.c"
         "services/vision/ai_inference_guard.c"
         "services/vision/ai_worker_runtime.c"
+        "services/vision/ai_worker_pipeline.c"
 
         # ESP-DL reference backend
         "services/vision/face_detection/face_detector_espdl.cpp"
