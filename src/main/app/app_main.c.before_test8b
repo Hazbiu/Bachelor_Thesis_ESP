@@ -1,0 +1,246 @@
+#include <stdio.h>
+
+#include "config/app_config.h"
+#include "driver/gpio.h"
+#include "esp_check.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_sleep.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+/*
+ * TEST 8A: EXTERNAL CONTROLLER 0x95 SEQUENCE, WITH 0x96 CLAMPED OFF
+ * =================================================================
+ *
+ * Test 7 produced a periodic ~66 -> ~110 mA pattern instead of a clean
+ * deep-sleep plateau. Test 4 had already shown the ordinary brightness path
+ * (register 0x96) is clean by itself.
+ *
+ * Test 8A therefore isolates the remaining stock constructor writes:
+ *
+ *   address 0x45
+ *     first clamp 0x96 <- 0x00
+ *     0x95 <- 0x11
+ *     0x95 <- 0x17
+ *     re-clamp 0x96 <- 0x00
+ *
+ * Then the temporary device and I2C bus are deleted.
+ *
+ * NO 0x96 <- 0xFF is ever sent.
+ * NO MIPI/DSI/DBI/JD9365 panel/LVGL/GT911 is initialized.
+ *
+ * If the periodic current pattern still appears, the 0x95 sequence itself
+ * is sufficient to provoke it.
+ */
+
+static const char *TAG = "CTRL_0X95_DS_TEST";
+
+#define PRE_SEQUENCE_BASELINE_MS   2000U
+#define POST_0X95_WINDOW_MS        4000U
+#define PRE_SLEEP_MEASURE_MS      10000U
+#define UART_QUIET_MS               500U
+
+extern esp_err_t jd9365_test8a_run_0x95_sequence_off(void);
+
+static int wait_for_level(gpio_num_t pin, int expected)
+{
+    for (unsigned i = 0; i < 20U; ++i) {
+        const int level = gpio_get_level(pin);
+        if (level == expected) {
+            return level;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return gpio_get_level(pin);
+}
+
+static esp_err_t held_output(
+    gpio_num_t pin,
+    int level,
+    gpio_pullup_t pull_up,
+    gpio_pulldown_t pull_down,
+    const char *name)
+{
+    esp_err_t ret = gpio_hold_dis(pin);
+    if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGW(TAG, "%s: previous hold release on GPIO%d returned %s",
+                 name, (int)pin, esp_err_to_name(ret));
+    }
+
+    const gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << pin,
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en = pull_up,
+        .pull_down_en = pull_down,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "%s gpio_config failed", name);
+    ESP_RETURN_ON_ERROR(gpio_set_level(pin, level), TAG, "%s level failed", name);
+    ESP_RETURN_ON_ERROR(gpio_sleep_sel_dis(pin), TAG, "%s sleep_sel failed", name);
+    ESP_RETURN_ON_ERROR(gpio_hold_en(pin), TAG, "%s hold failed", name);
+
+    const int readback = wait_for_level(pin, level);
+    ESP_LOGI(TAG, "%s: GPIO%d=%d expected=%d hold=ON",
+             name, (int)pin, readback, level);
+
+    return readback == level ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t float_input_no_pull(gpio_num_t pin)
+{
+    esp_err_t ret = gpio_hold_dis(pin);
+    if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGW(TAG, "GPIO%d previous hold release returned %s",
+                 (int)pin, esp_err_to_name(ret));
+    }
+
+    const gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << pin,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "GPIO%d config failed", (int)pin);
+    return gpio_sleep_sel_dis(pin);
+}
+
+static void quiesce_board_control_rails(void)
+{
+    ESP_ERROR_CHECK(held_output(
+        APP_PWR_WIFI_C6_CHIP_PU_GPIO,
+        APP_PWR_WIFI_C6_DISABLED_LEVEL,
+        GPIO_PULLUP_DISABLE,
+        GPIO_PULLDOWN_ENABLE,
+        "ESP32-C6 CHIP_PU"));
+
+    ESP_ERROR_CHECK(held_output(
+        APP_PWR_ETHERNET_PHY_RESET_GPIO,
+        APP_PWR_ETHERNET_RESET_ACTIVE_LEVEL,
+        GPIO_PULLUP_DISABLE,
+        GPIO_PULLDOWN_DISABLE,
+        "Ethernet PHY RESET"));
+
+    ESP_ERROR_CHECK(held_output(
+        APP_PWR_AUDIO_AMP_GPIO,
+        APP_PWR_AUDIO_AMP_DISABLED_LEVEL,
+        GPIO_PULLUP_DISABLE,
+        GPIO_PULLDOWN_DISABLE,
+        "NS4150B amplifier EN"));
+
+    ESP_ERROR_CHECK(held_output(
+        APP_PWR_SDCARD_POWER_GPIO,
+        APP_PWR_SDCARD_POWER_OFF_LEVEL,
+        GPIO_PULLUP_DISABLE,
+        GPIO_PULLDOWN_DISABLE,
+        "microSD power gate"));
+}
+
+static void release_unused_signal_pins(void)
+{
+#if APP_PWR_ISOLATE_SDMMC_PINS
+    static const int sdmmc_pins[] = APP_PWR_SDMMC_PIN_LIST;
+    for (size_t i = 0; i < sizeof(sdmmc_pins) / sizeof(sdmmc_pins[0]); ++i) {
+        ESP_ERROR_CHECK(float_input_no_pull((gpio_num_t)sdmmc_pins[i]));
+    }
+#endif
+
+    ESP_ERROR_CHECK(float_input_no_pull(APP_PWR_SHARED_I2C_SDA_GPIO));
+    ESP_ERROR_CHECK(float_input_no_pull(APP_PWR_SHARED_I2C_SCL_GPIO));
+
+#if APP_PWR_QUIESCE_PERIPHERAL_SIGNAL_PINS
+    static const int peripheral_pins[] = APP_PWR_PERIPHERAL_SIGNAL_PIN_LIST;
+    for (size_t i = 0;
+         i < sizeof(peripheral_pins) / sizeof(peripheral_pins[0]);
+         ++i) {
+        ESP_ERROR_CHECK(float_input_no_pull((gpio_num_t)peripheral_pins[i]));
+    }
+#endif
+}
+
+static void configure_gpio3_only_wakeup(void)
+{
+    const gpio_num_t wake_pin = APP_DEEP_SLEEP_BUTTON_GPIO;
+
+    const gpio_config_t wake_cfg = {
+        .pin_bit_mask = 1ULL << wake_pin,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&wake_cfg));
+
+    while (gpio_get_level(wake_pin) == 0) {
+        ESP_LOGW(TAG, "Release GPIO%d wake button to continue", (int)wake_pin);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    ESP_ERROR_CHECK(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
+    ESP_ERROR_CHECK(
+        esp_deep_sleep_enable_gpio_wakeup(
+            1ULL << wake_pin,
+            ESP_GPIO_WAKEUP_GPIO_LOW));
+
+    ESP_LOGI(TAG, "GPIO%d configured as the ONLY Deep-sleep wake source",
+             (int)wake_pin);
+}
+
+static void detach_uart0(void)
+{
+#if APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY
+    static const int uart0_pins[] = APP_PWR_UART0_PIN_LIST;
+    for (size_t i = 0; i < sizeof(uart0_pins) / sizeof(uart0_pins[0]); ++i) {
+        (void)float_input_no_pull((gpio_num_t)uart0_pins[i]);
+    }
+#endif
+}
+
+void app_main(void)
+{
+    ESP_LOGW(TAG, "======================================================");
+    ESP_LOGW(TAG, " TEST 8A: CONTROLLER 0x95 SEQUENCE, 0x96 CLAMPED OFF");
+    ESP_LOGW(TAG, " NO 0x96=0xFF; NO MIPI/DSI/DBI/JD9365/LVGL/GT911");
+    ESP_LOGW(TAG, "======================================================");
+
+    quiesce_board_control_rails();
+
+    ESP_LOGW(TAG,
+             "TEST8A BASELINE window: %u ms",
+             (unsigned)PRE_SEQUENCE_BASELINE_MS);
+    vTaskDelay(pdMS_TO_TICKS(PRE_SEQUENCE_BASELINE_MS));
+
+    ESP_LOGW(TAG,
+             "TEST8A PHASE A: 0x96=0, then 0x95=0x11, 0x95=0x17, then 0x96=0");
+    ESP_ERROR_CHECK(jd9365_test8a_run_0x95_sequence_off());
+
+    ESP_LOGW(TAG,
+             "TEST8A VERIFIED: 0x95 sequence complete, 0x96 remains OFF, "
+             "I2C bus deleted");
+
+    ESP_LOGW(TAG,
+             "TEST8A POST-0x95 measurement window: %u ms",
+             (unsigned)POST_0X95_WINDOW_MS);
+    vTaskDelay(pdMS_TO_TICKS(POST_0X95_WINDOW_MS));
+
+    quiesce_board_control_rails();
+    release_unused_signal_pins();
+    configure_gpio3_only_wakeup();
+
+    ESP_LOGW(TAG,
+             "TEST8A PRE-SLEEP measurement window: %u ms",
+             (unsigned)PRE_SLEEP_MEASURE_MS);
+    vTaskDelay(pdMS_TO_TICKS(PRE_SLEEP_MEASURE_MS));
+
+    quiesce_board_control_rails();
+
+    ESP_LOGW(TAG, "TEST8A entering TRUE ESP32-P4 Deep-sleep now.");
+
+    fflush(stdout);
+    detach_uart0();
+    vTaskDelay(pdMS_TO_TICKS(UART_QUIET_MS));
+    esp_deep_sleep_start();
+}

@@ -1,6 +1,6 @@
 ESP32-P4 MAIN APPLICATION SOURCE EXPORT
 
-Generated on: Sat Sep  5 05:53:37 PM CEST 2026
+Generated on: Sun Sep  6 12:32:05 PM CEST 2026
 Project: /home/hazbiu/Programming/Bachelor_Thesis_ESP
 Source directory: src/main/
 
@@ -8,11 +8,11 @@ Source directory: src/main/
 FILE COUNTS
 ============================================================
 
-C files       : 46
-Header files  : 57
+C files       : 47
+Header files  : 58
 C++ files     : 10
 Other files   : 2
-Total files   : 115
+Total files   : 117
 
 ============================================================
 FILE MANIFEST
@@ -30,6 +30,7 @@ src/main/CMakeLists.txt
 src/main/diagnostics/ai_pipeline_status.c
 src/main/diagnostics/app_logging.c
 src/main/diagnostics/cpu_stats.c
+src/main/diagnostics/sleep_power_profile.c
 src/main/idf_component.yml
 src/main/include/app/app_boot.h
 src/main/include/app/app_runtime.h
@@ -47,6 +48,7 @@ src/main/include/diagnostics/ai_pipeline_status.h
 src/main/include/diagnostics/app_logging.h
 src/main/include/diagnostics/core_trace.h
 src/main/include/diagnostics/cpu_stats.h
+src/main/include/diagnostics/sleep_power_profile.h
 src/main/include/domain/app_event.h
 src/main/include/domain/app_state.h
 src/main/include/platform/camera/camera_runtime.h
@@ -212,12 +214,243 @@ void app_boot_initialize_services(void)
 FILE: src/main/app/app_main.c
 ============================================================
 
-#include "app/app_runtime.h"
+#include <stdio.h>
 
+#include "config/app_config.h"
+#include "driver/gpio.h"
+#include "esp_check.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_sleep.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+static const char *TAG = "DPI_0X17_RECOVERY_TEST";
+
+#define BASELINE_MS              2000U
+#define CONSTRUCTOR_DELAY_MS     1000U
+#define ACTIVE_MS                3000U
+#define POST_STOP_MS             3000U
+#define PRE_SLEEP_MS            10000U
+#define UART_QUIET_MS             500U
+
+extern esp_err_t bsp_test13_transport_start(void);
+extern esp_err_t bsp_test13_raw_dpi_create(void);
+extern esp_err_t bsp_test13_stop(void);
+extern esp_err_t jd9365_test13_write_0x17_off(void);
+extern esp_err_t jd9365_test13_write_0x11_off(void);
+
+static int wait_level(gpio_num_t pin, int expected)
+{
+    for (unsigned i = 0; i < 20U; ++i) {
+        const int level = gpio_get_level(pin);
+        if (level == expected) return level;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return gpio_get_level(pin);
+}
+
+static esp_err_t held_output(gpio_num_t pin, int level,
+                             gpio_pullup_t pu, gpio_pulldown_t pd,
+                             const char *name)
+{
+    esp_err_t ret = gpio_hold_dis(pin);
+    if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGW(TAG, "%s hold release -> %s", name, esp_err_to_name(ret));
+    }
+
+    const gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << pin,
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en = pu,
+        .pull_down_en = pd,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "%s config failed", name);
+    ESP_RETURN_ON_ERROR(gpio_set_level(pin, level), TAG, "%s level failed", name);
+    ESP_RETURN_ON_ERROR(gpio_sleep_sel_dis(pin), TAG, "%s sleep_sel failed", name);
+    ESP_RETURN_ON_ERROR(gpio_hold_en(pin), TAG, "%s hold failed", name);
+
+    const int rb = wait_level(pin, level);
+    ESP_LOGI(TAG, "%s: GPIO%d=%d expected=%d hold=ON",
+             name, (int)pin, rb, level);
+
+    return rb == level ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t float_input_no_pull(gpio_num_t pin)
+{
+    esp_err_t ret = gpio_hold_dis(pin);
+    if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGW(TAG, "GPIO%d hold release -> %s",
+                 (int)pin, esp_err_to_name(ret));
+    }
+
+    const gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << pin,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "GPIO%d config failed", (int)pin);
+    return gpio_sleep_sel_dis(pin);
+}
+
+static void quiesce_rails(void)
+{
+    ESP_ERROR_CHECK(held_output(APP_PWR_WIFI_C6_CHIP_PU_GPIO,
+                                APP_PWR_WIFI_C6_DISABLED_LEVEL,
+                                GPIO_PULLUP_DISABLE, GPIO_PULLDOWN_ENABLE,
+                                "ESP32-C6 CHIP_PU"));
+
+    ESP_ERROR_CHECK(held_output(APP_PWR_ETHERNET_PHY_RESET_GPIO,
+                                APP_PWR_ETHERNET_RESET_ACTIVE_LEVEL,
+                                GPIO_PULLUP_DISABLE, GPIO_PULLDOWN_DISABLE,
+                                "Ethernet PHY RESET"));
+
+    ESP_ERROR_CHECK(held_output(APP_PWR_AUDIO_AMP_GPIO,
+                                APP_PWR_AUDIO_AMP_DISABLED_LEVEL,
+                                GPIO_PULLUP_DISABLE, GPIO_PULLDOWN_DISABLE,
+                                "NS4150B amplifier EN"));
+
+    ESP_ERROR_CHECK(held_output(APP_PWR_SDCARD_POWER_GPIO,
+                                APP_PWR_SDCARD_POWER_OFF_LEVEL,
+                                GPIO_PULLUP_DISABLE, GPIO_PULLDOWN_DISABLE,
+                                "microSD power gate"));
+}
+
+static void release_unused(void)
+{
+#if APP_PWR_ISOLATE_SDMMC_PINS
+    static const int sdmmc_pins[] = APP_PWR_SDMMC_PIN_LIST;
+    for (size_t i = 0; i < sizeof(sdmmc_pins)/sizeof(sdmmc_pins[0]); ++i) {
+        ESP_ERROR_CHECK(float_input_no_pull((gpio_num_t)sdmmc_pins[i]));
+    }
+#endif
+
+    ESP_ERROR_CHECK(float_input_no_pull(APP_PWR_SHARED_I2C_SDA_GPIO));
+    ESP_ERROR_CHECK(float_input_no_pull(APP_PWR_SHARED_I2C_SCL_GPIO));
+
+#if APP_PWR_QUIESCE_PERIPHERAL_SIGNAL_PINS
+    static const int pins[] = APP_PWR_PERIPHERAL_SIGNAL_PIN_LIST;
+    for (size_t i = 0; i < sizeof(pins)/sizeof(pins[0]); ++i) {
+        ESP_ERROR_CHECK(float_input_no_pull((gpio_num_t)pins[i]));
+    }
+#endif
+}
+
+static void configure_gpio3_wake(void)
+{
+    const gpio_num_t pin = APP_DEEP_SLEEP_BUTTON_GPIO;
+    const gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << pin,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&cfg));
+
+    while (gpio_get_level(pin) == 0) {
+        ESP_LOGW(TAG, "Release GPIO%d wake button", (int)pin);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    esp_err_t ret = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(ret);
+    }
+
+    ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup(
+        1ULL << pin, ESP_GPIO_WAKEUP_GPIO_LOW));
+
+    ESP_LOGI(TAG, "GPIO%d configured as ONLY Deep-sleep wake source", (int)pin);
+}
+
+static void detach_uart0(void)
+{
+#if APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY
+    static const int uart_pins[] = APP_PWR_UART0_PIN_LIST;
+    for (size_t i = 0; i < sizeof(uart_pins)/sizeof(uart_pins[0]); ++i) {
+        (void)float_input_no_pull((gpio_num_t)uart_pins[i]);
+    }
+#endif
+}
 
 void app_main(void)
 {
-    app_runtime_start();
+    ESP_LOGW(TAG, "======================================================");
+    ESP_LOGW(TAG, " TEST 13: 0x17 + RAW DPI HIGH STATE, THEN 0x11 RECOVERY");
+    ESP_LOGW(TAG, " ORDER MATCHES JD9365 CONSTRUCTOR:");
+    ESP_LOGW(TAG, " DPHY+DSI+DBI -> 0x95=0x17 -> 1s -> RAW DPI");
+    ESP_LOGW(TAG, " 0x96 ALWAYS OFF; NO JD9365 DRIVER RESET/INIT");
+    ESP_LOGW(TAG, "======================================================");
+
+    quiesce_rails();
+
+    ESP_LOGW(TAG, "TEST13 BASELINE window: %u ms", (unsigned)BASELINE_MS);
+    vTaskDelay(pdMS_TO_TICKS(BASELINE_MS));
+
+    ESP_LOGW(TAG, "TEST13 PHASE A: create DPHY + DSI + DBI only");
+    ESP_ERROR_CHECK(bsp_test13_transport_start());
+
+    ESP_LOGW(TAG,
+             "TEST13 PHASE B: external controller ONLY 0x95=0x17, "
+             "with 0x96 clamped OFF");
+    ESP_ERROR_CHECK(jd9365_test13_write_0x17_off());
+
+    ESP_LOGW(TAG,
+             "TEST13 constructor-equivalent delay: %u ms before raw DPI create",
+             (unsigned)CONSTRUCTOR_DELAY_MS);
+    vTaskDelay(pdMS_TO_TICKS(CONSTRUCTOR_DELAY_MS));
+
+    ESP_LOGW(TAG, "TEST13 PHASE C: create RAW DPI panel");
+    ESP_ERROR_CHECK(bsp_test13_raw_dpi_create());
+
+    ESP_LOGW(TAG,
+             "TEST13 VERIFIED HIGH-STATE SETUP: DPHY+DSI+DBI + 0x95=0x17 + RAW DPI; "
+             "NO JD9365 constructor/reset/init; 0x96 OFF");
+    vTaskDelay(pdMS_TO_TICKS(ACTIVE_MS));
+
+    ESP_LOGW(TAG,
+             "TEST13 PHASE D: apply candidate recovery while RAW DPI is still active: "
+             "0x96=0 -> 0x95=0x11 -> 0x96=0");
+    ESP_ERROR_CHECK(jd9365_test13_write_0x11_off());
+
+    ESP_LOGW(TAG,
+             "TEST13 RECOVERY APPLIED: 0x95=0x11, 0x96 remains OFF; "
+             "waiting 2000 ms before teardown");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    ESP_LOGW(TAG, "TEST13 PHASE E: delete DPI+DBI+DSI and release DPHY");
+    ESP_ERROR_CHECK(bsp_test13_stop());
+
+    ESP_LOGW(TAG,
+             "TEST13 VERIFIED STOPPED: DPI/DBI/DSI deleted; DPHY released; "
+             "controller I2C already deleted");
+    vTaskDelay(pdMS_TO_TICKS(POST_STOP_MS));
+
+    quiesce_rails();
+    release_unused();
+    configure_gpio3_wake();
+
+    ESP_LOGW(TAG, "TEST13 PRE-SLEEP measurement window: %u ms",
+             (unsigned)PRE_SLEEP_MS);
+    vTaskDelay(pdMS_TO_TICKS(PRE_SLEEP_MS));
+
+    quiesce_rails();
+
+    ESP_LOGW(TAG,
+             "TEST13 entering TRUE ESP32-P4 Deep-sleep now. "
+             "Compare recovery result with Test12 ~64.99 mA and minimal ~41.61 mA.");
+
+    fflush(stdout);
+    detach_uart0();
+    vTaskDelay(pdMS_TO_TICKS(UART_QUIET_MS));
+    esp_deep_sleep_start();
 }
 
 
@@ -2743,6 +2976,7 @@ idf_component_register(
 
         # Diagnostics
         "diagnostics/app_logging.c"
+        "diagnostics/sleep_power_profile.c"
         "diagnostics/cpu_stats.c"
         "diagnostics/ai_pipeline_status.c"
 
@@ -3110,6 +3344,121 @@ void diagnostics_start_cpu_stats_monitor(void)
         NULL,
         APP_SYSTEM_WORKER_CORE
     );
+}
+
+
+============================================================
+FILE: src/main/diagnostics/sleep_power_profile.c
+============================================================
+
+#include "diagnostics/sleep_power_profile.h"
+
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "config/app_config.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+static bool s_active;
+static unsigned s_stage;
+static const char *TAG = "POWER_PROFILE";
+
+void sleep_power_profile_start(const char *origin)
+{
+    s_active = APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS > 0;
+    s_stage = 0;
+    if (!s_active) {
+        return;
+    }
+
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+    ESP_LOGI(TAG,
+             "event=PROFILE_START origin=\"%s\" pause_ms=%u "
+             "target=TRUE_P4_DEEP_SLEEP",
+             origin, (unsigned)APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS);
+    ESP_LOGW(TAG,
+             "Measurement windows use vTaskDelay: P4 is awake, other tasks may "
+             "run. Read current on the external meter during MEASURE. Compare "
+             "adjacent windows; these are not final sleep-current readings.");
+}
+
+void sleep_power_profile_stop(void)
+{
+    s_active = false;
+}
+
+void sleep_power_profile_before(const char *component)
+{
+    if (s_active) {
+        ESP_LOGI(TAG, "stage=%02u event=BEGIN component=\"%s\"",
+                 s_stage + 1U, component);
+    }
+}
+
+void sleep_power_profile_quiet_wait(void)
+{
+    if (!s_active) {
+        return;
+    }
+
+    /* Use a monotonic deadline, so tick rounding never shortens the requested
+     * three-second interval. Yield to FreeRTOS; never spin or mask interrupts.
+     * This also remains safe after UART detach: there are no log calls here. */
+    const int64_t deadline_us = esp_timer_get_time() +
+        (int64_t)APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS * 1000LL;
+    for (;;) {
+        const int64_t remaining_us = deadline_us - esp_timer_get_time();
+        if (remaining_us <= 0) {
+            break;
+        }
+        const uint32_t remaining_ms =
+            (uint32_t)((remaining_us + 999LL) / 1000LL);
+        const TickType_t ticks = pdMS_TO_TICKS(remaining_ms);
+        vTaskDelay(ticks > 0 ? ticks : 1);
+    }
+}
+
+void sleep_power_profile_after(const char *component, const char *result)
+{
+    if (!s_active) {
+        return;
+    }
+
+    ++s_stage;
+    ESP_LOGI(TAG,
+             "stage=%02u event=MEASURE component=\"%s\" result=%s "
+             "pause_ms=%u p4=AWAKE",
+             s_stage, component, result,
+             (unsigned)APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS);
+    fflush(stdout);
+    const int64_t start_us = esp_timer_get_time();
+    sleep_power_profile_quiet_wait();
+    ESP_LOGI(TAG,
+             "stage=%02u event=READY component=\"%s\" elapsed_ms=%" PRId64,
+             s_stage, component,
+             (int64_t)((esp_timer_get_time() - start_us) / 1000LL));
+}
+
+void sleep_power_profile_final_boundary(bool detach_uart)
+{
+    if (s_active) {
+        ++s_stage;
+        ESP_LOGW(TAG,
+                 "stage=%02u event=FINAL_BOUNDARY_NEXT component=\"%s\" "
+                 "quiet_pause_ms=%u then=esp_deep_sleep_start "
+                 "application_logs_after_boundary=OFF",
+                 s_stage, detach_uart ? "UART0 GPIO37/38 detach" : "P4 sleep entry",
+                 (unsigned)APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS);
+        ESP_LOGW(TAG,
+                 "After the quiet pause, observe the final meter plateau. "
+                 "P4 internal domains switch at actual sleep entry, not when "
+                 "their OFF policy is configured. GPIO levels logged before "
+                 "entry do not prove pad retention in Deep-sleep.");
+    }
 }
 
 
@@ -3845,11 +4194,24 @@ FILE: src/main/include/config/app_config.h
 #define APP_PWR_SDMMC_PIN_LIST                      { 39, 40, 41, 42, 43, 44 }
 
 /*
- * Per-stage delay used only while recording per-subsystem current plateaus
- * with a bench supply. Normal firmware must use 0; any non-zero value keeps
- * the board fully awake for seven extra stages on every Deep-sleep entry.
+ * Diagnostic build: pause three seconds after each named shutdown operation.
+ * These are awake measurement windows, not Light-sleep intervals. Set the
+ * delay to 0 for normal firmware; a non-zero delay increases entry time and
+ * energy use. No power-domain policy is changed by the delay itself.
  */
-#define APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS      0
+#ifndef APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS
+#define APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS      3000U
+#endif
+
+/* With profiling enabled, Hybrid must reach the existing true Deep-sleep
+ * teardown so the Light -> Deep current increase can be investigated. With
+ * delay=0 the original continuous-Light-sleep Hybrid behavior is restored.
+ * Set this separately to 0 to retain that Hybrid behavior while profiling
+ * only direct Deep-sleep requests. */
+#ifndef APP_SLEEP_POWER_PROFILE_TRUE_DEEP_FROM_LIGHT
+#define APP_SLEEP_POWER_PROFILE_TRUE_DEEP_FROM_LIGHT \
+    (APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS > 0)
+#endif
 
 /*
  * Normally full GT911 Sleep is refused when no host wake pin exists.
@@ -4177,6 +4539,35 @@ FILE: src/main/include/diagnostics/cpu_stats.h
 #pragma once
 
 void diagnostics_start_cpu_stats_monitor(void);
+
+============================================================
+FILE: src/main/include/diagnostics/sleep_power_profile.h
+============================================================
+
+#pragma once
+
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Serialized by app_sleep's existing sleep-request owner. Inactive during
+ * normal operation and Light-sleep, including runtime component toggles. */
+void sleep_power_profile_start(const char *origin);
+void sleep_power_profile_stop(void);
+void sleep_power_profile_before(const char *component);
+void sleep_power_profile_after(const char *component, const char *result);
+
+/* Announce the last observable boundary before detaching the UART pins.
+ * quiet_wait() performs the same measurement delay without emitting logs. */
+void sleep_power_profile_final_boundary(bool detach_uart);
+void sleep_power_profile_quiet_wait(void);
+
+#ifdef __cplusplus
+}
+#endif
+
 
 ============================================================
 FILE: src/main/include/domain/app_event.h
@@ -8277,6 +8668,8 @@ uint32_t display_platform_height(void)
 FILE: src/main/platform/power/component_audio.c
 ============================================================
 
+#include "diagnostics/sleep_power_profile.h"
+
 #include "platform/power/component_audio.h"
 
 #include <inttypes.h>
@@ -8863,9 +9256,14 @@ esp_err_t component_audio_restore_after_light_sleep(void)
 
 esp_err_t component_audio_disable_for_deep_sleep(void)
 {
+    sleep_power_profile_before("NS4150B amplifier OFF");
     esp_err_t first_error = audio_amp_disable();
+    sleep_power_profile_after("NS4150B amplifier OFF",
+                              esp_err_to_name(first_error));
 
+    sleep_power_profile_before("ES8311 codec suspend");
     if (s_codec_powered_down) {
+        sleep_power_profile_after("ES8311 codec suspend", "ALREADY_SUSPENDED");
         return first_error;
     }
 
@@ -8876,6 +9274,7 @@ esp_err_t component_audio_disable_for_deep_sleep(void)
         if (first_error == ESP_OK) {
             first_error = ret;
         }
+        sleep_power_profile_after("ES8311 codec suspend", esp_err_to_name(ret));
         return first_error;
     }
 
@@ -8904,6 +9303,7 @@ esp_err_t component_audio_disable_for_deep_sleep(void)
     }
 
     es8311_close(device);
+    sleep_power_profile_after("ES8311 codec suspend", esp_err_to_name(ret));
     return first_error;
 }
 
@@ -11713,6 +12113,7 @@ FILE: src/main/services/power/sleep/app_sleep.c
 #include "bsp/esp-bsp.h"
 #include "bsp/esp32_p4_platform.h"
 #include "config/app_config.h"
+#include "diagnostics/sleep_power_profile.h"
 #include "services/power/sleep/deep_sleep.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
@@ -11733,16 +12134,6 @@ FILE: src/main/services/power/sleep/app_sleep.c
 
 #if APP_LIGHT_SLEEP_TOUCH_POLL_MS == 0
 #error "APP_LIGHT_SLEEP_TOUCH_POLL_MS must be greater than zero"
-#endif
-
-/*
-* Defined in config/app_config.h. Set it to 5000 only when deliberately
-* recording per-subsystem current plateaus with a bench supply; the default of
-* 0 is mandatory for normal firmware, because a non-zero value keeps the board
-* fully awake for one extra delay per shutdown stage on every Deep-sleep entry.
-*/
-#ifndef APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS
-#define APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS 0
 #endif
 
 #define APP_INACTIVITY_POWER_TASK_STACK_SIZE 8192
@@ -11808,13 +12199,6 @@ static void configure_runtime_power_modes(void)
         (unsigned)(light_enabled && deep_enabled
             ? APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS
             : 0U));
-}
-
-static void power_profile_stage_delay(void)
-{
-#if APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS > 0
-    vTaskDelay(pdMS_TO_TICKS(APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS));
-#endif
 }
 
 /*
@@ -12449,12 +12833,18 @@ static void run_sleep_sequence(
     const char *reason,
     app_deep_sleep_strategy_t strategy)
 {
-    if (strategy == APP_DEEP_SLEEP_STRATEGY_PRESERVE_LIGHT_STATE) {
+    if (strategy == APP_DEEP_SLEEP_STRATEGY_PRESERVE_LIGHT_STATE &&
+        !APP_SLEEP_POWER_PROFILE_TRUE_DEEP_FROM_LIGHT) {
         run_light_compatible_deep_sleep_sequence(reason);
         return;
     }
 
+    sleep_power_profile_start(
+        strategy == APP_DEEP_SLEEP_STRATEGY_PRESERVE_LIGHT_STATE
+            ? "LIGHT_TO_TRUE_DEEP: external peripherals remain suspended"
+            : "DIRECT_TRUE_DEEP");
     run_aggressive_deep_sleep_sequence(reason);
+    sleep_power_profile_stop();
 }
 
 
@@ -12473,15 +12863,21 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
         "Deep sleep requested by %s",
         sleep_reason);
 
-    ESP_LOGI("POWER_PROFILE", "STEP 0: all systems active");
-    power_profile_stage_delay();
+    sleep_power_profile_after(
+        "Pre-shutdown baseline (P4 awake; peripheral state unchanged)",
+        "REFERENCE_ONLY");
 
     /* Stop new PPA, AI and display work before camera shutdown. */
+    sleep_power_profile_before("Application / AI drain / CPU boost release");
     if (s_prepare_callback != NULL) {
         s_prepare_callback(s_prepare_user_data);
     }
+    sleep_power_profile_after(
+        "Application / AI drain / CPU boost release",
+        s_prepare_callback != NULL ? "CALLBACK_RETURNED_SEE_LOG" : "NO_CALLBACK");
 
-    ESP_LOGI("POWER_PROFILE", "STEP 1: stopping camera");
+    ESP_LOGI(TAG, "STEP 1: stopping camera");
+    sleep_power_profile_before("OV5647 camera / CSI shutdown");
     esp_err_t camera_ret = app_video_shutdown();
 
     if (camera_ret == ESP_OK) {
@@ -12493,7 +12889,9 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(camera_ret));
     }
 
-    power_profile_stage_delay();
+    sleep_power_profile_after(
+        "OV5647 camera / CSI shutdown",
+        esp_err_to_name(camera_ret));
 
     /*
     * V20 STEP 2A: the physical JD9365 must receive DISPLAY_OFF + SLEEP_IN
@@ -12501,9 +12899,10 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
     * objects first would make the DCS Sleep-In command impossible.
     */
     ESP_LOGI(
-        "POWER_PROFILE",
+        TAG,
         "STEP 2A: LCD controller DISPLAY_OFF + FULL SLEEP_IN");
 
+    sleep_power_profile_before("JD9365 LCD full sleep / backlight OFF");
     esp_err_t lcd_sleep_ret = component_display_panel_enter_full_sleep();
 
     if (lcd_sleep_ret == ESP_OK) {
@@ -12519,12 +12918,15 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(lcd_sleep_ret));
     }
 
-    power_profile_stage_delay();
+    sleep_power_profile_after(
+        "JD9365 LCD full sleep / backlight OFF",
+        esp_err_to_name(lcd_sleep_ret));
 
     ESP_LOGI(
-        "POWER_PROFILE",
+        TAG,
         "STEP 2B: tearing down display, touch and MIPI-DSI");
 
+    sleep_power_profile_before("Display transport / LVGL / MIPI-DSI teardown");
     esp_err_t display_ret = bsp_display_shutdown_for_deep_sleep();
 
     if (display_ret == ESP_OK) {
@@ -12536,7 +12938,9 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(display_ret));
     }
 
-    power_profile_stage_delay();
+    sleep_power_profile_after(
+        "Display transport / LVGL / MIPI-DSI teardown",
+        esp_err_to_name(display_ret));
 
     /*
     * STEP 3 runs after the BSP has released its own touch handle and while
@@ -12547,10 +12951,11 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
     * before touch is usable again.
     */
     ESP_LOGI(
-        "POWER_PROFILE",
+        TAG,
         "STEP 3: GT911 FULL SLEEP + display side-channel cleanup "
         "(Green mode disabled; stock wiring needs power-cycle to restore touch)");
 
+    sleep_power_profile_before("GT911 touch full sleep / display side channels");
     esp_err_t touch_ret = component_display_disable_for_deep_sleep();
 
     if (touch_ret == ESP_OK) {
@@ -12562,10 +12967,12 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(touch_ret));
     }
 
-    power_profile_stage_delay();
+    sleep_power_profile_after(
+        "GT911 touch full sleep / display side channels",
+        esp_err_to_name(touch_ret));
 
     ESP_LOGI(
-        "POWER_PROFILE",
+        TAG,
         "STEP 4: suspending ES8311 codec and disabling NS4150B amplifier");
 
     esp_err_t audio_ret = component_audio_disable_for_deep_sleep();
@@ -12582,9 +12989,8 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(audio_ret));
     }
 
-    power_profile_stage_delay();
-
-    ESP_LOGI("POWER_PROFILE", "STEP 5: disabling microSD");
+    ESP_LOGI(TAG, "STEP 5: disabling microSD");
+    sleep_power_profile_before("microSD unmount / power OFF");
     esp_err_t sdcard_ret = component_sdcard_disable_for_deep_sleep();
 
     if (sdcard_ret == ESP_OK) {
@@ -12596,9 +13002,12 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(sdcard_ret));
     }
 
-    power_profile_stage_delay();
+    sleep_power_profile_after(
+        "microSD unmount / power OFF",
+        esp_err_to_name(sdcard_ret));
 
-    ESP_LOGI("POWER_PROFILE", "STEP 6: disabling ESP32-C6");
+    ESP_LOGI(TAG, "STEP 6: disabling ESP32-C6");
+    sleep_power_profile_before("ESP32-C6 Wi-Fi / Bluetooth CHIP_PU LOW");
     esp_err_t wifi_ret = component_wifi_disable_for_deep_sleep();
 
     if (wifi_ret == ESP_OK) {
@@ -12610,12 +13019,15 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(wifi_ret));
     }
 
-    power_profile_stage_delay();
+    sleep_power_profile_after(
+        "ESP32-C6 Wi-Fi / Bluetooth CHIP_PU LOW",
+        esp_err_to_name(wifi_ret));
 
     ESP_LOGI(
-        "POWER_PROFILE",
+        TAG,
         "STEP 7: keeping IP101GRI in hardware RESET LOW for Deep-sleep");
 
+    sleep_power_profile_before("IP101GRI Ethernet RESET LOW");
     esp_err_t ethernet_ret = component_ethernet_disable_for_deep_sleep();
 
     if (ethernet_ret == ESP_OK) {
@@ -12629,14 +13041,18 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(ethernet_ret));
     }
 
-    power_profile_stage_delay();
+    sleep_power_profile_after(
+        "IP101GRI Ethernet RESET LOW",
+        esp_err_to_name(ethernet_ret));
 
-    ESP_LOGI("POWER_PROFILE", "STEP 8: entering ESP32-P4 deep sleep");
+    ESP_LOGI(TAG, "STEP 8: preparing final ESP32-P4 deep-sleep boundary");
     ESP_LOGI(
         POWER_TAG,
-        "event=DEEP_SLEEP_COMMIT wake_gpio=%d wake_level=LOW",
+        "event=DEEP_SLEEP_BOUNDARY_PREPARE wake_gpio=%d wake_level=LOW",
         APP_DEEP_SLEEP_BUTTON_GPIO);
     enter_deep_sleep_with_profile(DEEP_SLEEP_PROFILE_AGGRESSIVE);
+
+    sleep_power_profile_stop();
 
     /* The following recovery path is reached only if Deep-sleep fails. */
     esp_err_t ethernet_restore_ret =
@@ -13394,9 +13810,9 @@ static void inactivity_power_policy_task(void *arg)
             }
 
             /*
-             * RETENTIVE_DEEP returns after GPIO3 wake. The application and RAM
-             * are restored in-place, so continue the same inactivity monitor
-             * instead of deleting this task as the old true Deep-sleep path did.
+             * Normal RETENTIVE_DEEP returns after GPIO3 and restores RAM.
+             * The diagnostic true-Deep path normally never returns. If entry
+             * fails, its existing error/recovery path has logged the failure.
              */
             continue;
         }
@@ -13492,6 +13908,7 @@ FILE: src/main/services/power/sleep/deep_sleep.c
 #include "freertos/task.h"
 
 #include "config/app_config.h"
+#include "diagnostics/sleep_power_profile.h"
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
 #include "esp_err.h"
@@ -13882,7 +14299,7 @@ static esp_err_t float_digital_pin_for_deep_sleep(gpio_num_t gpio_num)
 }
 
 #if APP_PWR_ISOLATE_SDMMC_PINS
-static void float_sdmmc_pins_for_deep_sleep(void)
+static esp_err_t float_sdmmc_pins_for_deep_sleep(void)
 {
     static const int sdmmc_pins[] = APP_PWR_SDMMC_PIN_LIST;
     unsigned failed = 0;
@@ -13912,57 +14329,85 @@ static void float_sdmmc_pins_for_deep_sleep(void)
             "%u SDMMC pin(s) could not be floated; continuing to Deep-sleep",
             failed);
     }
+    return failed == 0 ? ESP_OK : ESP_FAIL;
 }
 #endif /* APP_PWR_ISOLATE_SDMMC_PINS */
 
 #if APP_PWR_QUIESCE_PERIPHERAL_SIGNAL_PINS
+/* Keep the configured pin membership; separate changes by physical subsystem
+ * so one combined pin-cleanup operation cannot hide the source of a rise. */
+static unsigned peripheral_signal_group(gpio_num_t pin)
+{
+    switch (pin) {
+    case 9: case 10: case 11: case 12: case 13:
+        return 0; /* ES8311 I2S */
+    case 6: case 14: case 15: case 16: case 17: case 18: case 19:
+    case 24: case 25:
+        return 1; /* C6 SDIO / sideband */
+    case 20: case 21:
+        return 2; /* C6 programming UART */
+    case 28: case 29: case 30: case 34: case 35: case 49: case 50:
+        return 3; /* Ethernet RMII */
+    case 46: case 47:
+        return 4; /* Camera CSI sideband */
+    default:
+        return 5; /* Any additional configured pins */
+    }
+}
+
 static void quiesce_peripheral_signal_pins_for_deep_sleep(void)
 {
     static const int signal_pins[] = APP_PWR_PERIPHERAL_SIGNAL_PIN_LIST;
-    unsigned failed = 0U;
+    static const char *const group_names[] = {
+        "Audio I2S GPIOs INPUT/no-pull",
+        "C6 SDIO / sideband GPIOs INPUT/no-pull",
+        "C6 programming UART GPIOs INPUT/no-pull",
+        "Ethernet RMII GPIOs INPUT/no-pull",
+        "Camera CSI sideband GPIOs INPUT/no-pull",
+        "Additional configured signal GPIOs INPUT/no-pull",
+    };
+    unsigned total_failed = 0U;
 
-    for (size_t i = 0; i < sizeof(signal_pins) / sizeof(signal_pins[0]); ++i) {
-        const gpio_num_t gpio_num = (gpio_num_t)signal_pins[i];
+    for (unsigned group = 0; group < sizeof(group_names) / sizeof(group_names[0]); ++group) {
+        unsigned count = 0U;
+        unsigned failed = 0U;
+        for (size_t i = 0; i < sizeof(signal_pins) / sizeof(signal_pins[0]); ++i) {
+            const gpio_num_t gpio_num = (gpio_num_t)signal_pins[i];
+            if (peripheral_signal_group(gpio_num) != group) {
+                continue;
+            }
+            if (count++ == 0U) {
+                sleep_power_profile_before(group_names[group]);
+            }
 
-        /*
-        * Defensive invariants: never release the one wake input or any board
-        * control signal whose level is intentionally held until sleep entry.
-        */
-        if (gpio_num == WAKE_BUTTON_GPIO ||
-            gpio_num == APP_PWR_SDCARD_POWER_GPIO ||
-            gpio_num == APP_PWR_AUDIO_AMP_GPIO ||
-            gpio_num == APP_PWR_WIFI_C6_CHIP_PU_GPIO) {
-            failed++;
-            ESP_LOGE(
-                TAG,
-                "Refusing to float protected control/wake GPIO%d",
-                (int)gpio_num);
-            continue;
+            /* Never release a wake input or a held board-control signal. */
+            if (gpio_num == WAKE_BUTTON_GPIO ||
+                gpio_num == APP_PWR_SDCARD_POWER_GPIO ||
+                gpio_num == APP_PWR_AUDIO_AMP_GPIO ||
+                gpio_num == APP_PWR_WIFI_C6_CHIP_PU_GPIO ||
+                gpio_num == APP_PWR_ETHERNET_PHY_RESET_GPIO) {
+                failed++;
+                ESP_LOGE(TAG, "Refusing to float protected control/wake GPIO%d",
+                         (int)gpio_num);
+                continue;
+            }
+
+            const esp_err_t ret = float_digital_pin_for_deep_sleep(gpio_num);
+            if (ret != ESP_OK) {
+                failed++;
+                ESP_LOGW(TAG, "Could not release peripheral signal GPIO%d: %s",
+                         (int)gpio_num, esp_err_to_name(ret));
+            }
         }
-
-        const esp_err_t ret = float_digital_pin_for_deep_sleep(gpio_num);
-        if (ret != ESP_OK) {
-            failed++;
-            ESP_LOGW(
-                TAG,
-                "Could not release peripheral signal GPIO%d: %s",
-                (int)gpio_num,
-                esp_err_to_name(ret));
+        if (count != 0U) {
+            sleep_power_profile_after(group_names[group],
+                                      failed == 0U ? "ESP_OK" : "GPIO_ERRORS_SEE_LOG");
         }
+        total_failed += failed;
     }
 
-    if (failed == 0U) {
-        ESP_LOGI(
-            TAG,
-            "Peripheral signal audit complete: audio I2S, C6 SDIO/sideband, "
-            "C6 programming UART, Ethernet RMII and CSI side-channel GPIOs "
-            "released INPUT/no-pull");
-    } else {
-        ESP_LOGW(
-            TAG,
-            "%u peripheral signal GPIO(s) could not be released; continuing",
-            failed);
-    }
+    ESP_LOGI(TAG, "Peripheral signal cleanup complete: failed_gpio_count=%u",
+             total_failed);
 }
 #endif /* APP_PWR_QUIESCE_PERIPHERAL_SIGNAL_PINS */
 
@@ -13972,7 +14417,7 @@ typedef struct {
     const char *name;
 } deep_sleep_domain_request_t;
 
-static void configure_final_p4_power_domains(void)
+static esp_err_t configure_final_p4_power_domains(void)
 {
     /*
     * ESP-IDF defaults unused domains to AUTO. Keep RTC_PERIPH out of this
@@ -14087,13 +14532,15 @@ static void configure_final_p4_power_domains(void)
             "ESP-IDF will still apply its Deep-sleep AUTO policy",
             failed);
     }
+    return failed == 0U ? ESP_OK : ESP_FAIL;
 }
 #endif /* APP_PWR_DEEP_SLEEP_FORCE_DOMAINS_OFF */
 
 #if APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY
 /*
-* Must be the LAST software operation before esp_deep_sleep_start().
 * After these pins are detached from UART0 no additional logging is allowed.
+* The diagnostic build uses one silent three-second measurement interval here
+* before esp_deep_sleep_start(); normal firmware (delay=0) enters immediately.
 */
 static void float_uart0_at_final_boundary(void)
 {
@@ -14173,6 +14620,7 @@ void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
         .intr_type = GPIO_INTR_DISABLE,
     };
 
+    sleep_power_profile_before("GPIO3 wake source / stale timers cleared");
     ESP_ERROR_CHECK(gpio_config(&button_config));
 
     /* Verify that GPIO3 is supported as a Deep-sleep wake pin. */
@@ -14216,6 +14664,10 @@ void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
         esp_deep_sleep_enable_gpio_wakeup(
             1ULL << WAKE_BUTTON_GPIO,
             ESP_GPIO_WAKEUP_GPIO_LOW));
+    sleep_power_profile_after(
+        "GPIO3 wake source / stale timers cleared",
+        (wake_clear_ret == ESP_OK || wake_clear_ret == ESP_ERR_INVALID_STATE)
+            ? "ESP_OK" : "WAKE_CLEAR_ERROR_SEE_LOG");
 
     ESP_LOGI(
         TAG,
@@ -14226,7 +14678,10 @@ void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
 
 #if APP_PWR_DEEP_SLEEP_FORCE_DOMAINS_OFF
     if (profile == DEEP_SLEEP_PROFILE_AGGRESSIVE) {
-        configure_final_p4_power_domains();
+        sleep_power_profile_before("P4 power-domain POLICY (applies at entry)");
+        const esp_err_t domain_ret = configure_final_p4_power_domains();
+        sleep_power_profile_after("P4 power-domain POLICY (applies at entry)",
+                                  esp_err_to_name(domain_ret));
     } else {
         ESP_LOGI(
             TAG,
@@ -14239,18 +14694,29 @@ void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
         /*
          * Existing full/destructive Deep-only boundary remains available.
          */
+        sleep_power_profile_before("Pre-isolation rail / codec / touch audit");
         audit_rails_before_deep_sleep();
+        sleep_power_profile_after("Pre-isolation rail / codec / touch audit",
+                                  "SEE_PWR_AUDIT_LOG");
 
 #if APP_PWR_ISOLATE_SDMMC_PINS
-        float_sdmmc_pins_for_deep_sleep();
+        sleep_power_profile_before("SDMMC GPIO39..44 INPUT/no-pull");
+        const esp_err_t sd_pins_ret = float_sdmmc_pins_for_deep_sleep();
+        sleep_power_profile_after("SDMMC GPIO39..44 INPUT/no-pull",
+                                  esp_err_to_name(sd_pins_ret));
 #endif
 
 #if APP_PWR_DEEP_SLEEP_POWER_DOWN_FLASH
+        sleep_power_profile_before("Optional flash power-down POLICY");
         power_down_flash_for_deep_sleep();
+        sleep_power_profile_after("Optional flash power-down POLICY", "SEE_LOG");
 #endif
 
+        sleep_power_profile_before("Shared I2C SDA/SCL GPIO7/8 isolation");
         esp_err_t i2c_ret =
             isolate_shared_i2c_for_deep_sleep();
+        sleep_power_profile_after("Shared I2C SDA/SCL GPIO7/8 isolation",
+                                  esp_err_to_name(i2c_ret));
 
         if (i2c_ret != ESP_OK) {
             ESP_LOGW(
@@ -14295,10 +14761,14 @@ void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
     *
     * STEP 6 has already disabled the ESP32-C6. Re-apply GPIO54 LOW again now,
     * after every other application-side teardown operation, so there is no
-    * stale-state shortcut and no component delay between this write and the
-    * actual Deep-sleep entry.
+    * stale-state shortcut. Diagnostic builds hold this state for measurement
+    * and also pause silently after UART detach. The final pad readback below
+    * occurs after the C6 measurement window. Delay=0 has no added pauses.
     */
+    sleep_power_profile_before("Final ESP32-C6 GPIO54 LOW clamp");
     esp_err_t c6_final_ret = component_wifi_force_off_at_sleep_boundary();
+    sleep_power_profile_after("Final ESP32-C6 GPIO54 LOW clamp",
+                              esp_err_to_name(c6_final_ret));
     if (c6_final_ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -14338,10 +14808,13 @@ void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
         "Entering Deep-sleep. Press the GPIO%d button to wake up.",
         WAKE_BUTTON_GPIO);
 
-    /*
-    * Flush all logs before the final UART0 detach. No logging, delay or other
-    * application activity is allowed after this point.
-    */
+    const bool detach_uart = APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY &&
+        profile == DEEP_SLEEP_PROFILE_AGGRESSIVE;
+    sleep_power_profile_final_boundary(detach_uart);
+
+    /* Flush the final announcement before UART detach. The only diagnostic
+     * work afterwards is a silent FreeRTOS delay; no application log is issued.
+     * The P4 then really enters Deep-sleep, so no post-entry pause is possible. */
     fflush(stdout);
 
 #if APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY
@@ -14350,6 +14823,7 @@ void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
     }
 #endif
 
+    sleep_power_profile_quiet_wait();
     esp_deep_sleep_start();
 }
 

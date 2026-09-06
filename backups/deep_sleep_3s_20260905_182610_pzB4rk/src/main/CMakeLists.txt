@@ -77,7 +77,6 @@ idf_component_register(
 
         # Diagnostics
         "diagnostics/app_logging.c"
-        "diagnostics/sleep_power_profile.c"
         "diagnostics/cpu_stats.c"
         "diagnostics/ai_pipeline_status.c"
 

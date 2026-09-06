@@ -1,0 +1,2 @@
+src/main/include/diagnostics/sleep_power_profile.h
+src/main/diagnostics/sleep_power_profile.c

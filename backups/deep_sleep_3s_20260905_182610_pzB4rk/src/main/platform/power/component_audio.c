@@ -1,5 +1,3 @@
-#include "diagnostics/sleep_power_profile.h"
-
 #include "platform/power/component_audio.h"
 
 #include <inttypes.h>
@@ -586,14 +584,9 @@ esp_err_t component_audio_restore_after_light_sleep(void)
 
 esp_err_t component_audio_disable_for_deep_sleep(void)
 {
-    sleep_power_profile_before("NS4150B amplifier OFF");
     esp_err_t first_error = audio_amp_disable();
-    sleep_power_profile_after("NS4150B amplifier OFF",
-                              esp_err_to_name(first_error));
 
-    sleep_power_profile_before("ES8311 codec suspend");
     if (s_codec_powered_down) {
-        sleep_power_profile_after("ES8311 codec suspend", "ALREADY_SUSPENDED");
         return first_error;
     }
 
@@ -604,7 +597,6 @@ esp_err_t component_audio_disable_for_deep_sleep(void)
         if (first_error == ESP_OK) {
             first_error = ret;
         }
-        sleep_power_profile_after("ES8311 codec suspend", esp_err_to_name(ret));
         return first_error;
     }
 
@@ -633,7 +625,6 @@ esp_err_t component_audio_disable_for_deep_sleep(void)
     }
 
     es8311_close(device);
-    sleep_power_profile_after("ES8311 codec suspend", esp_err_to_name(ret));
     return first_error;
 }
 

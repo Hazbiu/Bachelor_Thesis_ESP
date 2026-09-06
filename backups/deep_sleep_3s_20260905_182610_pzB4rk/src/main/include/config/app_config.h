@@ -412,24 +412,11 @@
 #define APP_PWR_SDMMC_PIN_LIST                      { 39, 40, 41, 42, 43, 44 }
 
 /*
- * Diagnostic build: pause three seconds after each named shutdown operation.
- * These are awake measurement windows, not Light-sleep intervals. Set the
- * delay to 0 for normal firmware; a non-zero delay increases entry time and
- * energy use. No power-domain policy is changed by the delay itself.
+ * Per-stage delay used only while recording per-subsystem current plateaus
+ * with a bench supply. Normal firmware must use 0; any non-zero value keeps
+ * the board fully awake for seven extra stages on every Deep-sleep entry.
  */
-#ifndef APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS
-#define APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS      3000U
-#endif
-
-/* With profiling enabled, Hybrid must reach the existing true Deep-sleep
- * teardown so the Light -> Deep current increase can be investigated. With
- * delay=0 the original continuous-Light-sleep Hybrid behavior is restored.
- * Set this separately to 0 to retain that Hybrid behavior while profiling
- * only direct Deep-sleep requests. */
-#ifndef APP_SLEEP_POWER_PROFILE_TRUE_DEEP_FROM_LIGHT
-#define APP_SLEEP_POWER_PROFILE_TRUE_DEEP_FROM_LIGHT \
-    (APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS > 0)
-#endif
+#define APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS      0
 
 /*
  * Normally full GT911 Sleep is refused when no host wake pin exists.

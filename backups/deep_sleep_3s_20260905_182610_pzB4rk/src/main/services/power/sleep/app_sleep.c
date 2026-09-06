@@ -9,7 +9,6 @@
 #include "bsp/esp-bsp.h"
 #include "bsp/esp32_p4_platform.h"
 #include "config/app_config.h"
-#include "diagnostics/sleep_power_profile.h"
 #include "services/power/sleep/deep_sleep.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
@@ -30,6 +29,16 @@
 
 #if APP_LIGHT_SLEEP_TOUCH_POLL_MS == 0
 #error "APP_LIGHT_SLEEP_TOUCH_POLL_MS must be greater than zero"
+#endif
+
+/*
+* Defined in config/app_config.h. Set it to 5000 only when deliberately
+* recording per-subsystem current plateaus with a bench supply; the default of
+* 0 is mandatory for normal firmware, because a non-zero value keeps the board
+* fully awake for one extra delay per shutdown stage on every Deep-sleep entry.
+*/
+#ifndef APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS
+#define APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS 0
 #endif
 
 #define APP_INACTIVITY_POWER_TASK_STACK_SIZE 8192
@@ -95,6 +104,13 @@ static void configure_runtime_power_modes(void)
         (unsigned)(light_enabled && deep_enabled
             ? APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS
             : 0U));
+}
+
+static void power_profile_stage_delay(void)
+{
+#if APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS > 0
+    vTaskDelay(pdMS_TO_TICKS(APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS));
+#endif
 }
 
 /*
@@ -729,18 +745,12 @@ static void run_sleep_sequence(
     const char *reason,
     app_deep_sleep_strategy_t strategy)
 {
-    if (strategy == APP_DEEP_SLEEP_STRATEGY_PRESERVE_LIGHT_STATE &&
-        !APP_SLEEP_POWER_PROFILE_TRUE_DEEP_FROM_LIGHT) {
+    if (strategy == APP_DEEP_SLEEP_STRATEGY_PRESERVE_LIGHT_STATE) {
         run_light_compatible_deep_sleep_sequence(reason);
         return;
     }
 
-    sleep_power_profile_start(
-        strategy == APP_DEEP_SLEEP_STRATEGY_PRESERVE_LIGHT_STATE
-            ? "LIGHT_TO_TRUE_DEEP: external peripherals remain suspended"
-            : "DIRECT_TRUE_DEEP");
     run_aggressive_deep_sleep_sequence(reason);
-    sleep_power_profile_stop();
 }
 
 
@@ -759,21 +769,15 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
         "Deep sleep requested by %s",
         sleep_reason);
 
-    sleep_power_profile_after(
-        "Pre-shutdown baseline (P4 awake; peripheral state unchanged)",
-        "REFERENCE_ONLY");
+    ESP_LOGI("POWER_PROFILE", "STEP 0: all systems active");
+    power_profile_stage_delay();
 
     /* Stop new PPA, AI and display work before camera shutdown. */
-    sleep_power_profile_before("Application / AI drain / CPU boost release");
     if (s_prepare_callback != NULL) {
         s_prepare_callback(s_prepare_user_data);
     }
-    sleep_power_profile_after(
-        "Application / AI drain / CPU boost release",
-        s_prepare_callback != NULL ? "CALLBACK_RETURNED_SEE_LOG" : "NO_CALLBACK");
 
-    ESP_LOGI(TAG, "STEP 1: stopping camera");
-    sleep_power_profile_before("OV5647 camera / CSI shutdown");
+    ESP_LOGI("POWER_PROFILE", "STEP 1: stopping camera");
     esp_err_t camera_ret = app_video_shutdown();
 
     if (camera_ret == ESP_OK) {
@@ -785,9 +789,7 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(camera_ret));
     }
 
-    sleep_power_profile_after(
-        "OV5647 camera / CSI shutdown",
-        esp_err_to_name(camera_ret));
+    power_profile_stage_delay();
 
     /*
     * V20 STEP 2A: the physical JD9365 must receive DISPLAY_OFF + SLEEP_IN
@@ -795,10 +797,9 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
     * objects first would make the DCS Sleep-In command impossible.
     */
     ESP_LOGI(
-        TAG,
+        "POWER_PROFILE",
         "STEP 2A: LCD controller DISPLAY_OFF + FULL SLEEP_IN");
 
-    sleep_power_profile_before("JD9365 LCD full sleep / backlight OFF");
     esp_err_t lcd_sleep_ret = component_display_panel_enter_full_sleep();
 
     if (lcd_sleep_ret == ESP_OK) {
@@ -814,15 +815,12 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(lcd_sleep_ret));
     }
 
-    sleep_power_profile_after(
-        "JD9365 LCD full sleep / backlight OFF",
-        esp_err_to_name(lcd_sleep_ret));
+    power_profile_stage_delay();
 
     ESP_LOGI(
-        TAG,
+        "POWER_PROFILE",
         "STEP 2B: tearing down display, touch and MIPI-DSI");
 
-    sleep_power_profile_before("Display transport / LVGL / MIPI-DSI teardown");
     esp_err_t display_ret = bsp_display_shutdown_for_deep_sleep();
 
     if (display_ret == ESP_OK) {
@@ -834,9 +832,7 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(display_ret));
     }
 
-    sleep_power_profile_after(
-        "Display transport / LVGL / MIPI-DSI teardown",
-        esp_err_to_name(display_ret));
+    power_profile_stage_delay();
 
     /*
     * STEP 3 runs after the BSP has released its own touch handle and while
@@ -847,11 +843,10 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
     * before touch is usable again.
     */
     ESP_LOGI(
-        TAG,
+        "POWER_PROFILE",
         "STEP 3: GT911 FULL SLEEP + display side-channel cleanup "
         "(Green mode disabled; stock wiring needs power-cycle to restore touch)");
 
-    sleep_power_profile_before("GT911 touch full sleep / display side channels");
     esp_err_t touch_ret = component_display_disable_for_deep_sleep();
 
     if (touch_ret == ESP_OK) {
@@ -863,12 +858,10 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(touch_ret));
     }
 
-    sleep_power_profile_after(
-        "GT911 touch full sleep / display side channels",
-        esp_err_to_name(touch_ret));
+    power_profile_stage_delay();
 
     ESP_LOGI(
-        TAG,
+        "POWER_PROFILE",
         "STEP 4: suspending ES8311 codec and disabling NS4150B amplifier");
 
     esp_err_t audio_ret = component_audio_disable_for_deep_sleep();
@@ -885,8 +878,9 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(audio_ret));
     }
 
-    ESP_LOGI(TAG, "STEP 5: disabling microSD");
-    sleep_power_profile_before("microSD unmount / power OFF");
+    power_profile_stage_delay();
+
+    ESP_LOGI("POWER_PROFILE", "STEP 5: disabling microSD");
     esp_err_t sdcard_ret = component_sdcard_disable_for_deep_sleep();
 
     if (sdcard_ret == ESP_OK) {
@@ -898,12 +892,9 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(sdcard_ret));
     }
 
-    sleep_power_profile_after(
-        "microSD unmount / power OFF",
-        esp_err_to_name(sdcard_ret));
+    power_profile_stage_delay();
 
-    ESP_LOGI(TAG, "STEP 6: disabling ESP32-C6");
-    sleep_power_profile_before("ESP32-C6 Wi-Fi / Bluetooth CHIP_PU LOW");
+    ESP_LOGI("POWER_PROFILE", "STEP 6: disabling ESP32-C6");
     esp_err_t wifi_ret = component_wifi_disable_for_deep_sleep();
 
     if (wifi_ret == ESP_OK) {
@@ -915,15 +906,12 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(wifi_ret));
     }
 
-    sleep_power_profile_after(
-        "ESP32-C6 Wi-Fi / Bluetooth CHIP_PU LOW",
-        esp_err_to_name(wifi_ret));
+    power_profile_stage_delay();
 
     ESP_LOGI(
-        TAG,
+        "POWER_PROFILE",
         "STEP 7: keeping IP101GRI in hardware RESET LOW for Deep-sleep");
 
-    sleep_power_profile_before("IP101GRI Ethernet RESET LOW");
     esp_err_t ethernet_ret = component_ethernet_disable_for_deep_sleep();
 
     if (ethernet_ret == ESP_OK) {
@@ -937,18 +925,14 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
             esp_err_to_name(ethernet_ret));
     }
 
-    sleep_power_profile_after(
-        "IP101GRI Ethernet RESET LOW",
-        esp_err_to_name(ethernet_ret));
+    power_profile_stage_delay();
 
-    ESP_LOGI(TAG, "STEP 8: preparing final ESP32-P4 deep-sleep boundary");
+    ESP_LOGI("POWER_PROFILE", "STEP 8: entering ESP32-P4 deep sleep");
     ESP_LOGI(
         POWER_TAG,
-        "event=DEEP_SLEEP_BOUNDARY_PREPARE wake_gpio=%d wake_level=LOW",
+        "event=DEEP_SLEEP_COMMIT wake_gpio=%d wake_level=LOW",
         APP_DEEP_SLEEP_BUTTON_GPIO);
     enter_deep_sleep_with_profile(DEEP_SLEEP_PROFILE_AGGRESSIVE);
-
-    sleep_power_profile_stop();
 
     /* The following recovery path is reached only if Deep-sleep fails. */
     esp_err_t ethernet_restore_ret =
@@ -1706,9 +1690,9 @@ static void inactivity_power_policy_task(void *arg)
             }
 
             /*
-             * Normal RETENTIVE_DEEP returns after GPIO3 and restores RAM.
-             * The diagnostic true-Deep path normally never returns. If entry
-             * fails, its existing error/recovery path has logged the failure.
+             * RETENTIVE_DEEP returns after GPIO3 wake. The application and RAM
+             * are restored in-place, so continue the same inactivity monitor
+             * instead of deleting this task as the old true Deep-sleep path did.
              */
             continue;
         }
