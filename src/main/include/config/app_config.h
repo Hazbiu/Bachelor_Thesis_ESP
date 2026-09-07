@@ -163,7 +163,19 @@
  * microSD has no Light-sleep power-down toggle by design. The mounted card is
  * part of the retained application state. Deep-sleep owns SD unmount/power-off.
  */
-#define APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET          1
+
+/*
+ * IP101GRI Light-sleep reduced-bandwidth experiment:
+ *
+ * Do NOT assert the PHY RESET pin in Light-sleep. Keep the PHY powered and
+ * temporarily force its standard MII Control Register to 10 Mbps. This gives a
+ * deterministic, immediate reduced-Ethernet state without waiting for the
+ * IP101G WOL+ sleep-ready timer.
+ *
+ * The original BMCR value is restored when Light-sleep returns to Active mode.
+ * Deep-sleep remains unchanged and still asserts GPIO51 RESET LOW.
+ */
+#define APP_LIGHT_SLEEP_ETHERNET_REDUCED_10M         1
 
 /*
  * GT911 Light-sleep false-wake filter (V8, preserving the proven V6 driver fix).
@@ -446,23 +458,25 @@
 #define APP_PWR_SDMMC_PIN_LIST                      { 39, 40, 41, 42, 43, 44 }
 
 /*
- * Diagnostic build: pause three seconds after each named shutdown operation.
- * These are awake measurement windows, not Light-sleep intervals. Set the
- * delay to 0 for normal firmware; a non-zero delay increases entry time and
- * energy use. No power-domain policy is changed by the delay itself.
+ * Normal-measurement build: do not pause between Deep-sleep shutdown stages.
+ *
+ * The previous 3000 ms diagnostic windows intentionally kept the P4 awake
+ * after every component transition. Those windows produced the repeating
+ * ~3-second current staircase visible in Joulescope and are not part of the
+ * real Light-sleep behavior. Keep the profiler compiled in, but make its
+ * measurement delay zero so shutdown proceeds continuously.
  */
 #ifndef APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS
-#define APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS      3000U
+#define APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS      0U
 #endif
 
-/* With profiling enabled, Hybrid must reach the existing true Deep-sleep
- * teardown so the Light -> Deep current increase can be investigated. With
- * delay=0 the original continuous-Light-sleep Hybrid behavior is restored.
- * Set this separately to 0 to retain that Hybrid behavior while profiling
- * only direct Deep-sleep requests. */
+/*
+ * Even with diagnostic delays disabled, Hybrid Light->Deep must still enter
+ * the real aggressive ESP32-P4 Deep-sleep path. Do not fall back to the older
+ * continuous-Light-sleep "retentive deep" compatibility mode.
+ */
 #ifndef APP_SLEEP_POWER_PROFILE_TRUE_DEEP_FROM_LIGHT
-#define APP_SLEEP_POWER_PROFILE_TRUE_DEEP_FROM_LIGHT \
-    (APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS > 0)
+#define APP_SLEEP_POWER_PROFILE_TRUE_DEEP_FROM_LIGHT 1
 #endif
 
 /*

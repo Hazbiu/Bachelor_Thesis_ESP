@@ -143,9 +143,9 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
         &first_error);
 #endif
 
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
+#if APP_LIGHT_SLEEP_ETHERNET_REDUCED_10M
     record_first_light_sleep_error(
-        component_ethernet_hold_reset_for_light_sleep(),
+        component_ethernet_enter_light_sleep_reduced_mode(),
         &first_error);
 #endif
 
@@ -156,8 +156,8 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
         const char *audio_state = "UNCHANGED";
 #endif
         const char *sdcard_state = "PRESERVED";
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
-        const char *ethernet_state = "RESET";
+#if APP_LIGHT_SLEEP_ETHERNET_REDUCED_10M
+        const char *ethernet_state = "POWERED_10M";
 #else
         const char *ethernet_state = "UNCHANGED";
 #endif
@@ -187,11 +187,11 @@ static esp_err_t restore_aux_peripherals_after_light_sleep(void)
         &first_error);
 
     /*
-    * Reverse only the reversible Light-sleep operations. Deep-sleep now uses
-    * stronger one-way peripheral states (ES8311 register suspend and IP101GRI
-    * BMCR Power Down) which are intentionally not used in this polling path.
-    */
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
+     * Reverse only reversible Light-sleep operations. Ethernet restores its
+     * saved BMCR after the temporary powered 10 Mbps mode. Deep-sleep remains
+     * the hard RESET boundary.
+     */
+#if APP_LIGHT_SLEEP_ETHERNET_REDUCED_10M
     record_first_light_sleep_error(
         component_ethernet_restore_after_light_sleep(),
         &first_error);
@@ -210,8 +210,8 @@ static esp_err_t restore_aux_peripherals_after_light_sleep(void)
         const char *audio_state = "UNCHANGED";
 #endif
         const char *sdcard_state = "PRESERVED";
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
-        const char *ethernet_state = "RELEASED";
+#if APP_LIGHT_SLEEP_ETHERNET_REDUCED_10M
+        const char *ethernet_state = "ACTIVE";
 #else
         const char *ethernet_state = "UNCHANGED";
 #endif
@@ -457,12 +457,45 @@ static void mark_light_sleep_recovery_failure(void)
     portEXIT_CRITICAL(&s_sleep_request_lock);
 }
 
+
+/*
+ * A failed Light-sleep preparation can still recover every component
+ * successfully. That return to ACTIVE must start a new inactivity epoch.
+ *
+ * Previously the recovery path restored only the CPU scan state. The shared
+ * s_last_face_detected_us timestamp still pointed to the old pre-sleep epoch,
+ * so the next 100 ms policy tick jumped straight back to ~20-25 s inactive.
+ */
+static void restart_inactivity_epoch_after_light_sleep_recovery(
+    const char *phase)
+{
+    const int64_t now_us = esp_timer_get_time();
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    s_last_face_detected_us = now_us;
+    s_light_sleep_in_progress = false;
+    s_light_sleep_failed_until_activity = false;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    cpu_power_notify_activity();
+
+    ESP_LOGI(
+        POWER_TAG,
+        "event=LIGHT_SLEEP_RECOVERY_EPOCH_RESET phase=%s "
+        "inactive_ms=0 next_light_after_ms=%u next_deep_after_ms=%u",
+        phase != NULL ? phase : "UNKNOWN",
+        (unsigned)s_light_sleep_threshold_ms,
+        (unsigned)s_deep_sleep_threshold_ms);
+}
+
 static void recover_light_sleep_without_reset(
     const char *phase,
     esp_err_t cause,
     bool restore_aux,
     bool restore_hardware)
 {
+    bool recovery_complete = true;
+
     mark_light_sleep_recovery_failure();
 
     ESP_LOGE(
@@ -477,6 +510,7 @@ static void recover_light_sleep_without_reset(
             restore_aux_peripherals_after_light_sleep();
 
         if (aux_ret != ESP_OK) {
+            recovery_complete = false;
             ESP_LOGE(
                 POWER_TAG,
                 "event=LIGHT_SLEEP_RECOVERY_WARNING phase=AUX_RESTORE "
@@ -490,6 +524,7 @@ static void recover_light_sleep_without_reset(
             s_light_resume_callback(s_light_transition_user_data);
 
         if (resume_ret != ESP_OK) {
+            recovery_complete = false;
             ESP_LOGE(
                 POWER_TAG,
                 "event=LIGHT_SLEEP_RECOVERY_WARNING phase=HARDWARE_RESUME "
@@ -499,11 +534,17 @@ static void recover_light_sleep_without_reset(
     }
 
     /*
-     * Light-sleep must never become a reset boundary. Return the CPU policy to
-     * ACTIVE and keep the existing RAM/application state. A later real activity
-     * event clears the failure guard and may arm Light-sleep again.
+     * When all recovery steps succeeded, the application is genuinely ACTIVE
+     * again. Restart the complete inactivity timeline at 0 ms.
+     *
+     * If recovery itself was incomplete, keep the failure guard and merely
+     * restore the CPU policy so automatic retries cannot hammer bad hardware.
      */
-    cpu_power_notify_activity();
+    if (recovery_complete) {
+        restart_inactivity_epoch_after_light_sleep_recovery(phase);
+    } else {
+        cpu_power_notify_activity();
+    }
 }
 
 static bool claim_light_sleep_window(uint32_t *remaining_ms)
@@ -610,9 +651,9 @@ static void run_light_compatible_deep_sleep_sequence(const char *reason)
     }
 #endif
 
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
+#if APP_LIGHT_SLEEP_ETHERNET_REDUCED_10M
     esp_err_t ethernet_ret =
-        component_ethernet_hold_reset_for_light_sleep();
+        component_ethernet_enter_light_sleep_reduced_mode();
 
     if (ethernet_ret != ESP_OK) {
         ESP_LOGW(
@@ -1137,10 +1178,11 @@ static void inactivity_power_policy_task(void *arg)
     if (s_light_mode_enabled) {
         ESP_LOGI(
             POWER_TAG,
-            "event=LIGHT_SLEEP_STATE_POLICY version=11 "
+            "event=LIGHT_SLEEP_STATE_POLICY version=14 "
             "mode=RAM_PRESERVING_NO_RESET sdcard=PRESERVED gt911=POLLING "
-            "touch_poll_ms=%u backlight=ON",
-            (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS);
+            "touch_poll_ms=%u backlight=ON ethernet=POWERED_10M deep_stage_delay_ms=%u",
+            (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
+            (unsigned)APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS);
     }
 
     const char *policy_name = s_light_mode_enabled
@@ -1289,7 +1331,8 @@ static void inactivity_power_policy_task(void *arg)
             POWER_TAG,
             "event=LIGHT_SLEEP_HARDWARE_SUSPENDED "
             "camera=OFF display=OFF backlight=ON audio=OFF sdcard=PRESERVED "
-            "ethernet=RESET c6=RETAINED_80MHZ gt911=POLLING ram=PRESERVED");
+            "ethernet=POWERED_10M c6=RETAINED_80MHZ "
+            "gt911=POLLING ram=PRESERVED");
 
         /*
         * PRE-SLEEP CHECK

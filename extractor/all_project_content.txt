@@ -1,6 +1,6 @@
 ESP32-P4 MAIN APPLICATION SOURCE EXPORT
 
-Generated on: Mon Sep  7 09:01:41 PM CEST 2026
+Generated on: Mon Sep  7 09:51:07 PM CEST 2026
 Project: /home/admin/Programming/Bachelor_Thesis_ESP
 Source directory: src/main/
 
@@ -1047,7 +1047,17 @@ static void power_manager_block_new_work(void)
 
 static void power_manager_mark_backlight_off(void)
 {
+    /*
+     * This hook runs before the destructive Deep-sleep sequence. In the
+     * Light->Deep policy the backlight may intentionally still be ON while
+     * the panel/DSI transport is already suspended, so request the physical
+     * backlight OFF here rather than updating only the software shadow.
+     */
+    display_platform_backlight_off();
     display_backlight_enabled = false;
+    ESP_LOGI(
+        TAG,
+        "Deep-sleep transition: physical LCD backlight OFF requested");
 }
 
 static void power_manager_on_setup_error(
@@ -1425,6 +1435,22 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
         }
     }
 
+#if APP_LIGHT_SLEEP_KEEP_BACKLIGHT_ON
+    if (ret == ESP_OK) {
+        /*
+         * Deliberately re-enable only the physical backlight AFTER the panel
+         * accepted SLEEP_IN and MIPI-DSI/LVGL were suspended. No framebuffer,
+         * panel scanout, camera stream or AI work is restarted here.
+         */
+        display_platform_backlight_on();
+        display_backlight_enabled = true;
+        ESP_LOGI(
+            TAG,
+            "Light-sleep visual standby: backlight ON; "
+            "JD9365/MIPI-DSI/camera remain suspended");
+    }
+#endif
+
     /* The adapter invalidates every LVGL display/input object on shutdown. */
     disp = NULL;
     launcher_touch_indev = NULL;
@@ -1480,6 +1506,19 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
         ESP_LOGE(TAG, "Timed out waiting to restore display after Light-sleep");
         return ESP_ERR_TIMEOUT;
     }
+
+#if APP_LIGHT_SLEEP_KEEP_BACKLIGHT_ON
+    /*
+     * Remove the standby illumination while reconstructing the display.
+     * The normal first complete camera frame will turn the backlight on again,
+     * preserving the existing tear-free wake behavior.
+     */
+    display_platform_backlight_off();
+    display_backlight_enabled = false;
+    ESP_LOGI(
+        TAG,
+        "Leaving Light-sleep visual standby: backlight OFF during display restore");
+#endif
 
     ESP_LOGI(TAG, "Restoring MIPI-DSI and camera after Light-sleep activity");
 
@@ -3673,6 +3712,15 @@ FILE: src/main/include/config/app_config.h
  * while preserving the C6-at-80-MHz and Deep-sleep policies unchanged.
  */
 #define APP_LIGHT_SLEEP_TOUCH_POLL_MS               250U
+
+/*
+ * Light-sleep visual-standby experiment:
+ * Keep only the physical LCD backlight powered while the JD9365 panel,
+ * LVGL/MIPI-DSI transport and camera remain suspended. This intentionally
+ * trades some Light-sleep energy for a visible standby indication. The
+ * backlight is forced OFF again before true Deep-sleep.
+ */
+#define APP_LIGHT_SLEEP_KEEP_BACKLIGHT_ON            1
 #define APP_LIGHT_SLEEP_BUTTON_POLL_MS              5U
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
 
@@ -3702,7 +3750,18 @@ FILE: src/main/include/config/app_config.h
  * microSD has no Light-sleep power-down toggle by design. The mounted card is
  * part of the retained application state. Deep-sleep owns SD unmount/power-off.
  */
-#define APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET          1
+
+/*
+ * IP101GRI Light-sleep network-standby experiment:
+ *
+ * Do NOT assert the PHY RESET pin in Light-sleep. Keep the PHY powered and use
+ * the documented WOL+ slave low-power state instead. The PHY is manually put
+ * into WOL+ sleep, where the IP101G down-speeds its sleeping link to 10 Mbps.
+ * The P4 manually restores normal PHY operation on application wake.
+ *
+ * Deep-sleep remains unchanged and still asserts GPIO51 RESET LOW.
+ */
+#define APP_LIGHT_SLEEP_ETHERNET_WOL_STANDBY         1
 
 /*
  * GT911 Light-sleep false-wake filter (V8, preserving the proven V6 driver fix).
@@ -4887,13 +4946,18 @@ esp_err_t component_ethernet_set_enabled(bool enabled);
 bool component_ethernet_is_enabled(void);
 
 /**
- * Reversible Light-sleep path: hold the onboard IP101GRI PHY in hardware reset.
+ * Reversible Light-sleep path: keep the IP101GRI powered and enter its
+ * documented WOL+ slave low-power state instead of asserting hardware RESET.
  *
- * ESP32-P4-NANO:
- *   GPIO51 LOW  = PHY reset asserted
- *   GPIO51 HIGH = PHY reset released
+ * The PHY remains out of reset (GPIO51 HIGH). WOL+ is entered manually over
+ * Clause-22 MDC/MDIO and the sleeping PHY down-speeds to 10 Mbps. This keeps a
+ * reduced-power network PHY state while the ESP32-P4 is in timer-sliced
+ * Light-sleep.
+ *
+ * Ethernet traffic is NOT configured as a P4 wake source by this application;
+ * touch/GPIO3 remain the application wake sources.
  */
-esp_err_t component_ethernet_hold_reset_for_light_sleep(void);
+esp_err_t component_ethernet_enter_light_sleep_standby(void);
 esp_err_t component_ethernet_restore_after_light_sleep(void);
 
 /**
@@ -10328,6 +10392,7 @@ FILE: src/main/platform/power/component_ethernet.c
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -10335,10 +10400,43 @@ FILE: src/main/platform/power/component_ethernet.c
 #define ETHERNET_PHY_RESET_ACTIVE   APP_PWR_ETHERNET_RESET_ACTIVE_LEVEL
 #define ETHERNET_PHY_RESET_RELEASED APP_PWR_ETHERNET_RESET_RELEASED_LEVEL
 
+#define ETHERNET_MDC_GPIO           APP_PWR_ETHERNET_MDC_GPIO
+#define ETHERNET_MDIO_GPIO          APP_PWR_ETHERNET_MDIO_GPIO
+#define ETHERNET_PHY_ADDRESS        APP_PWR_ETHERNET_PHY_ADDRESS
+
+/* IEEE 802.3 Clause-22 / IP101G register definitions. */
+#define IP101G_REG_PAGE_SELECT      20U
+#define IP101G_REG_WOL_CONTROL      16U
+#define IP101G_REG_WOL_STATUS       17U
+
+#define IP101G_PAGE_WOL_CONTROL     4U
+#define IP101G_PAGE_WOL_STATUS      17U
+#define IP101G_PAGE_DEFAULT         16U
+
+#define IP101G_WOL_PLUS_EN          (1U << 15)
+#define IP101G_WOL_PLUS_MASTER      (1U << 14)
+#define IP101G_WOL_SENSE_MAGIC      (1U << 11)
+#define IP101G_WOL_SENSE_ANY        (1U << 10)
+#define IP101G_WOL_SENSE_DUT        (1U << 9)
+#define IP101G_WOL_DOWNSPEED_EN     (1U << 8)
+#define IP101G_WOL_MANUAL_SET       (1U << 5)
+
+#define IP101G_WOL_STATUS_SLEEPING  (1U << 2)
+#define IP101G_WOL_STATUS_SLEEP_RDY (1U << 1)
+#define IP101G_WOL_STATUS_WAKE_RDY  (1U << 0)
+
+#define IP101G_MDIO_HALF_US         2U
+#define IP101G_WOL_READY_TIMEOUT_MS 100U
+#define IP101G_WOL_SLEEP_TIMEOUT_MS 100U
+#define IP101G_WOL_WAKE_SETTLE_MS   20U
+
 static const char *TAG = "component_ethernet";
 
 static bool s_reset_asserted;
 static bool s_user_enabled = true;
+static bool s_light_wol_standby_active;
+static bool s_wol_control_snapshot_valid;
+static uint16_t s_wol_control_snapshot;
 
 
 static int wait_for_pad_level(
@@ -10362,6 +10460,257 @@ static int wait_for_pad_level(
 
     return level;
 }
+
+
+/*
+ * Minimal Clause-22 MDC/MDIO bit-bang helper.
+ *
+ * The current application does not own an esp_eth MAC object, but the board
+ * exposes the IP101GRI management pins directly:
+ *     MDC  = GPIO31
+ *     MDIO = GPIO52
+ *
+ * We use the pins only at the Light-sleep boundary, then return them to
+ * INPUT/no-pull so they are not continuously driven while the P4 sleeps.
+ */
+static inline void mdio_delay_half_period(void)
+{
+    esp_rom_delay_us(IP101G_MDIO_HALF_US);
+}
+
+
+static esp_err_t mdio_prepare_bus(void)
+{
+    gpio_config_t mdc_cfg = {
+        .pin_bit_mask = 1ULL << ETHERNET_MDC_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t ret = gpio_config(&mdc_cfg);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    gpio_config_t mdio_cfg = {
+        .pin_bit_mask = 1ULL << ETHERNET_MDIO_GPIO,
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ret = gpio_config(&mdio_cfg);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    gpio_set_level(ETHERNET_MDC_GPIO, 0);
+    gpio_set_level(ETHERNET_MDIO_GPIO, 1);
+    return ESP_OK;
+}
+
+
+static void mdio_release_bus(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask =
+            (1ULL << ETHERNET_MDC_GPIO) |
+            (1ULL << ETHERNET_MDIO_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    (void)gpio_config(&cfg);
+}
+
+
+static void mdio_write_bit(int bit)
+{
+    gpio_set_level(ETHERNET_MDIO_GPIO, bit ? 1 : 0);
+    mdio_delay_half_period();
+    gpio_set_level(ETHERNET_MDC_GPIO, 1);
+    mdio_delay_half_period();
+    gpio_set_level(ETHERNET_MDC_GPIO, 0);
+}
+
+
+static int mdio_read_bit(void)
+{
+    mdio_delay_half_period();
+    gpio_set_level(ETHERNET_MDC_GPIO, 1);
+    mdio_delay_half_period();
+    const int bit = gpio_get_level(ETHERNET_MDIO_GPIO);
+    gpio_set_level(ETHERNET_MDC_GPIO, 0);
+    return bit;
+}
+
+
+static void mdio_write_bits(uint32_t value, unsigned bit_count)
+{
+    for (int bit = (int)bit_count - 1; bit >= 0; --bit) {
+        mdio_write_bit((value >> bit) & 1U);
+    }
+}
+
+
+static void mdio_preamble(void)
+{
+    gpio_set_direction(ETHERNET_MDIO_GPIO, GPIO_MODE_INPUT_OUTPUT);
+    for (unsigned i = 0; i < 32U; ++i) {
+        mdio_write_bit(1);
+    }
+}
+
+
+static esp_err_t mdio_write_register(uint8_t reg, uint16_t value)
+{
+    esp_err_t ret = mdio_prepare_bus();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    mdio_preamble();
+
+    /* ST=01, OP=01(write), PHYAD, REGAD, TA=10, DATA */
+    mdio_write_bits(0x1U, 2U);
+    mdio_write_bits(0x1U, 2U);
+    mdio_write_bits((uint32_t)ETHERNET_PHY_ADDRESS & 0x1FU, 5U);
+    mdio_write_bits((uint32_t)reg & 0x1FU, 5U);
+    mdio_write_bits(0x2U, 2U);
+    mdio_write_bits(value, 16U);
+
+    gpio_set_level(ETHERNET_MDIO_GPIO, 1);
+    mdio_delay_half_period();
+    mdio_release_bus();
+    return ESP_OK;
+}
+
+
+static esp_err_t mdio_read_register(uint8_t reg, uint16_t *value_out)
+{
+    if (value_out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = mdio_prepare_bus();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    mdio_preamble();
+
+    /* ST=01, OP=10(read), PHYAD, REGAD */
+    mdio_write_bits(0x1U, 2U);
+    mdio_write_bits(0x2U, 2U);
+    mdio_write_bits((uint32_t)ETHERNET_PHY_ADDRESS & 0x1FU, 5U);
+    mdio_write_bits((uint32_t)reg & 0x1FU, 5U);
+
+    /* Read turnaround is Z0: release MDIO for both turnaround clocks. */
+    gpio_set_direction(ETHERNET_MDIO_GPIO, GPIO_MODE_INPUT);
+    (void)mdio_read_bit();
+    const int turnaround = mdio_read_bit();
+    if (turnaround != 0) {
+        mdio_release_bus();
+        ESP_LOGE(
+            TAG,
+            "IP101GRI MDIO read failed: PHY%d reg=%u turnaround=%d expected=0",
+            ETHERNET_PHY_ADDRESS,
+            (unsigned)reg,
+            turnaround);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    uint16_t value = 0;
+    for (unsigned i = 0; i < 16U; ++i) {
+        value = (uint16_t)((value << 1) | (uint16_t)mdio_read_bit());
+    }
+
+    mdio_release_bus();
+    *value_out = value;
+    return ESP_OK;
+}
+
+
+static esp_err_t ip101g_select_page(uint8_t page)
+{
+    return mdio_write_register(IP101G_REG_PAGE_SELECT, page);
+}
+
+
+static esp_err_t ip101g_read_paged(
+    uint8_t page,
+    uint8_t reg,
+    uint16_t *value_out)
+{
+    esp_err_t ret = ip101g_select_page(page);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    return mdio_read_register(reg, value_out);
+}
+
+
+static esp_err_t ip101g_write_paged(
+    uint8_t page,
+    uint8_t reg,
+    uint16_t value)
+{
+    esp_err_t ret = ip101g_select_page(page);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    return mdio_write_register(reg, value);
+}
+
+
+static void ip101g_restore_default_page(void)
+{
+    (void)ip101g_select_page(IP101G_PAGE_DEFAULT);
+}
+
+
+static esp_err_t ip101g_wait_status(
+    uint16_t required_set,
+    uint16_t required_clear,
+    uint32_t timeout_ms,
+    uint16_t *last_status_out)
+{
+    uint32_t waited_ms = 0;
+    uint16_t status = 0;
+
+    while (waited_ms <= timeout_ms) {
+        esp_err_t ret = ip101g_read_paged(
+            IP101G_PAGE_WOL_STATUS,
+            IP101G_REG_WOL_STATUS,
+            &status);
+        if (ret != ESP_OK) {
+            ip101g_restore_default_page();
+            return ret;
+        }
+
+        if ((status & required_set) == required_set &&
+            (status & required_clear) == 0U) {
+            if (last_status_out != NULL) {
+                *last_status_out = status;
+            }
+            ip101g_restore_default_page();
+            return ESP_OK;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5U));
+        waited_ms += 5U;
+    }
+
+    if (last_status_out != NULL) {
+        *last_status_out = status;
+    }
+
+    ip101g_restore_default_page();
+    return ESP_ERR_TIMEOUT;
+}
+
 
 
 static esp_err_t configure_phy_reset_level(
@@ -10441,52 +10790,222 @@ static esp_err_t configure_phy_reset_level(
 }
 
 
-esp_err_t component_ethernet_hold_reset_for_light_sleep(void)
-{
-    const esp_err_t ret = configure_phy_reset_level(
-        ETHERNET_PHY_RESET_ACTIVE,
-        true,
-        true);
-
-    if (ret == ESP_OK) {
-        ESP_LOGI(
-            TAG,
-            "IP101GRI Light-sleep state: RESET GPIO%d LOW and held",
-            ETHERNET_PHY_RESET_GPIO);
-    }
-
-    return ret;
-}
-
-
-esp_err_t component_ethernet_restore_after_light_sleep(void)
+esp_err_t component_ethernet_enter_light_sleep_standby(void)
 {
     if (!s_user_enabled) {
+        ESP_LOGI(
+            TAG,
+            "IP101GRI Light-sleep state follows saved Ethernet OFF policy: "
+            "RESET GPIO%d LOW and held",
+            ETHERNET_PHY_RESET_GPIO);
         return configure_phy_reset_level(
             ETHERNET_PHY_RESET_ACTIVE,
             true,
             true);
     }
 
-    const esp_err_t ret = configure_phy_reset_level(
+    /*
+     * Keep the PHY alive. WOL+ slave mode is used as a true reduced-power PHY
+     * state rather than RESET. The IP101G datasheet specifies that WOL+ sleep
+     * down-speeds to 10 Mbps and can be exited by software.
+     */
+    esp_err_t ret = configure_phy_reset_level(
         ETHERNET_PHY_RESET_RELEASED,
         false,
         true);
-
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "IP101GRI reset released after Light-sleep");
+    if (ret != ESP_OK) {
+        return ret;
     }
 
-    return ret;
+    uint16_t wol_control = 0;
+    ret = ip101g_read_paged(
+        IP101G_PAGE_WOL_CONTROL,
+        IP101G_REG_WOL_CONTROL,
+        &wol_control);
+    if (ret != ESP_OK) {
+        ip101g_restore_default_page();
+        return ret;
+    }
+
+    s_wol_control_snapshot = wol_control;
+    s_wol_control_snapshot_valid = true;
+
+    /*
+     * WOL+ slave, down-speed enabled.
+     *
+     * Packet-triggered PHY wake is deliberately disabled for this measurement.
+     * The P4 has no Ethernet wake source in this application; allowing ordinary
+     * LAN broadcasts to wake only the PHY would make Light-sleep current noisy
+     * without waking the application. P4 wake remains touch/GPIO3.
+     */
+    uint16_t standby_control = wol_control;
+    standby_control |= IP101G_WOL_PLUS_EN;
+    standby_control |= IP101G_WOL_DOWNSPEED_EN;
+    standby_control &= (uint16_t)~IP101G_WOL_PLUS_MASTER;
+    standby_control &= (uint16_t)~IP101G_WOL_SENSE_MAGIC;
+    standby_control &= (uint16_t)~IP101G_WOL_SENSE_ANY;
+    standby_control &= (uint16_t)~IP101G_WOL_SENSE_DUT;
+    standby_control &= (uint16_t)~IP101G_WOL_MANUAL_SET;
+
+    ret = ip101g_write_paged(
+        IP101G_PAGE_WOL_CONTROL,
+        IP101G_REG_WOL_CONTROL,
+        standby_control);
+    if (ret != ESP_OK) {
+        ip101g_restore_default_page();
+        return ret;
+    }
+
+    uint16_t status = 0;
+    ret = ip101g_wait_status(
+        IP101G_WOL_STATUS_SLEEP_RDY,
+        IP101G_WOL_STATUS_SLEEPING,
+        IP101G_WOL_READY_TIMEOUT_MS,
+        &status);
+
+    /*
+     * Some IP101G revisions accept the manual request even if the transient
+     * "ready" status bit is missed by software. Continue with the documented
+     * manual-set request, then require the actual SLEEPING bit as proof.
+     */
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "IP101GRI WOL+ sleep-ready status was not observed "
+            "(status=0x%04x); issuing manual sleep request anyway",
+            status);
+    }
+
+    ret = ip101g_write_paged(
+        IP101G_PAGE_WOL_CONTROL,
+        IP101G_REG_WOL_CONTROL,
+        (uint16_t)(standby_control | IP101G_WOL_MANUAL_SET));
+    if (ret != ESP_OK) {
+        ip101g_restore_default_page();
+        return ret;
+    }
+
+    ret = ip101g_wait_status(
+        IP101G_WOL_STATUS_SLEEPING,
+        0U,
+        IP101G_WOL_SLEEP_TIMEOUT_MS,
+        &status);
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "IP101GRI failed to enter WOL+ Light-sleep standby: "
+            "status=0x%04x ret=%s",
+            status,
+            esp_err_to_name(ret));
+
+        /* Restore the previous WOL+ control state before aborting Light-sleep. */
+        if (s_wol_control_snapshot_valid) {
+            (void)ip101g_write_paged(
+                IP101G_PAGE_WOL_CONTROL,
+                IP101G_REG_WOL_CONTROL,
+                s_wol_control_snapshot);
+        }
+        ip101g_restore_default_page();
+        return ret;
+    }
+
+    s_light_wol_standby_active = true;
+    ip101g_restore_default_page();
+
+    ESP_LOGI(
+        TAG,
+        "IP101GRI Light-sleep WOL+ standby ACTIVE: "
+        "RESET=HIGH powered=YES downspeed=10Mbps packet_wake=DISABLED "
+        "p4_wake=TOUCH_OR_GPIO3 status=0x%04x",
+        status);
+
+    return ESP_OK;
+}
+
+
+esp_err_t component_ethernet_restore_after_light_sleep(void)
+{
+    if (!s_user_enabled) {
+        s_light_wol_standby_active = false;
+        s_wol_control_snapshot_valid = false;
+        return configure_phy_reset_level(
+            ETHERNET_PHY_RESET_ACTIVE,
+            true,
+            true);
+    }
+
+    esp_err_t first_error = ESP_OK;
+
+    if (s_light_wol_standby_active) {
+        uint16_t current_control = 0;
+        esp_err_t ret = ip101g_read_paged(
+            IP101G_PAGE_WOL_CONTROL,
+            IP101G_REG_WOL_CONTROL,
+            &current_control);
+
+        if (ret == ESP_OK) {
+            /*
+             * Datasheet-defined wake: disabling WOL+ returns the PHY to normal
+             * operation. Clear MANUAL_SET because it is a self-clearing command.
+             */
+            ret = ip101g_write_paged(
+                IP101G_PAGE_WOL_CONTROL,
+                IP101G_REG_WOL_CONTROL,
+                (uint16_t)((current_control &
+                    (uint16_t)~IP101G_WOL_PLUS_EN) &
+                    (uint16_t)~IP101G_WOL_MANUAL_SET));
+        }
+
+        if (ret != ESP_OK && first_error == ESP_OK) {
+            first_error = ret;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(IP101G_WOL_WAKE_SETTLE_MS));
+
+        if (s_wol_control_snapshot_valid) {
+            ret = ip101g_write_paged(
+                IP101G_PAGE_WOL_CONTROL,
+                IP101G_REG_WOL_CONTROL,
+                s_wol_control_snapshot);
+            if (ret != ESP_OK && first_error == ESP_OK) {
+                first_error = ret;
+            }
+        }
+
+        ip101g_restore_default_page();
+    }
+
+    esp_err_t reset_ret = configure_phy_reset_level(
+        ETHERNET_PHY_RESET_RELEASED,
+        false,
+        true);
+    if (reset_ret != ESP_OK && first_error == ESP_OK) {
+        first_error = reset_ret;
+    }
+
+    s_light_wol_standby_active = false;
+    s_wol_control_snapshot_valid = false;
+
+    if (first_error == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "IP101GRI restored from Light-sleep WOL+ standby: "
+            "RESET=HIGH normal PHY policy restored");
+    }
+
+    return first_error;
 }
 
 
 esp_err_t component_ethernet_disable_for_deep_sleep(void)
 {
     /*
-     * Preserve the exact lower-current Light-sleep electrical state.
-     * Do not release RESET and wake the PHY merely to program BMCR.
+     * Deep-sleep remains the hard-off boundary. Even if Light-sleep used the
+     * WOL+ 10 Mbps standby, assert hardware RESET LOW here.
      */
+    s_light_wol_standby_active = false;
+    s_wol_control_snapshot_valid = false;
+
     const esp_err_t ret = configure_phy_reset_level(
         ETHERNET_PHY_RESET_ACTIVE,
         true,
@@ -10559,6 +11078,8 @@ esp_err_t component_ethernet_set_enabled(bool enabled)
 {
     const bool previous_policy = s_user_enabled;
     s_user_enabled = enabled;
+    s_light_wol_standby_active = false;
+    s_wol_control_snapshot_valid = false;
 
     const esp_err_t ret = configure_phy_reset_level(
         enabled ? ETHERNET_PHY_RESET_RELEASED : ETHERNET_PHY_RESET_ACTIVE,
@@ -12457,9 +12978,9 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
         &first_error);
 #endif
 
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
+#if APP_LIGHT_SLEEP_ETHERNET_WOL_STANDBY
     record_first_light_sleep_error(
-        component_ethernet_hold_reset_for_light_sleep(),
+        component_ethernet_enter_light_sleep_standby(),
         &first_error);
 #endif
 
@@ -12470,8 +12991,8 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
         const char *audio_state = "UNCHANGED";
 #endif
         const char *sdcard_state = "PRESERVED";
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
-        const char *ethernet_state = "RESET";
+#if APP_LIGHT_SLEEP_ETHERNET_WOL_STANDBY
+        const char *ethernet_state = "WOL_STANDBY_10M";
 #else
         const char *ethernet_state = "UNCHANGED";
 #endif
@@ -12505,7 +13026,7 @@ static esp_err_t restore_aux_peripherals_after_light_sleep(void)
     * stronger one-way peripheral states (ES8311 register suspend and IP101GRI
     * BMCR Power Down) which are intentionally not used in this polling path.
     */
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
+#if APP_LIGHT_SLEEP_ETHERNET_WOL_STANDBY
     record_first_light_sleep_error(
         component_ethernet_restore_after_light_sleep(),
         &first_error);
@@ -12524,8 +13045,8 @@ static esp_err_t restore_aux_peripherals_after_light_sleep(void)
         const char *audio_state = "UNCHANGED";
 #endif
         const char *sdcard_state = "PRESERVED";
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
-        const char *ethernet_state = "RELEASED";
+#if APP_LIGHT_SLEEP_ETHERNET_WOL_STANDBY
+        const char *ethernet_state = "ACTIVE";
 #else
         const char *ethernet_state = "UNCHANGED";
 #endif
@@ -12924,9 +13445,9 @@ static void run_light_compatible_deep_sleep_sequence(const char *reason)
     }
 #endif
 
-#if APP_LIGHT_SLEEP_HOLD_ETHERNET_RESET
+#if APP_LIGHT_SLEEP_ETHERNET_WOL_STANDBY
     esp_err_t ethernet_ret =
-        component_ethernet_hold_reset_for_light_sleep();
+        component_ethernet_enter_light_sleep_standby();
 
     if (ethernet_ret != ESP_OK) {
         ESP_LOGW(
@@ -13451,9 +13972,9 @@ static void inactivity_power_policy_task(void *arg)
     if (s_light_mode_enabled) {
         ESP_LOGI(
             POWER_TAG,
-            "event=LIGHT_SLEEP_STATE_POLICY version=10 "
+            "event=LIGHT_SLEEP_STATE_POLICY version=12 "
             "mode=RAM_PRESERVING_NO_RESET sdcard=PRESERVED gt911=POLLING "
-            "touch_poll_ms=%u",
+            "touch_poll_ms=%u backlight=ON ethernet=WOL_STANDBY_10M",
             (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS);
     }
 
@@ -13602,8 +14123,9 @@ static void inactivity_power_policy_task(void *arg)
         ESP_LOGI(
             POWER_TAG,
             "event=LIGHT_SLEEP_HARDWARE_SUSPENDED "
-            "camera=OFF display=OFF audio=OFF sdcard=PRESERVED "
-            "ethernet=RESET c6=RETAINED_80MHZ gt911=POLLING ram=PRESERVED");
+            "camera=OFF display=OFF backlight=ON audio=OFF sdcard=PRESERVED "
+            "ethernet=WOL_STANDBY_10M c6=RETAINED_80MHZ "
+            "gt911=POLLING ram=PRESERVED");
 
         /*
         * PRE-SLEEP CHECK
@@ -13718,7 +14240,7 @@ static void inactivity_power_policy_task(void *arg)
             ESP_LOGI(
                 POWER_TAG,
                 "event=LIGHT_SLEEP_ENTER policy=LIGHT_THEN_DEEP "
-                "mode=TIMER_SLICED poll_ms=%u remaining_to_deep_ms=%" PRIu32,
+                "mode=TIMER_SLICED poll_ms=%u backlight=ON remaining_to_deep_ms=%" PRIu32,
                 (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
                 remaining_ms);
         } else {
@@ -13730,7 +14252,7 @@ static void inactivity_power_policy_task(void *arg)
             ESP_LOGI(
                 POWER_TAG,
                 "event=LIGHT_SLEEP_ENTER policy=LIGHT_ONLY "
-                "mode=TIMER_SLICED_INDEFINITE poll_ms=%u deep_sleep=DISABLED",
+                "mode=TIMER_SLICED_INDEFINITE poll_ms=%u backlight=ON deep_sleep=DISABLED",
                 (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS);
         }
 
