@@ -99,7 +99,7 @@ grep -Eq '^#define[[:space:]]+APP_CPU_MAX_FREQ_MHZ[[:space:]]+360([[:space:]]|$)
     "$PROJECT_ROOT/src/main/include/config/app_config.h"
 grep -Eq '^#define[[:space:]]+APP_CPU_ACTIVE_FREQ_MHZ[[:space:]]+180([[:space:]]|$)' \
     "$PROJECT_ROOT/src/main/include/config/app_config.h"
-grep -q 'xSemaphoreTake(ai_inference_mutex' \
+grep -q 'vision_ai_inference_guard_lock' \
     "$PROJECT_ROOT/src/main/app/app_main.c"
 grep -q 'cpu_power_face_boost_begin' \
     "$PROJECT_ROOT/src/main/app/app_main.c"

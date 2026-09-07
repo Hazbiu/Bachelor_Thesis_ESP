@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include "driver/gpio.h"
@@ -117,7 +118,22 @@
 #define APP_LIGHT_SLEEP_WAKE_GPIO                   GPIO_NUM_3
 #define APP_LIGHT_SLEEP_TIMEOUT_MS                  15000U
 #define APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS        10000U
-#define APP_LIGHT_SLEEP_TOUCH_POLL_MS               1000U
+/*
+ * Light-sleep touch responsiveness:
+ * Poll GT911 every 250 ms instead of every 1000 ms. This intentionally trades
+ * a small amount of Light-sleep energy for up to 4x faster touch detection,
+ * while preserving the C6-at-80-MHz and Deep-sleep policies unchanged.
+ */
+#define APP_LIGHT_SLEEP_TOUCH_POLL_MS               250U
+
+/*
+ * Light-sleep visual-standby experiment:
+ * Keep only the physical LCD backlight powered while the JD9365 panel,
+ * LVGL/MIPI-DSI transport and camera remain suspended. This intentionally
+ * trades some Light-sleep energy for a visible standby indication. The
+ * backlight is forced OFF again before true Deep-sleep.
+ */
+#define APP_LIGHT_SLEEP_KEEP_BACKLIGHT_ON            1
 #define APP_LIGHT_SLEEP_BUTTON_POLL_MS              5U
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
 
@@ -226,6 +242,24 @@
 #define APP_PWR_WIFI_C6_CHIP_PU_GPIO                GPIO_NUM_54
 #define APP_PWR_WIFI_C6_DISABLED_LEVEL              0
 #define APP_PWR_WIFI_C6_ENABLED_LEVEL               1
+
+/*
+ * P4 <-> C6 low-power mode sideband.
+ *
+ * ESP32-P4-NANO schematic:
+ *   P4 GPIO6 -- R52 (0R) --> C6 GPIO2
+ *
+ * HIGH before C6 reset/release = boot the custom C6 firmware into the
+ * retained 80 MHz Light-sleep companion state.
+ * LOW = normal/deep policy. During real P4 Deep-sleep the C6 boots with this
+ * line LOW and immediately enters its existing self-Deep-sleep path.
+ */
+#define APP_PWR_WIFI_C6_MODE_GPIO                   GPIO_NUM_6
+#define APP_PWR_WIFI_C6_MODE_DEEP_LEVEL             0
+#define APP_PWR_WIFI_C6_MODE_LIGHT_LEVEL            1
+#define APP_PWR_WIFI_C6_RESET_PULSE_MS              20U
+#define APP_PWR_WIFI_C6_LIGHT_BOOT_SETTLE_MS        150U
+#define APP_PWR_WIFI_C6_ACTIVE_SETTLE_MS            50U
 
 /*
  * IP101GRI low-current policy.
@@ -354,7 +388,7 @@
  * Schematic-confirmed board signal pins that can be released only after all
  * corresponding subsystems are quiesced:
  *
- *   GPIO6                    C6 sideband
+ *   GPIO6                    C6 power-mode sideband (NOT floated; retained LOW)
  *   GPIO9..13                ES8311 I2S
  *   GPIO14..19,24,25         P4<->C6 SDIO/sideband
  *   GPIO20,21                exposed C6-programming UART bridge pins
@@ -367,7 +401,7 @@
  * RTC-isolated separately. GPIO45/51/53/54 must retain their control policy.
  */
 #define APP_PWR_PERIPHERAL_SIGNAL_PIN_LIST          \
-    { 6, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, \
+    { 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, \
       20, 21, 24, 25, 28, 29, 30, 34, 35, 46, 47, 49, 50 }
 
 #define APP_PWR_UART0_PIN_LIST                      { 37, 38 }

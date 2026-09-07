@@ -1,3 +1,4 @@
+
 #include "services/power/sleep/app_sleep.h"
 
 #include <inttypes.h>
@@ -30,6 +31,15 @@
 
 #if APP_LIGHT_SLEEP_TOUCH_POLL_MS == 0
 #error "APP_LIGHT_SLEEP_TOUCH_POLL_MS must be greater than zero"
+#endif
+
+/*
+ * Build guard for the 250 ms responsiveness experiment. This deliberately
+ * makes a stale/incorrect 1000 ms configuration fail at compile time instead
+ * of silently producing the wrong measurement firmware.
+ */
+#if APP_LIGHT_SLEEP_TOUCH_POLL_MS != 250U
+#error "GT911 Light-sleep experiment requires APP_LIGHT_SLEEP_TOUCH_POLL_MS == 250U"
 #endif
 
 #define APP_INACTIVITY_POWER_TASK_STACK_SIZE 8192
@@ -117,6 +127,16 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
 {
     esp_err_t first_error = ESP_OK;
 
+    /*
+     * Do not hold or pulse the C6 reset in P4 Light-sleep. GPIO6->C6 GPIO2 is
+     * raised while CHIP_PU stays HIGH; the already-running companion switches
+     * to its 80 MHz policy in place. Deep-sleep keeps the existing self-sleep
+     * boundary behavior.
+     */
+    record_first_light_sleep_error(
+        component_wifi_prepare_for_light_sleep(),
+        &first_error);
+
 #if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
     record_first_light_sleep_error(
         component_audio_disable_for_light_sleep(),
@@ -145,10 +165,14 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
         ESP_LOGI(
             POWER_TAG,
             "event=LIGHT_SLEEP_AUX_SUSPENDED "
-            "audio=%s sdcard=%s ethernet=%s c6=OFF gt911=POLLING",
+            "audio=%s sdcard=%s ethernet=%s "
+            "c6=%s chip_pu=%s mode_gpio=%s gt911=POLLING",
             audio_state,
             sdcard_state,
-            ethernet_state);
+            ethernet_state,
+            component_wifi_is_enabled() ? "RETAINED_80MHZ_NO_RESET" : "OFF_BY_POLICY",
+            component_wifi_is_enabled() ? "HIGH" : "LOW",
+            component_wifi_is_enabled() ? "HIGH" : "LOW");
     }
 
     return first_error;
@@ -157,6 +181,10 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
 static esp_err_t restore_aux_peripherals_after_light_sleep(void)
 {
     esp_err_t first_error = ESP_OK;
+
+    record_first_light_sleep_error(
+        component_wifi_restore_after_light_sleep(),
+        &first_error);
 
     /*
     * Reverse only the reversible Light-sleep operations. Deep-sleep now uses
@@ -191,7 +219,7 @@ static esp_err_t restore_aux_peripherals_after_light_sleep(void)
         ESP_LOGI(
             POWER_TAG,
             "event=LIGHT_SLEEP_AUX_RESTORED "
-            "audio=%s sdcard=%s ethernet=%s",
+            "audio=%s sdcard=%s ethernet=%s c6=ACTIVE_POLICY mode_gpio=LOW",
             audio_state,
             sdcard_state,
             ethernet_state);
@@ -1109,8 +1137,10 @@ static void inactivity_power_policy_task(void *arg)
     if (s_light_mode_enabled) {
         ESP_LOGI(
             POWER_TAG,
-            "event=LIGHT_SLEEP_STATE_POLICY version=9 "
-            "mode=RAM_PRESERVING_NO_RESET sdcard=PRESERVED gt911=POLLING");
+            "event=LIGHT_SLEEP_STATE_POLICY version=11 "
+            "mode=RAM_PRESERVING_NO_RESET sdcard=PRESERVED gt911=POLLING "
+            "touch_poll_ms=%u backlight=ON",
+            (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS);
     }
 
     const char *policy_name = s_light_mode_enabled
@@ -1258,8 +1288,8 @@ static void inactivity_power_policy_task(void *arg)
         ESP_LOGI(
             POWER_TAG,
             "event=LIGHT_SLEEP_HARDWARE_SUSPENDED "
-            "camera=OFF display=OFF audio=OFF sdcard=PRESERVED "
-            "ethernet=RESET c6=OFF gt911=POLLING ram=PRESERVED");
+            "camera=OFF display=OFF backlight=ON audio=OFF sdcard=PRESERVED "
+            "ethernet=RESET c6=RETAINED_80MHZ gt911=POLLING ram=PRESERVED");
 
         /*
         * PRE-SLEEP CHECK
@@ -1374,7 +1404,7 @@ static void inactivity_power_policy_task(void *arg)
             ESP_LOGI(
                 POWER_TAG,
                 "event=LIGHT_SLEEP_ENTER policy=LIGHT_THEN_DEEP "
-                "mode=TIMER_SLICED poll_ms=%u remaining_to_deep_ms=%" PRIu32,
+                "mode=TIMER_SLICED poll_ms=%u backlight=ON remaining_to_deep_ms=%" PRIu32,
                 (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
                 remaining_ms);
         } else {
@@ -1386,7 +1416,7 @@ static void inactivity_power_policy_task(void *arg)
             ESP_LOGI(
                 POWER_TAG,
                 "event=LIGHT_SLEEP_ENTER policy=LIGHT_ONLY "
-                "mode=TIMER_SLICED_INDEFINITE poll_ms=%u deep_sleep=DISABLED",
+                "mode=TIMER_SLICED_INDEFINITE poll_ms=%u backlight=ON deep_sleep=DISABLED",
                 (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS);
         }
 

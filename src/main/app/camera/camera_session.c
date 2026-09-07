@@ -327,7 +327,17 @@ static void power_manager_block_new_work(void)
 
 static void power_manager_mark_backlight_off(void)
 {
+    /*
+     * This hook runs before the destructive Deep-sleep sequence. In the
+     * Light->Deep policy the backlight may intentionally still be ON while
+     * the panel/DSI transport is already suspended, so request the physical
+     * backlight OFF here rather than updating only the software shadow.
+     */
+    display_platform_backlight_off();
     display_backlight_enabled = false;
+    ESP_LOGI(
+        TAG,
+        "Deep-sleep transition: physical LCD backlight OFF requested");
 }
 
 static void power_manager_on_setup_error(
@@ -705,6 +715,22 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
         }
     }
 
+#if APP_LIGHT_SLEEP_KEEP_BACKLIGHT_ON
+    if (ret == ESP_OK) {
+        /*
+         * Deliberately re-enable only the physical backlight AFTER the panel
+         * accepted SLEEP_IN and MIPI-DSI/LVGL were suspended. No framebuffer,
+         * panel scanout, camera stream or AI work is restarted here.
+         */
+        display_platform_backlight_on();
+        display_backlight_enabled = true;
+        ESP_LOGI(
+            TAG,
+            "Light-sleep visual standby: backlight ON; "
+            "JD9365/MIPI-DSI/camera remain suspended");
+    }
+#endif
+
     /* The adapter invalidates every LVGL display/input object on shutdown. */
     disp = NULL;
     launcher_touch_indev = NULL;
@@ -760,6 +786,19 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
         ESP_LOGE(TAG, "Timed out waiting to restore display after Light-sleep");
         return ESP_ERR_TIMEOUT;
     }
+
+#if APP_LIGHT_SLEEP_KEEP_BACKLIGHT_ON
+    /*
+     * Remove the standby illumination while reconstructing the display.
+     * The normal first complete camera frame will turn the backlight on again,
+     * preserving the existing tear-free wake behavior.
+     */
+    display_platform_backlight_off();
+    display_backlight_enabled = false;
+    ESP_LOGI(
+        TAG,
+        "Leaving Light-sleep visual standby: backlight OFF during display restore");
+#endif
 
     ESP_LOGI(TAG, "Restoring MIPI-DSI and camera after Light-sleep activity");
 

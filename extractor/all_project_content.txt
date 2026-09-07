@@ -1,7 +1,7 @@
 ESP32-P4 MAIN APPLICATION SOURCE EXPORT
 
-Generated on: Sun Sep  6 12:32:05 PM CEST 2026
-Project: /home/hazbiu/Programming/Bachelor_Thesis_ESP
+Generated on: Mon Sep  7 09:01:41 PM CEST 2026
+Project: /home/admin/Programming/Bachelor_Thesis_ESP
 Source directory: src/main/
 
 ============================================================
@@ -209,248 +209,16 @@ void app_boot_initialize_services(void)
 }
 
 
-
 ============================================================
 FILE: src/main/app/app_main.c
 ============================================================
 
-#include <stdio.h>
+#include "app/app_runtime.h"
 
-#include "config/app_config.h"
-#include "driver/gpio.h"
-#include "esp_check.h"
-#include "esp_err.h"
-#include "esp_log.h"
-#include "esp_sleep.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
-static const char *TAG = "DPI_0X17_RECOVERY_TEST";
-
-#define BASELINE_MS              2000U
-#define CONSTRUCTOR_DELAY_MS     1000U
-#define ACTIVE_MS                3000U
-#define POST_STOP_MS             3000U
-#define PRE_SLEEP_MS            10000U
-#define UART_QUIET_MS             500U
-
-extern esp_err_t bsp_test13_transport_start(void);
-extern esp_err_t bsp_test13_raw_dpi_create(void);
-extern esp_err_t bsp_test13_stop(void);
-extern esp_err_t jd9365_test13_write_0x17_off(void);
-extern esp_err_t jd9365_test13_write_0x11_off(void);
-
-static int wait_level(gpio_num_t pin, int expected)
-{
-    for (unsigned i = 0; i < 20U; ++i) {
-        const int level = gpio_get_level(pin);
-        if (level == expected) return level;
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    return gpio_get_level(pin);
-}
-
-static esp_err_t held_output(gpio_num_t pin, int level,
-                             gpio_pullup_t pu, gpio_pulldown_t pd,
-                             const char *name)
-{
-    esp_err_t ret = gpio_hold_dis(pin);
-    if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
-        ESP_LOGW(TAG, "%s hold release -> %s", name, esp_err_to_name(ret));
-    }
-
-    const gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << pin,
-        .mode = GPIO_MODE_INPUT_OUTPUT,
-        .pull_up_en = pu,
-        .pull_down_en = pd,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-
-    ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "%s config failed", name);
-    ESP_RETURN_ON_ERROR(gpio_set_level(pin, level), TAG, "%s level failed", name);
-    ESP_RETURN_ON_ERROR(gpio_sleep_sel_dis(pin), TAG, "%s sleep_sel failed", name);
-    ESP_RETURN_ON_ERROR(gpio_hold_en(pin), TAG, "%s hold failed", name);
-
-    const int rb = wait_level(pin, level);
-    ESP_LOGI(TAG, "%s: GPIO%d=%d expected=%d hold=ON",
-             name, (int)pin, rb, level);
-
-    return rb == level ? ESP_OK : ESP_ERR_INVALID_STATE;
-}
-
-static esp_err_t float_input_no_pull(gpio_num_t pin)
-{
-    esp_err_t ret = gpio_hold_dis(pin);
-    if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
-        ESP_LOGW(TAG, "GPIO%d hold release -> %s",
-                 (int)pin, esp_err_to_name(ret));
-    }
-
-    const gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << pin,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-
-    ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "GPIO%d config failed", (int)pin);
-    return gpio_sleep_sel_dis(pin);
-}
-
-static void quiesce_rails(void)
-{
-    ESP_ERROR_CHECK(held_output(APP_PWR_WIFI_C6_CHIP_PU_GPIO,
-                                APP_PWR_WIFI_C6_DISABLED_LEVEL,
-                                GPIO_PULLUP_DISABLE, GPIO_PULLDOWN_ENABLE,
-                                "ESP32-C6 CHIP_PU"));
-
-    ESP_ERROR_CHECK(held_output(APP_PWR_ETHERNET_PHY_RESET_GPIO,
-                                APP_PWR_ETHERNET_RESET_ACTIVE_LEVEL,
-                                GPIO_PULLUP_DISABLE, GPIO_PULLDOWN_DISABLE,
-                                "Ethernet PHY RESET"));
-
-    ESP_ERROR_CHECK(held_output(APP_PWR_AUDIO_AMP_GPIO,
-                                APP_PWR_AUDIO_AMP_DISABLED_LEVEL,
-                                GPIO_PULLUP_DISABLE, GPIO_PULLDOWN_DISABLE,
-                                "NS4150B amplifier EN"));
-
-    ESP_ERROR_CHECK(held_output(APP_PWR_SDCARD_POWER_GPIO,
-                                APP_PWR_SDCARD_POWER_OFF_LEVEL,
-                                GPIO_PULLUP_DISABLE, GPIO_PULLDOWN_DISABLE,
-                                "microSD power gate"));
-}
-
-static void release_unused(void)
-{
-#if APP_PWR_ISOLATE_SDMMC_PINS
-    static const int sdmmc_pins[] = APP_PWR_SDMMC_PIN_LIST;
-    for (size_t i = 0; i < sizeof(sdmmc_pins)/sizeof(sdmmc_pins[0]); ++i) {
-        ESP_ERROR_CHECK(float_input_no_pull((gpio_num_t)sdmmc_pins[i]));
-    }
-#endif
-
-    ESP_ERROR_CHECK(float_input_no_pull(APP_PWR_SHARED_I2C_SDA_GPIO));
-    ESP_ERROR_CHECK(float_input_no_pull(APP_PWR_SHARED_I2C_SCL_GPIO));
-
-#if APP_PWR_QUIESCE_PERIPHERAL_SIGNAL_PINS
-    static const int pins[] = APP_PWR_PERIPHERAL_SIGNAL_PIN_LIST;
-    for (size_t i = 0; i < sizeof(pins)/sizeof(pins[0]); ++i) {
-        ESP_ERROR_CHECK(float_input_no_pull((gpio_num_t)pins[i]));
-    }
-#endif
-}
-
-static void configure_gpio3_wake(void)
-{
-    const gpio_num_t pin = APP_DEEP_SLEEP_BUTTON_GPIO;
-    const gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << pin,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&cfg));
-
-    while (gpio_get_level(pin) == 0) {
-        ESP_LOGW(TAG, "Release GPIO%d wake button", (int)pin);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
-    esp_err_t ret = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_ERROR_CHECK(ret);
-    }
-
-    ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup(
-        1ULL << pin, ESP_GPIO_WAKEUP_GPIO_LOW));
-
-    ESP_LOGI(TAG, "GPIO%d configured as ONLY Deep-sleep wake source", (int)pin);
-}
-
-static void detach_uart0(void)
-{
-#if APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY
-    static const int uart_pins[] = APP_PWR_UART0_PIN_LIST;
-    for (size_t i = 0; i < sizeof(uart_pins)/sizeof(uart_pins[0]); ++i) {
-        (void)float_input_no_pull((gpio_num_t)uart_pins[i]);
-    }
-#endif
-}
 
 void app_main(void)
 {
-    ESP_LOGW(TAG, "======================================================");
-    ESP_LOGW(TAG, " TEST 13: 0x17 + RAW DPI HIGH STATE, THEN 0x11 RECOVERY");
-    ESP_LOGW(TAG, " ORDER MATCHES JD9365 CONSTRUCTOR:");
-    ESP_LOGW(TAG, " DPHY+DSI+DBI -> 0x95=0x17 -> 1s -> RAW DPI");
-    ESP_LOGW(TAG, " 0x96 ALWAYS OFF; NO JD9365 DRIVER RESET/INIT");
-    ESP_LOGW(TAG, "======================================================");
-
-    quiesce_rails();
-
-    ESP_LOGW(TAG, "TEST13 BASELINE window: %u ms", (unsigned)BASELINE_MS);
-    vTaskDelay(pdMS_TO_TICKS(BASELINE_MS));
-
-    ESP_LOGW(TAG, "TEST13 PHASE A: create DPHY + DSI + DBI only");
-    ESP_ERROR_CHECK(bsp_test13_transport_start());
-
-    ESP_LOGW(TAG,
-             "TEST13 PHASE B: external controller ONLY 0x95=0x17, "
-             "with 0x96 clamped OFF");
-    ESP_ERROR_CHECK(jd9365_test13_write_0x17_off());
-
-    ESP_LOGW(TAG,
-             "TEST13 constructor-equivalent delay: %u ms before raw DPI create",
-             (unsigned)CONSTRUCTOR_DELAY_MS);
-    vTaskDelay(pdMS_TO_TICKS(CONSTRUCTOR_DELAY_MS));
-
-    ESP_LOGW(TAG, "TEST13 PHASE C: create RAW DPI panel");
-    ESP_ERROR_CHECK(bsp_test13_raw_dpi_create());
-
-    ESP_LOGW(TAG,
-             "TEST13 VERIFIED HIGH-STATE SETUP: DPHY+DSI+DBI + 0x95=0x17 + RAW DPI; "
-             "NO JD9365 constructor/reset/init; 0x96 OFF");
-    vTaskDelay(pdMS_TO_TICKS(ACTIVE_MS));
-
-    ESP_LOGW(TAG,
-             "TEST13 PHASE D: apply candidate recovery while RAW DPI is still active: "
-             "0x96=0 -> 0x95=0x11 -> 0x96=0");
-    ESP_ERROR_CHECK(jd9365_test13_write_0x11_off());
-
-    ESP_LOGW(TAG,
-             "TEST13 RECOVERY APPLIED: 0x95=0x11, 0x96 remains OFF; "
-             "waiting 2000 ms before teardown");
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    ESP_LOGW(TAG, "TEST13 PHASE E: delete DPI+DBI+DSI and release DPHY");
-    ESP_ERROR_CHECK(bsp_test13_stop());
-
-    ESP_LOGW(TAG,
-             "TEST13 VERIFIED STOPPED: DPI/DBI/DSI deleted; DPHY released; "
-             "controller I2C already deleted");
-    vTaskDelay(pdMS_TO_TICKS(POST_STOP_MS));
-
-    quiesce_rails();
-    release_unused();
-    configure_gpio3_wake();
-
-    ESP_LOGW(TAG, "TEST13 PRE-SLEEP measurement window: %u ms",
-             (unsigned)PRE_SLEEP_MS);
-    vTaskDelay(pdMS_TO_TICKS(PRE_SLEEP_MS));
-
-    quiesce_rails();
-
-    ESP_LOGW(TAG,
-             "TEST13 entering TRUE ESP32-P4 Deep-sleep now. "
-             "Compare recovery result with Test12 ~64.99 mA and minimal ~41.61 mA.");
-
-    fflush(stdout);
-    detach_uart0();
-    vTaskDelay(pdMS_TO_TICKS(UART_QUIET_MS));
-    esp_deep_sleep_start();
+    app_runtime_start();
 }
 
 
@@ -944,8 +712,6 @@ void authentication_flow_on_recognition_not_authenticated(void)
         }
     }
 }
-
-
 
 
 ============================================================
@@ -3170,7 +2936,6 @@ void app_logging_init(void)
 #undef ENABLE_INFO
 
 
-
 ============================================================
 FILE: src/main/diagnostics/cpu_stats.c
 ============================================================
@@ -3496,6 +3261,7 @@ FILE: src/main/include/app/app_boot.h
 
 void app_boot_initialize_services(void);
 
+
 ============================================================
 FILE: src/main/include/app/app_runtime.h
 ============================================================
@@ -3780,6 +3546,7 @@ FILE: src/main/include/config/ai_backend_selection.h
 FILE: src/main/include/config/app_config.h
 ============================================================
 
+
 #pragma once
 
 #include "driver/gpio.h"
@@ -3899,7 +3666,13 @@ FILE: src/main/include/config/app_config.h
 #define APP_LIGHT_SLEEP_WAKE_GPIO                   GPIO_NUM_3
 #define APP_LIGHT_SLEEP_TIMEOUT_MS                  15000U
 #define APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS        10000U
-#define APP_LIGHT_SLEEP_TOUCH_POLL_MS               1000U
+/*
+ * Light-sleep touch responsiveness:
+ * Poll GT911 every 250 ms instead of every 1000 ms. This intentionally trades
+ * a small amount of Light-sleep energy for up to 4x faster touch detection,
+ * while preserving the C6-at-80-MHz and Deep-sleep policies unchanged.
+ */
+#define APP_LIGHT_SLEEP_TOUCH_POLL_MS               250U
 #define APP_LIGHT_SLEEP_BUTTON_POLL_MS              5U
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
 
@@ -4008,6 +3781,24 @@ FILE: src/main/include/config/app_config.h
 #define APP_PWR_WIFI_C6_CHIP_PU_GPIO                GPIO_NUM_54
 #define APP_PWR_WIFI_C6_DISABLED_LEVEL              0
 #define APP_PWR_WIFI_C6_ENABLED_LEVEL               1
+
+/*
+ * P4 <-> C6 low-power mode sideband.
+ *
+ * ESP32-P4-NANO schematic:
+ *   P4 GPIO6 -- R52 (0R) --> C6 GPIO2
+ *
+ * HIGH before C6 reset/release = boot the custom C6 firmware into the
+ * retained 80 MHz Light-sleep companion state.
+ * LOW = normal/deep policy. During real P4 Deep-sleep the C6 boots with this
+ * line LOW and immediately enters its existing self-Deep-sleep path.
+ */
+#define APP_PWR_WIFI_C6_MODE_GPIO                   GPIO_NUM_6
+#define APP_PWR_WIFI_C6_MODE_DEEP_LEVEL             0
+#define APP_PWR_WIFI_C6_MODE_LIGHT_LEVEL            1
+#define APP_PWR_WIFI_C6_RESET_PULSE_MS              20U
+#define APP_PWR_WIFI_C6_LIGHT_BOOT_SETTLE_MS        150U
+#define APP_PWR_WIFI_C6_ACTIVE_SETTLE_MS            50U
 
 /*
  * IP101GRI low-current policy.
@@ -4136,7 +3927,7 @@ FILE: src/main/include/config/app_config.h
  * Schematic-confirmed board signal pins that can be released only after all
  * corresponding subsystems are quiesced:
  *
- *   GPIO6                    C6 sideband
+ *   GPIO6                    C6 power-mode sideband (NOT floated; retained LOW)
  *   GPIO9..13                ES8311 I2S
  *   GPIO14..19,24,25         P4<->C6 SDIO/sideband
  *   GPIO20,21                exposed C6-programming UART bridge pins
@@ -4149,7 +3940,7 @@ FILE: src/main/include/config/app_config.h
  * RTC-isolated separately. GPIO45/51/53/54 must retain their control policy.
  */
 #define APP_PWR_PERIPHERAL_SIGNAL_PIN_LIST          \
-    { 6, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, \
+    { 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, \
       20, 21, 24, 25, 28, 29, 30, 34, 35, 46, 47, 49, 50 }
 
 #define APP_PWR_UART0_PIN_LIST                      { 37, 38 }
@@ -4488,6 +4279,7 @@ void diagnostics_ai_frame_sent_to_detector(void);
 void diagnostics_ai_detection_result(int face_count);
 void diagnostics_ai_recognition_result(esp_err_t ret, const char *name, float similarity);
 
+
 ============================================================
 FILE: src/main/include/diagnostics/app_logging.h
 ============================================================
@@ -4504,7 +4296,6 @@ void app_logging_init(void);
 #ifdef __cplusplus
 }
 #endif
-
 
 
 ============================================================
@@ -4539,6 +4330,7 @@ FILE: src/main/include/diagnostics/cpu_stats.h
 #pragma once
 
 void diagnostics_start_cpu_stats_monitor(void);
+
 
 ============================================================
 FILE: src/main/include/diagnostics/sleep_power_profile.h
@@ -5164,6 +4956,7 @@ esp_err_t component_sdcard_restore_after_failed_sleep(void);
 FILE: src/main/include/platform/power/component_wifi.h
 ============================================================
 
+
 #pragma once
 
 #include <stdbool.h>
@@ -5180,6 +4973,29 @@ extern "C" {
  */
 esp_err_t component_wifi_set_enabled(bool enabled);
 bool component_wifi_is_enabled(void);
+
+/**
+ * Reversible P4 Light-sleep preparation.
+ *
+ * Uses the schematic-wired P4 GPIO6 -> C6 GPIO2 sideband as a live mode request.
+ * CHIP_PU stays continuously HIGH and the already-running C6 companion changes
+ * from 160 MHz to 80 MHz in place. No C6 reset/power-cycle occurs.
+ */
+esp_err_t component_wifi_prepare_for_light_sleep(void);
+
+/**
+ * Leave the retained C6 80 MHz state after P4 Light-sleep.
+ * The sideband returns LOW; if the saved Wi-Fi policy is ON the companion
+ * firmware returns to 160 MHz, otherwise CHIP_PU is clamped LOW again.
+ */
+esp_err_t component_wifi_restore_after_light_sleep(void);
+
+/**
+ * Drive and hold the C6 mode sideband LOW for the real Deep-sleep boundary.
+ * This keeps the existing self-Deep-sleep behavior deterministic when GPIO54
+ * rises after the ESP32-P4 v1.3 HP GPIO domain powers down.
+ */
+esp_err_t component_wifi_prepare_mode_for_deep_sleep(void);
 
 /**
  * Disable the external ESP32-C6 Wi-Fi coprocessor by driving CHIP_PU LOW and
@@ -5683,7 +5499,6 @@ FILE: src/main/include/services/power/sleep/wake_up.h
 #pragma once
 
 void report_wake_reason(void);
-
 
 
 ============================================================
@@ -8448,8 +8263,11 @@ FILE: src/main/platform/display/display_platform.c
 
 #include "platform/display/display_platform.h"
 
+#include <stdio.h>
+
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
+#include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
@@ -8457,6 +8275,134 @@ FILE: src/main/platform/display/display_platform.c
 #include "freertos/task.h"
 
 static const char *TAG = "display_platform";
+
+/*
+ * External display-controller Deep-sleep recovery
+ * ------------------------------------------------
+ *
+ * Controlled Joulescope tests on this exact board isolated the retained
+ * current to an interaction between the external address-0x45 controller
+ * state and the active MIPI-DPI display path:
+ *
+ *   raw DPI only                  -> ~41.63 mA Deep-sleep
+ *   0x95 = 0x17 only             -> ~47.57 mA
+ *   0x95 = 0x17 + raw DPI        -> ~64.99 mA
+ *   then 0x95 = 0x11 recovery    -> ~41.82 mA
+ *
+ * The electrical meaning of register 0x95 is not documented here.  Do not
+ * rename it as a "power" register.  We reproduce only the measured recovery
+ * sequence that was experimentally effective:
+ *
+ *     0x96 <- 0x00
+ *     0x95 <- 0x11
+ *     0x96 <- 0x00
+ *
+ * It MUST run while the panel/DPI path is still alive and before the normal
+ * DISPLAY_OFF / SLEEP_IN / MIPI teardown.  The 2 s settle interval deliberately
+ * matches the successful Test13 experiment.  Shorten it only after the full
+ * application has been re-measured.
+ */
+#define DISPLAY_CTRL_I2C_ADDRESS              0x45U
+#define DISPLAY_CTRL_STATE_REGISTER           0x95U
+#define DISPLAY_CTRL_BRIGHTNESS_REGISTER      0x96U
+#define DISPLAY_CTRL_RECOVERY_STATE           0x11U
+#define DISPLAY_CTRL_I2C_CLOCK_HZ             100000U
+#define DISPLAY_CTRL_I2C_TIMEOUT_MS           100
+#define DISPLAY_CTRL_RECOVERY_SETTLE_MS       2000U
+
+static esp_err_t display_platform_apply_controller_deep_sleep_recovery(void)
+{
+    /*
+     * This project is the measured JD9365 ESP32-P4-NANO configuration.
+     * Do not gate this recovery on optional BSP Kconfig macro spellings:
+     * the previous V2 gate evaluated false on the real build and silently
+     * compiled the recovery into a no-op.
+     */
+    printf("[DISPLAY-CTRL-RECOVERY] BEGIN address=0x45 sequence=96:00,95:11,96:00\n");
+    fflush(stdout);
+
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    if (bus == NULL) {
+        ESP_LOGW(
+            TAG,
+            "[DISPLAY-CTRL-RECOVERY] shared BSP I2C bus unavailable; "
+            "cannot apply address-0x45 recovery");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const i2c_device_config_t device_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = DISPLAY_CTRL_I2C_ADDRESS,
+        .scl_speed_hz = DISPLAY_CTRL_I2C_CLOCK_HZ,
+    };
+
+    i2c_master_dev_handle_t device = NULL;
+    esp_err_t ret = i2c_master_bus_add_device(
+        bus,
+        &device_config,
+        &device);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "[DISPLAY-CTRL-RECOVERY] could not open controller 0x%02X: %s",
+            DISPLAY_CTRL_I2C_ADDRESS,
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    static const uint8_t sequence[][2] = {
+        {DISPLAY_CTRL_BRIGHTNESS_REGISTER, 0x00U},
+        {DISPLAY_CTRL_STATE_REGISTER,      DISPLAY_CTRL_RECOVERY_STATE},
+        {DISPLAY_CTRL_BRIGHTNESS_REGISTER, 0x00U},
+    };
+
+    for (size_t i = 0; i < sizeof(sequence) / sizeof(sequence[0]); ++i) {
+        ret = i2c_master_transmit(
+            device,
+            sequence[i],
+            sizeof(sequence[i]),
+            DISPLAY_CTRL_I2C_TIMEOUT_MS);
+
+        if (ret != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "[DISPLAY-CTRL-RECOVERY] write reg=0x%02X value=0x%02X failed: %s",
+                sequence[i][0],
+                sequence[i][1],
+                esp_err_to_name(ret));
+            break;
+        }
+
+        ESP_LOGI(
+            TAG,
+            "[DISPLAY-CTRL-RECOVERY] 0x45 reg 0x%02X <- 0x%02X",
+            sequence[i][0],
+            sequence[i][1]);
+        printf("[DISPLAY-CTRL-RECOVERY] 0x45 reg 0x%02X <- 0x%02X\n",
+               sequence[i][0], sequence[i][1]);
+        fflush(stdout);
+    }
+
+    const esp_err_t remove_ret = i2c_master_bus_rm_device(device);
+    if (ret == ESP_OK && remove_ret != ESP_OK) {
+        ret = remove_ret;
+    }
+
+    if (ret == ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "[DISPLAY-CTRL-RECOVERY] Test13 recovery sequence completed; "
+            "keeping panel/DPI active for %u ms before DCS sleep",
+            (unsigned)DISPLAY_CTRL_RECOVERY_SETTLE_MS);
+        printf("[DISPLAY-CTRL-RECOVERY] COMPLETE settle_ms=%u before DCS sleep\n",
+               (unsigned)DISPLAY_CTRL_RECOVERY_SETTLE_MS);
+        fflush(stdout);
+    }
+
+    return ret;
+}
+
 
 /*
  * True only after the currently active panel instance accepted SLEEP_IN before
@@ -8553,6 +8499,26 @@ esp_err_t display_platform_panel_enter_full_sleep(void)
             "LCD FULL SLEEP: backlight OFF request failed: %s",
             esp_err_to_name(ret));
         first_error = ret;
+    }
+
+    /*
+     * Test13 proved that this recovery must be applied while the MIPI-DPI
+     * display path is still alive.  Run it after backlight OFF and before the
+     * normal DCS DISPLAY_OFF / SLEEP_IN sequence.
+     */
+    ret = display_platform_apply_controller_deep_sleep_recovery();
+    if (ret == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(DISPLAY_CTRL_RECOVERY_SETTLE_MS));
+    } else {
+        ESP_LOGW(
+            TAG,
+            "LCD FULL SLEEP: display-controller recovery completed with "
+            "errors: %s; continuing with DCS shutdown",
+            esp_err_to_name(ret));
+
+        if (first_error == ESP_OK) {
+            first_error = ret;
+        }
     }
 
     ret = esp_lcd_panel_disp_on_off(panel, false);
@@ -10923,6 +10889,7 @@ esp_err_t component_sdcard_restore_after_failed_sleep(void)
 FILE: src/main/platform/power/component_wifi.c
 ============================================================
 
+
 #include "platform/power/component_wifi.h"
 
 #include <inttypes.h>
@@ -10944,9 +10911,12 @@ FILE: src/main/platform/power/component_wifi.c
  * LOW  = ESP32-C6 held in reset
  * HIGH = ESP32-C6 enabled
  */
-#define WIFI_C6_CHIP_PU_GPIO    APP_PWR_WIFI_C6_CHIP_PU_GPIO
-#define WIFI_C6_DISABLED_LEVEL  APP_PWR_WIFI_C6_DISABLED_LEVEL
-#define WIFI_C6_ENABLED_LEVEL   APP_PWR_WIFI_C6_ENABLED_LEVEL
+#define WIFI_C6_CHIP_PU_GPIO       APP_PWR_WIFI_C6_CHIP_PU_GPIO
+#define WIFI_C6_DISABLED_LEVEL     APP_PWR_WIFI_C6_DISABLED_LEVEL
+#define WIFI_C6_ENABLED_LEVEL      APP_PWR_WIFI_C6_ENABLED_LEVEL
+#define WIFI_C6_MODE_GPIO          APP_PWR_WIFI_C6_MODE_GPIO
+#define WIFI_C6_MODE_DEEP_LEVEL    APP_PWR_WIFI_C6_MODE_DEEP_LEVEL
+#define WIFI_C6_MODE_LIGHT_LEVEL   APP_PWR_WIFI_C6_MODE_LIGHT_LEVEL
 
 static const char *TAG = "component_wifi";
 
@@ -10955,8 +10925,80 @@ static const char *TAG = "component_wifi";
  * the final Deep-sleep path must re-apply CHIP_PU LOW even if boot already
  * disabled the C6.
  */
-static bool s_c6_disabled;
+static bool s_c6_disabled = true;
 static bool s_user_enabled = true;
+
+/*
+ * GPIO6 is physically wired to ESP32-C6 GPIO2 through R52 (0 ohm).
+ * It is intentionally used as a dedicated power-mode sideband by this build:
+ *
+ *   HIGH -> C6 boots into retained 80 MHz companion mode
+ *   LOW  -> normal/deep policy
+ *
+ * GPIO6 belongs to the P4 VDD_LP domain. Keep the pad held at the requested
+ * level across P4 Light-sleep, and keep LOW at the real Deep-sleep boundary so
+ * the C6 self-sleep firmware can distinguish the two P4 states.
+ */
+static esp_err_t configure_c6_mode_pin(int level, bool hold_level)
+{
+    const gpio_num_t pin = WIFI_C6_MODE_GPIO;
+
+    esp_err_t ret = gpio_hold_dis(pin);
+    if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGE(TAG, "Could not release C6 mode GPIO%d hold: %s",
+                 pin, esp_err_to_name(ret));
+        return ret;
+    }
+
+    gpio_config_t io_config = {
+        .pin_bit_mask = 1ULL << pin,
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ret = gpio_config(&io_config);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = gpio_set_drive_capability(pin, GPIO_DRIVE_CAP_0);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = gpio_set_level(pin, level);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = gpio_sleep_sel_dis(pin);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if (hold_level) {
+        ret = gpio_hold_en(pin);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Could not hold C6 mode GPIO%d at level %d: %s",
+                     pin, level, esp_err_to_name(ret));
+            return ret;
+        }
+    }
+
+    const int readback = gpio_get_level(pin);
+    if (readback != level) {
+        ESP_LOGE(TAG, "C6 mode GPIO%d reads %d; expected %d",
+                 pin, readback, level);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG,
+             "C6 mode sideband: P4 GPIO%d -> C6 GPIO2 level=%d hold=%s",
+             pin, level, hold_level ? "YES" : "NO");
+    return ESP_OK;
+}
 
 /*
  * Poll the pad until it reaches the expected level, or until the settle
@@ -11199,33 +11241,180 @@ static esp_err_t configure_c6_chip_pu_low(
     return ESP_OK;
 }
 
+static esp_err_t boot_c6_for_active_policy(void)
+{
+    /*
+     * A cold C6 boot with GPIO2 LOW is reserved for the real P4 Deep-sleep
+     * boundary. Therefore a normal ACTIVE boot first presents GPIO2 HIGH,
+     * resets/releases CHIP_PU, lets the companion start at 80 MHz, and then
+     * drops GPIO2 LOW so the already-running companion selects 160 MHz.
+     *
+     * This reset sequence is used only when the C6 is already OFF/reset (for
+     * example at application boot or after a real Deep-sleep wake). It is NOT
+     * used when entering or leaving P4 Light-sleep.
+     */
+    esp_err_t ret = configure_c6_mode_pin(
+        WIFI_C6_MODE_LIGHT_LEVEL,
+        false);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = configure_c6_chip_pu_low(false, true);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(APP_PWR_WIFI_C6_RESET_PULSE_MS));
+
+    ret = configure_c6_chip_pu_high();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(APP_PWR_WIFI_C6_LIGHT_BOOT_SETTLE_MS));
+
+    ret = configure_c6_mode_pin(
+        WIFI_C6_MODE_DEEP_LEVEL,
+        false);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(APP_PWR_WIFI_C6_ACTIVE_SETTLE_MS));
+    ESP_LOGI(
+        TAG,
+        "ESP32-C6 ACTIVE boot complete: CHIP_PU=HIGH mode_gpio=LOW requested_cpu=160MHz");
+    return ESP_OK;
+}
+
+esp_err_t component_wifi_prepare_for_light_sleep(void)
+{
+    /*
+     * User requirement: P4 Light-sleep must NOT reset or power-cycle the C6.
+     * The already-running companion sees GPIO2 HIGH and lowers its CPU policy
+     * from 160 MHz to 80 MHz in place while CHIP_PU remains continuously HIGH.
+     */
+    if (!s_user_enabled) {
+        ESP_LOGI(
+            TAG,
+            "ESP32-C6 remains OFF in P4 Light-sleep because saved Wi-Fi policy is OFF");
+        return ESP_OK;
+    }
+
+    if (s_c6_disabled) {
+        /*
+         * Defensive recovery only: the saved policy says ON but the software
+         * state says the C6 is already OFF. Bring it up before requesting the
+         * retained Light-sleep frequency. This does not switch off a running C6.
+         */
+        esp_err_t ret = boot_c6_for_active_policy();
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+
+    esp_err_t ret = configure_c6_mode_pin(
+        WIFI_C6_MODE_LIGHT_LEVEL,
+        true);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* CHIP_PU is intentionally untouched here. */
+    vTaskDelay(pdMS_TO_TICKS(APP_PWR_WIFI_C6_LIGHT_BOOT_SETTLE_MS));
+
+    if (gpio_get_level(WIFI_C6_CHIP_PU_GPIO) != WIFI_C6_ENABLED_LEVEL) {
+        ESP_LOGE(
+            TAG,
+            "C6 Light-sleep request rejected: CHIP_PU is not continuously HIGH");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "ESP32-C6 retained for P4 Light-sleep WITHOUT RESET: "
+        "CHIP_PU=HIGH mode_gpio=HIGH requested_cpu=80MHz");
+    return ESP_OK;
+}
+
+esp_err_t component_wifi_restore_after_light_sleep(void)
+{
+    /*
+     * The running C6 sees GPIO2 HIGH -> LOW and restores 160 MHz. CHIP_PU is
+     * never pulsed LOW during this Light-sleep wake path.
+     */
+    esp_err_t ret = configure_c6_mode_pin(
+        WIFI_C6_MODE_DEEP_LEVEL,
+        false);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if (s_user_enabled) {
+        if (s_c6_disabled) {
+            /* Unexpected state: recover ACTIVE operation after the P4 woke. */
+            return boot_c6_for_active_policy();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(APP_PWR_WIFI_C6_ACTIVE_SETTLE_MS));
+        ESP_LOGI(
+            TAG,
+            "ESP32-C6 restored after P4 Light-sleep WITHOUT RESET: "
+            "CHIP_PU=HIGH mode_gpio=LOW requested_cpu=160MHz");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Saved Wi-Fi policy is OFF; ESP32-C6 remains held in reset after Light-sleep");
+    return configure_c6_chip_pu_low(false, true);
+}
+
+esp_err_t component_wifi_prepare_mode_for_deep_sleep(void)
+{
+    return configure_c6_mode_pin(
+        WIFI_C6_MODE_DEEP_LEVEL,
+        true);
+}
+
 esp_err_t component_wifi_disable_for_deep_sleep(void)
 {
     /*
-     * Intentionally no "if (s_c6_disabled) return" shortcut.
-     *
-     * The settings policy may already have disabled the C6, while the ordered
-     * sleep sequence calls this function again at STEP 6. Reprogramming the
-     * pad on every call guarantees that STEP 6 really does work instead of
-     * merely reporting success from a stale software flag.
+     * Preserve the existing P4 Deep-sleep strategy. GPIO6/C6-GPIO2 LOW means
+     * that when GPIO54 later rises after the P4 HP GPIO domain powers down, the
+     * freshly booting companion immediately enters C6 self-Deep-sleep.
      */
+    esp_err_t ret = component_wifi_prepare_mode_for_deep_sleep();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
     return configure_c6_chip_pu_low(false, true);
 }
 
 esp_err_t component_wifi_force_off_at_sleep_boundary(void)
 {
-    /*
-     * Last application-controlled GPIO54 write before esp_deep_sleep_start().
-     * No task delay is used here.
-     */
+    esp_err_t ret = component_wifi_prepare_mode_for_deep_sleep();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
     return configure_c6_chip_pu_low(true, false);
 }
 
 esp_err_t component_wifi_restore_after_failed_sleep(void)
 {
     if (s_user_enabled) {
-        ESP_LOGI(TAG, "Restoring ESP32-C6 because the saved Wi-Fi policy is ON");
-        return configure_c6_chip_pu_high();
+        ESP_LOGI(TAG, "Restoring ESP32-C6 after failed Deep-sleep");
+        return boot_c6_for_active_policy();
+    }
+
+    esp_err_t mode_ret = configure_c6_mode_pin(
+        WIFI_C6_MODE_DEEP_LEVEL,
+        false);
+    if (mode_ret != ESP_OK) {
+        return mode_ret;
     }
 
     ESP_LOGI(TAG, "ESP32-C6 remains disabled because the saved Wi-Fi policy is OFF");
@@ -11234,9 +11423,31 @@ esp_err_t component_wifi_restore_after_failed_sleep(void)
 
 esp_err_t component_wifi_set_enabled(bool enabled)
 {
-    esp_err_t ret = enabled
-        ? configure_c6_chip_pu_high()
-        : configure_c6_chip_pu_low(false, true);
+    esp_err_t ret;
+
+    if (enabled) {
+        if (s_c6_disabled) {
+            ret = boot_c6_for_active_policy();
+        } else {
+            /*
+             * Idempotent re-application after a Light-sleep wake: only request
+             * ACTIVE frequency and keep CHIP_PU HIGH. Do not reset the C6.
+             */
+            ret = configure_c6_mode_pin(
+                WIFI_C6_MODE_DEEP_LEVEL,
+                false);
+            if (ret == ESP_OK) {
+                ret = configure_c6_chip_pu_high();
+            }
+        }
+    } else {
+        ret = configure_c6_mode_pin(
+            WIFI_C6_MODE_DEEP_LEVEL,
+            false);
+        if (ret == ESP_OK) {
+            ret = configure_c6_chip_pu_low(false, true);
+        }
+    }
 
     if (ret == ESP_OK) {
         s_user_enabled = enabled;
@@ -11249,7 +11460,6 @@ bool component_wifi_is_enabled(void)
 {
     return s_user_enabled && !s_c6_disabled;
 }
-
 
 
 ============================================================
@@ -12102,6 +12312,7 @@ esp_err_t power_manager_start_inactivity_policy(void)
 FILE: src/main/services/power/sleep/app_sleep.c
 ============================================================
 
+
 #include "services/power/sleep/app_sleep.h"
 
 #include <inttypes.h>
@@ -12134,6 +12345,15 @@ FILE: src/main/services/power/sleep/app_sleep.c
 
 #if APP_LIGHT_SLEEP_TOUCH_POLL_MS == 0
 #error "APP_LIGHT_SLEEP_TOUCH_POLL_MS must be greater than zero"
+#endif
+
+/*
+ * Build guard for the 250 ms responsiveness experiment. This deliberately
+ * makes a stale/incorrect 1000 ms configuration fail at compile time instead
+ * of silently producing the wrong measurement firmware.
+ */
+#if APP_LIGHT_SLEEP_TOUCH_POLL_MS != 250U
+#error "GT911 Light-sleep experiment requires APP_LIGHT_SLEEP_TOUCH_POLL_MS == 250U"
 #endif
 
 #define APP_INACTIVITY_POWER_TASK_STACK_SIZE 8192
@@ -12221,6 +12441,16 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
 {
     esp_err_t first_error = ESP_OK;
 
+    /*
+     * Do not hold or pulse the C6 reset in P4 Light-sleep. GPIO6->C6 GPIO2 is
+     * raised while CHIP_PU stays HIGH; the already-running companion switches
+     * to its 80 MHz policy in place. Deep-sleep keeps the existing self-sleep
+     * boundary behavior.
+     */
+    record_first_light_sleep_error(
+        component_wifi_prepare_for_light_sleep(),
+        &first_error);
+
 #if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
     record_first_light_sleep_error(
         component_audio_disable_for_light_sleep(),
@@ -12249,10 +12479,14 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
         ESP_LOGI(
             POWER_TAG,
             "event=LIGHT_SLEEP_AUX_SUSPENDED "
-            "audio=%s sdcard=%s ethernet=%s c6=OFF gt911=POLLING",
+            "audio=%s sdcard=%s ethernet=%s "
+            "c6=%s chip_pu=%s mode_gpio=%s gt911=POLLING",
             audio_state,
             sdcard_state,
-            ethernet_state);
+            ethernet_state,
+            component_wifi_is_enabled() ? "RETAINED_80MHZ_NO_RESET" : "OFF_BY_POLICY",
+            component_wifi_is_enabled() ? "HIGH" : "LOW",
+            component_wifi_is_enabled() ? "HIGH" : "LOW");
     }
 
     return first_error;
@@ -12261,6 +12495,10 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
 static esp_err_t restore_aux_peripherals_after_light_sleep(void)
 {
     esp_err_t first_error = ESP_OK;
+
+    record_first_light_sleep_error(
+        component_wifi_restore_after_light_sleep(),
+        &first_error);
 
     /*
     * Reverse only the reversible Light-sleep operations. Deep-sleep now uses
@@ -12295,7 +12533,7 @@ static esp_err_t restore_aux_peripherals_after_light_sleep(void)
         ESP_LOGI(
             POWER_TAG,
             "event=LIGHT_SLEEP_AUX_RESTORED "
-            "audio=%s sdcard=%s ethernet=%s",
+            "audio=%s sdcard=%s ethernet=%s c6=ACTIVE_POLICY mode_gpio=LOW",
             audio_state,
             sdcard_state,
             ethernet_state);
@@ -13213,8 +13451,10 @@ static void inactivity_power_policy_task(void *arg)
     if (s_light_mode_enabled) {
         ESP_LOGI(
             POWER_TAG,
-            "event=LIGHT_SLEEP_STATE_POLICY version=9 "
-            "mode=RAM_PRESERVING_NO_RESET sdcard=PRESERVED gt911=POLLING");
+            "event=LIGHT_SLEEP_STATE_POLICY version=10 "
+            "mode=RAM_PRESERVING_NO_RESET sdcard=PRESERVED gt911=POLLING "
+            "touch_poll_ms=%u",
+            (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS);
     }
 
     const char *policy_name = s_light_mode_enabled
@@ -13363,7 +13603,7 @@ static void inactivity_power_policy_task(void *arg)
             POWER_TAG,
             "event=LIGHT_SLEEP_HARDWARE_SUSPENDED "
             "camera=OFF display=OFF audio=OFF sdcard=PRESERVED "
-            "ethernet=RESET c6=OFF gt911=POLLING ram=PRESERVED");
+            "ethernet=RESET c6=RETAINED_80MHZ gt911=POLLING ram=PRESERVED");
 
         /*
         * PRE-SLEEP CHECK
@@ -13899,6 +14139,7 @@ esp_err_t app_sleep_start_timeout(void)
 FILE: src/main/services/power/sleep/deep_sleep.c
 ============================================================
 
+
 #include "services/power/sleep/deep_sleep.h"
 
 #include <stdbool.h>
@@ -13988,6 +14229,12 @@ typedef struct {
 } deep_sleep_rail_t;
 
 static const deep_sleep_rail_t s_audited_rails[] = {
+    {
+        .gpio_num = APP_PWR_WIFI_C6_MODE_GPIO,
+        .description = "C6 mode GPIO2",
+        .expected_level = APP_PWR_WIFI_C6_MODE_DEEP_LEVEL,
+        .consequence_if_wrong = "C6 can select retained 80 MHz mode instead of self-Deep-sleep",
+    },
     {
         .gpio_num = APP_PWR_WIFI_C6_CHIP_PU_GPIO,
         .description = "ESP32-C6 CHIP_PU",
@@ -14139,7 +14386,7 @@ static void audit_rails_before_deep_sleep(void)
         ESP_LOGI(
             AUDIT_TAG,
             "All software-controlled Deep-sleep states verified: "
-            "C6 self-sleep policy armed, IP101GRI RESET LOW held, "
+            "C6 mode GPIO LOW + self-sleep policy armed, IP101GRI RESET LOW held, "
             "ES8311 suspend, NS4150B off, GT911 FULL SLEEP, microSD rail off "
             "and shared I2C high. Hybrid display continuity also guarantees "
             "LCD SLEEP_IN before the Light-sleep transport is destroyed.");
@@ -14341,9 +14588,9 @@ static unsigned peripheral_signal_group(gpio_num_t pin)
     switch (pin) {
     case 9: case 10: case 11: case 12: case 13:
         return 0; /* ES8311 I2S */
-    case 6: case 14: case 15: case 16: case 17: case 18: case 19:
+    case 14: case 15: case 16: case 17: case 18: case 19:
     case 24: case 25:
-        return 1; /* C6 SDIO / sideband */
+        return 1; /* C6 SDIO / sideband; GPIO6 is a retained mode-control pin */
     case 20: case 21:
         return 2; /* C6 programming UART */
     case 28: case 29: case 30: case 34: case 35: case 49: case 50:
@@ -14384,6 +14631,7 @@ static void quiesce_peripheral_signal_pins_for_deep_sleep(void)
             if (gpio_num == WAKE_BUTTON_GPIO ||
                 gpio_num == APP_PWR_SDCARD_POWER_GPIO ||
                 gpio_num == APP_PWR_AUDIO_AMP_GPIO ||
+                gpio_num == APP_PWR_WIFI_C6_MODE_GPIO ||
                 gpio_num == APP_PWR_WIFI_C6_CHIP_PU_GPIO ||
                 gpio_num == APP_PWR_ETHERNET_PHY_RESET_GPIO) {
                 failed++;
@@ -14798,10 +15046,14 @@ void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
     ESP_LOGW(
         TAG,
         "C6-FINAL-AUDIT: GPIO%d CHIP_PU level=%d expected=%d "
+        "mode_gpio%d=%d expected_mode=%d "
         "silicon=v1.3 deep_sleep_behavior=C6_self_sleep_trigger",
         APP_PWR_WIFI_C6_CHIP_PU_GPIO,
         c6_final_level,
-        APP_PWR_WIFI_C6_DISABLED_LEVEL);
+        APP_PWR_WIFI_C6_DISABLED_LEVEL,
+        APP_PWR_WIFI_C6_MODE_GPIO,
+        gpio_get_level(APP_PWR_WIFI_C6_MODE_GPIO),
+        APP_PWR_WIFI_C6_MODE_DEEP_LEVEL);
 
     ESP_LOGI(
         TAG,
@@ -15246,7 +15498,6 @@ void report_wake_reason(void)
         break;
     }
 }
-
 
 
 ============================================================
@@ -16469,7 +16720,6 @@ void vision_ai_worker_runtime_wait_for_notification(void)
 {
     (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 }
-
 
 
 ============================================================
@@ -23316,7 +23566,6 @@ void app_ui_destroy(void);
 #ifdef __cplusplus
 }
 #endif
-
 
 
 ============================================================
