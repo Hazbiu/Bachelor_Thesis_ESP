@@ -2,6 +2,9 @@
 
 #include <stdbool.h>
 
+#include "app/configuration/app_configuration.h"
+#include "assets/launcher_heading.h"
+#include "assets/university_logo.h"
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
 #include "esp_err.h"
@@ -9,7 +12,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
-#include "app/configuration/app_configuration.h"
 
 static const char *TAG = "app_ui";
 
@@ -49,6 +51,17 @@ static esp_err_t app_ui_lock(void)
     return ret;
 }
 
+static void show_launcher_status(const char *text, uint32_t color)
+{
+    if (!s_status_label || !text) {
+        return;
+    }
+
+    lv_label_set_text(s_status_label, text);
+    lv_obj_set_style_text_color(s_status_label, lv_color_hex(color), 0);
+    lv_obj_remove_flag(s_status_label, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void disable_launcher_actions(void)
 {
     if (s_start_button) {
@@ -67,12 +80,7 @@ static void dispatch_start_request(void)
 
     const app_configuration_snapshot_t settings = app_configuration_get();
     if (!settings.camera_enabled) {
-        if (s_status_label) {
-            lv_label_set_text(
-                s_status_label,
-                "Camera is OFF. Enable it in Settings.");
-            lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xD97706), 0);
-        }
+        show_launcher_status("Camera is OFF. Enable it in Settings.", 0xD97706);
         return;
     }
 
@@ -83,10 +91,7 @@ static void dispatch_start_request(void)
     if (s_start_button_label) {
         lv_label_set_text(s_start_button_label, "Starting...");
     }
-    if (s_status_label) {
-        lv_label_set_text(s_status_label, "Preparing camera and face recognition...");
-        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x64748B), 0);
-    }
+    show_launcher_status("Preparing camera and AI face recognition...", 0x64748B);
 
     if (s_start_callback) {
         s_start_callback(s_user_data);
@@ -126,31 +131,51 @@ static void launcher_settings_event_cb(lv_event_t *event)
     }
 }
 
-static void create_ready_pill(lv_obj_t *parent, bool dark_mode, bool camera_ready)
+static void create_brand_logo(lv_obj_t *parent, bool dark_mode)
 {
-    lv_obj_t *pill = lv_obj_create(parent);
-    lv_obj_set_size(pill, 176, 46);
-    lv_obj_remove_flag(pill, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(pill, 23, 0);
-    lv_obj_set_style_border_width(pill, 0, 0);
-    lv_obj_set_style_bg_color(
-        pill,
-        lv_color_hex(
-            camera_ready
-                ? (dark_mode ? 0x153A2A : 0xDCFCE7)
-                : (dark_mode ? 0x422006 : 0xFEF3C7)),
-        0);
+    if (university_logo_available) {
+        /*
+         * Native RGB565 artwork is used directly from flash. No JPEG decoder,
+         * filesystem read, runtime scaling or animation is needed.
+         */
+        lv_obj_t *logo_card = lv_obj_create(parent);
+        lv_obj_set_size(logo_card, LV_PCT(88), 190);
+        lv_obj_remove_flag(logo_card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_radius(logo_card, 18, 0);
+        lv_obj_set_style_bg_color(logo_card, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(logo_card, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(
+            logo_card,
+            lv_color_hex(dark_mode ? 0x334155 : 0xE2E8F0),
+            0);
+        lv_obj_set_style_border_width(logo_card, 1, 0);
+        lv_obj_set_style_pad_all(logo_card, 10, 0);
 
-    lv_obj_t *label = lv_label_create(pill);
-    lv_label_set_text(label, camera_ready ? "SYSTEM READY" : "POWER SAVING");
-    lv_obj_set_style_text_color(
-        label,
-        lv_color_hex(
-            camera_ready
-                ? (dark_mode ? 0x86EFAC : 0x15803D)
-                : (dark_mode ? 0xFCD34D : 0xB45309)),
+        lv_obj_t *logo = lv_image_create(logo_card);
+        lv_image_set_src(logo, &university_logo_image);
+        lv_obj_center(logo);
+        return;
+    }
+
+    /* Fallback if the university JPG has not yet been converted. */
+    lv_obj_t *brand = lv_obj_create(parent);
+    lv_obj_set_size(brand, LV_PCT(88), 150);
+    lv_obj_remove_flag(brand, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(brand, 18, 0);
+    lv_obj_set_style_border_width(brand, 1, 0);
+    lv_obj_set_style_border_color(
+        brand,
+        lv_color_hex(dark_mode ? 0x334155 : 0xE2E8F0),
         0);
-    lv_obj_center(label);
+    lv_obj_set_style_bg_color(brand, lv_color_hex(dark_mode ? 0x172033 : 0xF8FAFC), 0);
+
+    lv_obj_t *brand_label = lv_label_create(brand);
+    lv_label_set_text(brand_label, "THU");
+    lv_obj_set_style_text_color(
+        brand_label,
+        lv_color_hex(dark_mode ? 0xF8FAFC : 0x172033),
+        0);
+    lv_obj_center(brand_label);
 }
 
 void app_ui_create(
@@ -167,16 +192,14 @@ void app_ui_create(
     const bool dark = settings.dark_mode;
     const bool camera_ready = settings.camera_enabled;
 
-    esp_err_t lock_ret = app_ui_lock();
-    if (lock_ret != ESP_OK) {
+    if (app_ui_lock() != ESP_OK) {
         return;
     }
 
-    const uint32_t screen_bg = dark ? 0x08111F : 0xF3F7FA;
-    const uint32_t panel_bg = dark ? 0x111C2E : 0xFFFFFF;
-    const uint32_t primary_text = dark ? 0xF8FAFC : 0x172033;
+    const uint32_t screen_bg = dark ? 0x0B1220 : 0xF4F7FA;
+    const uint32_t panel_bg = dark ? 0x111827 : 0xFFFFFF;
     const uint32_t secondary_text = dark ? 0xA9B6C7 : 0x64748B;
-    const uint32_t border = dark ? 0x29415F : 0xDFE7EE;
+    const uint32_t border = dark ? 0x334155 : 0xDCE5EC;
 
     lv_obj_t *screen = lv_screen_active();
     lv_obj_clean(screen);
@@ -184,21 +207,21 @@ void app_ui_create(
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
+    /*
+     * Flat opaque surfaces are intentional: fewer blended shadow/gradient
+     * pixels means less LVGL rendering work on every invalidation.
+     */
     lv_obj_t *panel = lv_obj_create(screen);
-    lv_obj_set_size(panel, LV_PCT(82), LV_PCT(76));
+    lv_obj_set_size(panel, LV_PCT(90), LV_PCT(80));
     lv_obj_center(panel);
     lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(panel, 34, 0);
+    lv_obj_set_style_radius(panel, 24, 0);
     lv_obj_set_style_bg_color(panel, lv_color_hex(panel_bg), 0);
     lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(panel, lv_color_hex(border), 0);
     lv_obj_set_style_border_width(panel, 1, 0);
-    lv_obj_set_style_shadow_color(panel, lv_color_hex(0x0F172A), 0);
-    lv_obj_set_style_shadow_opa(panel, dark ? LV_OPA_20 : LV_OPA_10, 0);
-    lv_obj_set_style_shadow_width(panel, 28, 0);
-    lv_obj_set_style_shadow_ofs_y(panel, 10, 0);
-    lv_obj_set_style_pad_all(panel, 44, 0);
-    lv_obj_set_style_pad_row(panel, 20, 0);
+    lv_obj_set_style_pad_all(panel, 28, 0);
+    lv_obj_set_style_pad_row(panel, 18, 0);
     lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(
         panel,
@@ -206,69 +229,36 @@ void app_ui_create(
         LV_FLEX_ALIGN_CENTER,
         LV_FLEX_ALIGN_CENTER);
 
-    lv_obj_t *brand = lv_obj_create(panel);
-    lv_obj_set_size(brand, 104, 104);
-    lv_obj_remove_flag(brand, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(brand, 30, 0);
-    lv_obj_set_style_border_width(brand, 0, 0);
-    lv_obj_set_style_bg_color(brand, lv_color_hex(0x2F80ED), 0);
+    create_brand_logo(panel, dark);
 
-    lv_obj_t *brand_label = lv_label_create(brand);
-    lv_label_set_text(brand_label, "AI");
-    lv_obj_set_style_text_color(brand_label, lv_color_white(), 0);
-    lv_obj_center(brand_label);
+    /*
+     * The heading is a pre-rendered native RGB565 asset: visibly larger and
+     * bold without requiring additional runtime font scaling/render passes.
+     */
+    lv_obj_t *heading = lv_image_create(panel);
+    lv_image_set_src(
+        heading,
+        dark ? &launcher_heading_dark_image : &launcher_heading_light_image);
 
-    lv_obj_t *title = lv_label_create(panel);
-    lv_label_set_text(title, "Face Recognition");
-    lv_obj_set_style_text_color(title, lv_color_hex(primary_text), 0);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-
-    lv_obj_t *subtitle = lv_label_create(panel);
-    lv_label_set_text(
-        subtitle,
-        "Secure local recognition with adaptive power management.");
-    lv_label_set_long_mode(subtitle, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(subtitle, LV_PCT(80));
-    lv_obj_set_style_text_color(subtitle, lv_color_hex(secondary_text), 0);
-    lv_obj_set_style_text_align(subtitle, LV_TEXT_ALIGN_CENTER, 0);
-
-    create_ready_pill(panel, dark, camera_ready);
-
-    lv_obj_t *status_box = lv_obj_create(panel);
-    lv_obj_set_size(status_box, LV_PCT(74), 60);
-    lv_obj_remove_flag(status_box, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(status_box, 18, 0);
-    lv_obj_set_style_bg_color(
-        status_box,
-        lv_color_hex(dark ? 0x0B1525 : 0xF8FAFC),
-        0);
-    lv_obj_set_style_border_color(status_box, lv_color_hex(border), 0);
-    lv_obj_set_style_border_width(status_box, 1, 0);
-
-    s_status_label = lv_label_create(status_box);
-    lv_label_set_text(
-        s_status_label,
-        !settings.camera_enabled
-            ? "Camera disabled in Settings"
-            : (!settings.sdcard_enabled
-                ? "Ready; microSD powers off after AI load"
-                : "Touch ready"));
-    lv_obj_set_style_text_color(
-        s_status_label,
-        lv_color_hex(
-            camera_ready
-                ? (dark ? 0x86EFAC : 0x15803D)
-                : (dark ? 0xFCD34D : 0xB45309)),
-        0);
-    lv_obj_center(s_status_label);
+    /*
+     * No static SYSTEM READY / Touch ready indicators are drawn anymore.
+     * Keep one hidden status label only for startup progress and real errors.
+     */
+    s_status_label = lv_label_create(panel);
+    lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_status_label, LV_PCT(86));
+    lv_obj_set_style_text_color(s_status_label, lv_color_hex(secondary_text), 0);
+    lv_obj_set_style_text_align(s_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(s_status_label, LV_OBJ_FLAG_HIDDEN);
 
     s_start_button = lv_button_create(panel);
-    lv_obj_set_size(s_start_button, LV_PCT(74), 92);
+    lv_obj_set_size(s_start_button, LV_PCT(78), 94);
     lv_obj_remove_flag(s_start_button, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(s_start_button, 22, 0);
-    lv_obj_set_style_bg_color(s_start_button, lv_color_hex(0x2F80ED), 0);
+    lv_obj_set_style_radius(s_start_button, 18, 0);
+    lv_obj_set_style_bg_color(s_start_button, lv_color_hex(0x2477D4), 0);
     lv_obj_set_style_bg_color(s_start_button, lv_color_hex(0x1D5FAF), LV_STATE_PRESSED);
     lv_obj_set_style_bg_color(s_start_button, lv_color_hex(0x94A3B8), LV_STATE_DISABLED);
+    lv_obj_set_style_border_width(s_start_button, 0, 0);
     lv_obj_add_event_cb(s_start_button, launcher_start_event_cb, LV_EVENT_PRESSED, NULL);
 
     if (!camera_ready) {
@@ -276,25 +266,21 @@ void app_ui_create(
     }
 
     s_start_button_label = lv_label_create(s_start_button);
-    lv_label_set_text(
-        s_start_button_label,
-        camera_ready
-            ? "Start Camera"
-            : "Camera Off");
+    lv_label_set_text(s_start_button_label, camera_ready ? "Start Camera" : "Camera Off");
     lv_obj_set_style_text_color(s_start_button_label, lv_color_white(), 0);
+    lv_obj_set_style_text_letter_space(s_start_button_label, 1, 0);
     lv_obj_center(s_start_button_label);
 
     s_settings_button = lv_button_create(panel);
-    lv_obj_set_size(s_settings_button, LV_PCT(74), 80);
+    lv_obj_set_size(s_settings_button, LV_PCT(78), 82);
     lv_obj_remove_flag(s_settings_button, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(s_settings_button, 22, 0);
+    lv_obj_set_style_radius(s_settings_button, 18, 0);
     lv_obj_set_style_bg_color(s_settings_button, lv_color_hex(panel_bg), 0);
     lv_obj_set_style_bg_color(
         s_settings_button,
-        lv_color_hex(dark ? 0x1D2A3E : 0xEEF4F8),
+        lv_color_hex(dark ? 0x1E293B : 0xEEF4F8),
         LV_STATE_PRESSED);
-    lv_obj_set_style_bg_color(s_settings_button, lv_color_hex(panel_bg), LV_STATE_DISABLED);
-    lv_obj_set_style_border_color(s_settings_button, lv_color_hex(0x2F80ED), 0);
+    lv_obj_set_style_border_color(s_settings_button, lv_color_hex(0x2477D4), 0);
     lv_obj_set_style_border_width(s_settings_button, 2, 0);
     lv_obj_add_event_cb(
         s_settings_button,
@@ -304,17 +290,9 @@ void app_ui_create(
 
     s_settings_button_label = lv_label_create(s_settings_button);
     lv_label_set_text(s_settings_button_label, "Settings");
-    lv_obj_set_style_text_color(s_settings_button_label, lv_color_hex(0x2F80ED), 0);
+    lv_obj_set_style_text_color(s_settings_button_label, lv_color_hex(0x2477D4), 0);
+    lv_obj_set_style_text_letter_space(s_settings_button_label, 1, 0);
     lv_obj_center(s_settings_button_label);
-
-    lv_obj_t *hint = lv_label_create(panel);
-    lv_label_set_text(
-        hint,
-        "GPIO3 remains available for the configured sleep mode.");
-    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(hint, LV_PCT(82));
-    lv_obj_set_style_text_color(hint, lv_color_hex(secondary_text), 0);
-    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
 
     bsp_display_unlock();
 }
@@ -329,11 +307,7 @@ void app_ui_set_status(const char *text)
         return;
     }
 
-    if (s_status_label) {
-        lv_label_set_text(s_status_label, text);
-        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x64748B), 0);
-    }
-
+    show_launcher_status(text, 0x64748B);
     bsp_display_unlock();
 }
 
@@ -347,10 +321,8 @@ void app_ui_show_error(const char *text)
         return;
     }
 
-    if (s_status_label) {
-        lv_label_set_text(s_status_label, text);
-        lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xDC2626), 0);
-    }
+    show_launcher_status(text, 0xDC2626);
+
     if (s_start_button_label) {
         lv_label_set_text(s_start_button_label, "Restart device");
     }

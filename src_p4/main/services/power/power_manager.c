@@ -156,6 +156,21 @@ void power_manager_set_sleep_modes(bool light_enabled, bool deep_enabled)
     app_sleep_set_mode_policy(light_enabled, deep_enabled);
 }
 
+bool power_manager_pause_inactivity_policy(void)
+{
+    return app_sleep_pause_inactivity_policy();
+}
+
+void power_manager_resume_inactivity_policy(void)
+{
+    app_sleep_resume_inactivity_policy();
+}
+
+bool power_manager_inactivity_policy_is_paused(void)
+{
+    return app_sleep_inactivity_policy_is_paused();
+}
+
 void power_manager_notify_activity(void)
 {
     app_sleep_notify_face_detected();

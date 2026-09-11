@@ -126,16 +126,12 @@ static lv_obj_t *create_card(
     lv_obj_set_width(card, LV_PCT(90));
     lv_obj_set_height(card, LV_SIZE_CONTENT);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(card, 26, 0);
+    lv_obj_set_style_radius(card, 18, 0);
     lv_obj_set_style_bg_color(card, lv_color_hex(palette->card_bg), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(card, lv_color_hex(palette->border), 0);
     lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_set_style_shadow_color(card, lv_color_hex(0x0F172A), 0);
-    lv_obj_set_style_shadow_opa(card, palette->dark ? LV_OPA_20 : LV_OPA_10, 0);
-    lv_obj_set_style_shadow_width(card, 16, 0);
-    lv_obj_set_style_shadow_ofs_y(card, 5, 0);
-    lv_obj_set_style_pad_all(card, 20, 0);
+    lv_obj_set_style_pad_all(card, 16, 0);
     lv_obj_set_style_pad_row(card, 10, 0);
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(
@@ -445,8 +441,10 @@ static lv_obj_t *create_toggle_row(
     settings_toggle_kind_t kind,
     const settings_palette_t *palette)
 {
+    const bool has_detail = detail != NULL && detail[0] != '\0';
+
     lv_obj_t *row = lv_obj_create(card);
-    lv_obj_set_size(row, LV_PCT(100), 92);
+    lv_obj_set_size(row, LV_PCT(100), has_detail ? 88 : 70);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_radius(row, 0, 0);
     lv_obj_set_style_border_width(row, 0, 0);
@@ -457,17 +455,19 @@ static lv_obj_t *create_toggle_row(
     lv_obj_t *title_label = lv_label_create(row);
     lv_label_set_text(title_label, title);
     lv_obj_set_style_text_color(title_label, lv_color_hex(palette->primary_text), 0);
-    lv_obj_align(title_label, LV_ALIGN_LEFT_MID, 0, -13);
+    lv_obj_align(title_label, LV_ALIGN_LEFT_MID, 0, has_detail ? -13 : 0);
 
-    lv_obj_t *detail_label = lv_label_create(row);
-    lv_label_set_text(detail_label, detail);
-    lv_label_set_long_mode(detail_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(detail_label, LV_PCT(70));
-    lv_obj_set_style_text_color(detail_label, lv_color_hex(palette->secondary_text), 0);
-    lv_obj_align(detail_label, LV_ALIGN_LEFT_MID, 0, 16);
+    if (has_detail) {
+        lv_obj_t *detail_label = lv_label_create(row);
+        lv_label_set_text(detail_label, detail);
+        lv_label_set_long_mode(detail_label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(detail_label, LV_PCT(70));
+        lv_obj_set_style_text_color(detail_label, lv_color_hex(palette->secondary_text), 0);
+        lv_obj_align(detail_label, LV_ALIGN_LEFT_MID, 0, 16);
+    }
 
     lv_obj_t *toggle = lv_switch_create(row);
-    lv_obj_set_size(toggle, 96, 52);
+    lv_obj_set_size(toggle, 92, 50);
     lv_obj_set_ext_click_area(toggle, 16);
     lv_obj_align(toggle, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_set_style_bg_color(toggle, lv_color_hex(palette->border), LV_PART_MAIN);
@@ -538,6 +538,11 @@ void settings_screen_create(
 
     lv_obj_t *screen = lv_screen_active();
     lv_obj_clean(screen);
+
+    /*
+     * Settings intentionally uses flat opaque surfaces and no box shadows or
+     * animations. This minimizes blended pixels and redraw work on ESP32-P4.
+     */
     lv_obj_set_style_bg_color(screen, lv_color_hex(palette.screen_bg), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
@@ -589,7 +594,7 @@ void settings_screen_create(
     lv_obj_set_style_pad_bottom(content, 44, 0);
     lv_obj_set_style_pad_row(content, 14, 0);
     lv_obj_set_scroll_dir(content, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_ACTIVE);
+    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(
         content,
@@ -640,7 +645,7 @@ void settings_screen_create(
     create_toggle_row(
         power_modes_card,
         "Light Sleep",
-        "Reversible; touch or GPIO3 returns to Active",
+        NULL,
         settings.light_sleep_enabled,
         SETTINGS_TOGGLE_LIGHT_SLEEP,
         &palette);
@@ -648,7 +653,7 @@ void settings_screen_create(
     create_toggle_row(
         power_modes_card,
         "Deep Sleep",
-        "When both are ON, starts 10 s after Light Sleep",
+        NULL,
         settings.deep_sleep_enabled,
         SETTINGS_TOGGLE_DEEP_SLEEP,
         &palette);

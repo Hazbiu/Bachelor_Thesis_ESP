@@ -128,13 +128,12 @@
 #define APP_LIGHT_SLEEP_TOUCH_POLL_MS               250U
 
 /*
- * Light-sleep visual-standby experiment:
- * Keep only the physical LCD backlight powered while the JD9365 panel,
- * LVGL/MIPI-DSI transport and camera remain suspended. This intentionally
- * trades some Light-sleep energy for a visible standby indication. The
- * backlight is forced OFF again before true Deep-sleep.
+ * Power-efficient Light-sleep display policy:
+ * Keep the physical LCD backlight OFF while JD9365, LVGL/MIPI-DSI and camera
+ * are suspended. On this backlit LCD this saves materially more power than
+ * changing GUI pixel colors alone.
  */
-#define APP_LIGHT_SLEEP_KEEP_BACKLIGHT_ON            1
+#define APP_LIGHT_SLEEP_KEEP_BACKLIGHT_ON            0
 #define APP_LIGHT_SLEEP_BUTTON_POLL_MS              5U
 #define APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS          25U
 

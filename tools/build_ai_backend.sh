@@ -3,7 +3,7 @@ set -euo pipefail
 
 TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$TOOLS_DIR/.." && pwd)"
-SRC_DIR="$PROJECT_ROOT/src"
+SRC_DIR="$PROJECT_ROOT/src_p4"
 
 BACKEND="${1:-}"
 if [[ -z "$BACKEND" ]]; then

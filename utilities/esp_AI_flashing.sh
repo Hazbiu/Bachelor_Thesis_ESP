@@ -104,7 +104,7 @@ for ARG in "$@"; do
     esac
 done
 
-SLEEP_HEADER="$PROJECT_ROOT/src/main/include/config/sleep_mode_selection.h"
+SLEEP_HEADER="$PROJECT_ROOT/src_p4/main/include/config/sleep_mode_selection.h"
 mkdir -p "$(dirname "$SLEEP_HEADER")"
 
 TMP_HEADER="${SLEEP_HEADER}.tmp.$$"

@@ -44,6 +44,12 @@
 
 #define APP_INACTIVITY_POWER_TASK_STACK_SIZE 8192
 
+#if APP_LIGHT_SLEEP_KEEP_BACKLIGHT_ON
+#define APP_LIGHT_SLEEP_BACKLIGHT_STATE "ON"
+#else
+#define APP_LIGHT_SLEEP_BACKLIGHT_STATE "OFF"
+#endif
+
 static const char *TAG = "app_sleep";
 static const char *POWER_TAG = "PWR_STATE";
 
@@ -52,6 +58,7 @@ static portMUX_TYPE s_sleep_request_lock =
 
 static bool s_sleep_requested;
 static bool s_inactivity_monitor_started;
+static bool s_inactivity_policy_paused;
 static bool s_light_sleep_in_progress;
 static bool s_ignore_button_until_release;
 static bool s_light_sleep_failed_until_activity;
@@ -267,7 +274,7 @@ static bool claim_sleep_request(void)
 
     portENTER_CRITICAL(&s_sleep_request_lock);
 
-    if (!s_sleep_requested) {
+    if (!s_sleep_requested && !s_inactivity_policy_paused) {
         s_sleep_requested = true;
         claimed = true;
     }
@@ -289,6 +296,7 @@ static bool claim_inactivity_sleep_request(void)
     if (s_deep_mode_enabled &&
         s_deep_sleep_threshold_ms > 0 &&
         s_inactivity_monitor_started &&
+        !s_inactivity_policy_paused &&
         !s_sleep_requested &&
         !s_light_sleep_in_progress &&
         (now_us - s_last_face_detected_us) >= timeout_us) {
@@ -318,6 +326,65 @@ bool app_sleep_is_requested(void)
     return requested;
 }
 
+bool app_sleep_pause_inactivity_policy(void)
+{
+    bool paused = false;
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+
+    if (s_inactivity_monitor_started && !s_sleep_requested) {
+        s_inactivity_policy_paused = true;
+        s_light_sleep_in_progress = false;
+        paused = true;
+    }
+
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    if (paused) {
+        ESP_LOGI(
+            POWER_TAG,
+            "event=INACTIVITY_POLICY_PAUSED reason=PIN_ENTRY automatic_sleep=BLOCKED");
+    }
+
+    return paused;
+}
+
+void app_sleep_resume_inactivity_policy(void)
+{
+    const int64_t now_us = esp_timer_get_time();
+    bool resumed = false;
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+
+    if (s_inactivity_monitor_started && !s_sleep_requested) {
+        s_inactivity_policy_paused = false;
+        s_last_face_detected_us = now_us;
+        s_light_sleep_in_progress = false;
+        s_light_sleep_failed_until_activity = false;
+        resumed = true;
+    }
+
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    if (resumed) {
+        cpu_power_notify_activity();
+        ESP_LOGI(
+            POWER_TAG,
+            "event=INACTIVITY_POLICY_RESUMED reason=CAMERA_ACTIVE inactive_ms=0");
+    }
+}
+
+bool app_sleep_inactivity_policy_is_paused(void)
+{
+    bool paused;
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    paused = s_inactivity_policy_paused;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    return paused;
+}
+
 void app_sleep_notify_face_detected(void)
 {
     const int64_t now_us = esp_timer_get_time();
@@ -325,7 +392,9 @@ void app_sleep_notify_face_detected(void)
 
     portENTER_CRITICAL(&s_sleep_request_lock);
 
-    if (s_inactivity_monitor_started && !s_sleep_requested) {
+    if (s_inactivity_monitor_started &&
+        !s_inactivity_policy_paused &&
+        !s_sleep_requested) {
         s_last_face_detected_us = now_us;
         s_light_sleep_failed_until_activity = false;
         activity_accepted = true;
@@ -353,6 +422,7 @@ bool app_sleep_light_sleep_is_due(void)
     due = s_light_mode_enabled &&
         s_light_sleep_threshold_ms > 0 &&
         s_inactivity_monitor_started &&
+        !s_inactivity_policy_paused &&
         !s_sleep_requested &&
         s_light_sleep_in_progress &&
         !s_light_sleep_failed_until_activity &&
@@ -577,6 +647,7 @@ static bool claim_light_sleep_window(uint32_t *remaining_ms)
         s_light_mode_enabled &&
         s_light_sleep_threshold_ms > 0 &&
         s_inactivity_monitor_started &&
+        !s_inactivity_policy_paused &&
         !s_sleep_requested &&
         !s_light_sleep_in_progress &&
         !s_light_sleep_failed_until_activity &&
@@ -1093,6 +1164,14 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
 
 void app_sleep_request(const char *reason)
 {
+    if (app_sleep_inactivity_policy_is_paused()) {
+        ESP_LOGI(
+            POWER_TAG,
+            "event=DEEP_SLEEP_REQUEST_IGNORED policy=PIN_ENTRY_PAUSED reason=\"%s\"",
+            reason != NULL ? reason : "unknown");
+        return;
+    }
+
     if (!app_sleep_deep_mode_is_enabled()) {
         ESP_LOGW(
             POWER_TAG,
@@ -1197,7 +1276,7 @@ static void inactivity_power_policy_task(void *arg)
             POWER_TAG,
             "event=LIGHT_SLEEP_STATE_POLICY version=15 "
             "mode=UNIFIED_FULL_PANEL_SLEEP sdcard=PRESERVED gt911=POLLING "
-            "touch_poll_ms=%u backlight=ON ethernet=POWERED_10M "
+            "touch_poll_ms=%u backlight=" APP_LIGHT_SLEEP_BACKLIGHT_STATE " ethernet=POWERED_10M "
             "deep_stage_delay_ms=%u light_to_deep_residency_ms=10000",
             (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
             (unsigned)APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS);
@@ -1348,7 +1427,7 @@ static void inactivity_power_policy_task(void *arg)
         ESP_LOGI(
             POWER_TAG,
             "event=LIGHT_SLEEP_HARDWARE_SUSPENDED "
-            "camera=OFF display=OFF backlight=ON audio=OFF sdcard=PRESERVED "
+            "camera=OFF display=OFF backlight=" APP_LIGHT_SLEEP_BACKLIGHT_STATE " audio=OFF sdcard=PRESERVED "
             "ethernet=POWERED_10M c6=RETAINED_80MHZ "
             "gt911=POLLING ram=PRESERVED");
 
@@ -1465,7 +1544,7 @@ static void inactivity_power_policy_task(void *arg)
             ESP_LOGI(
                 POWER_TAG,
                 "event=LIGHT_SLEEP_ENTER policy=LIGHT_THEN_DEEP "
-                "mode=TIMER_SLICED poll_ms=%u backlight=ON remaining_to_deep_ms=%" PRIu32,
+                "mode=TIMER_SLICED poll_ms=%u backlight=" APP_LIGHT_SLEEP_BACKLIGHT_STATE " remaining_to_deep_ms=%" PRIu32,
                 (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
                 remaining_ms);
         } else {
@@ -1477,7 +1556,7 @@ static void inactivity_power_policy_task(void *arg)
             ESP_LOGI(
                 POWER_TAG,
                 "event=LIGHT_SLEEP_ENTER policy=LIGHT_ONLY "
-                "mode=TIMER_SLICED_INDEFINITE poll_ms=%u backlight=ON deep_sleep=DISABLED",
+                "mode=TIMER_SLICED_INDEFINITE poll_ms=%u backlight=" APP_LIGHT_SLEEP_BACKLIGHT_STATE " deep_sleep=DISABLED",
                 (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS);
         }
 
@@ -1807,6 +1886,7 @@ static void inactivity_power_policy_task(void *arg)
 
     portENTER_CRITICAL(&s_sleep_request_lock);
     s_inactivity_monitor_started = false;
+    s_inactivity_policy_paused = false;
     s_light_sleep_in_progress = false;
     portEXIT_CRITICAL(&s_sleep_request_lock);
 
@@ -1852,6 +1932,7 @@ esp_err_t app_sleep_start_timeout(void)
 
     s_last_face_detected_us = start_time_us;
     s_inactivity_monitor_started = true;
+    s_inactivity_policy_paused = false;
     s_light_sleep_in_progress = false;
     s_ignore_button_until_release = false;
     s_light_sleep_failed_until_activity = false;

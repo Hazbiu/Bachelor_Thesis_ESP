@@ -95,14 +95,13 @@ bool app_state_machine_handle_event(
 
 
     case APP_STATE_PIN_ENTRY:
+        /*
+         * PIN entry owns the display until authentication completes. Automatic
+         * Light/Deep inactivity transitions are intentionally blocked here and
+         * restart only after APP_EVENT_PIN_COMPLETE restores CAMERA_ACTIVE.
+         */
         if (event == APP_EVENT_PIN_COMPLETE) {
             next_state = APP_STATE_CAMERA_ACTIVE;
-        }
-        else if (event == APP_EVENT_LIGHT_SLEEP_REQUEST) {
-            next_state = APP_STATE_LIGHT_SLEEP;
-        }
-        else if (event == APP_EVENT_DEEP_SLEEP_REQUEST) {
-            next_state = APP_STATE_DEEP_SLEEP;
         }
         break;
 

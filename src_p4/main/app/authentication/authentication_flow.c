@@ -91,6 +91,10 @@ static void authentication_mark_transition_failed(void)
 
     authentication_release_face_boost("PIN transition failed");
 
+    if (power_manager_inactivity_policy_is_paused()) {
+        power_manager_resume_inactivity_policy();
+    }
+
     /*
      * Camera operation remains the fallback when the PIN transition cannot
      * be completed. Keep the FSM synchronized with that existing behavior.
@@ -179,7 +183,11 @@ static void camera_resume_task(void *arg)
             "[APP-STATE] PIN_COMPLETE did not cause a transition");
     }
 
-    power_manager_notify_activity();
+    /*
+     * Automatic Light/Deep timers restart only now, after live camera capture
+     * and the AI-facing application state are genuinely active again.
+     */
+    power_manager_resume_inactivity_policy();
     xSemaphoreGive(authentication_display_mode_mutex());
 
     ESP_LOGI(TAG, "PIN accepted; camera stream and display mode restored");
@@ -221,6 +229,21 @@ static void pin_screen_transition_task(void *arg)
     }
 
     if (power_manager_sleep_is_requested()) {
+        authentication_mark_transition_failed();
+        xSemaphoreGive(authentication_display_mode_mutex());
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /*
+     * PIN entry is an explicit interaction state, not camera inactivity. Pause
+     * automatic Light/Deep transitions before camera ownership changes. The
+     * timer restarts with a fresh epoch only after camera restart succeeds.
+     */
+    if (!power_manager_pause_inactivity_policy()) {
+        ESP_LOGW(
+            TAG,
+            "Could not pause automatic sleep policy before PIN transition");
         authentication_mark_transition_failed();
         xSemaphoreGive(authentication_display_mode_mutex());
         vTaskDelete(NULL);

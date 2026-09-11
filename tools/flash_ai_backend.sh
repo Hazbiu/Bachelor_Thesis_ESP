@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-IDF_PROJECT="$PROJECT_ROOT/src"
+IDF_PROJECT="$PROJECT_ROOT/src_p4"
 
 MODE="${1:-}"
 PORT="${2:-}"
@@ -101,28 +101,28 @@ fi
 echo
 echo "========== COMMON POLICY CHECK =========="
 grep -Eq '^#define[[:space:]]+APP_CPU_MAX_FREQ_MHZ[[:space:]]+360([[:space:]]|$)' \
-    "$PROJECT_ROOT/src/main/include/config/app_config.h"
+    "$PROJECT_ROOT/src_p4/main/include/config/app_config.h"
 grep -Eq '^#define[[:space:]]+APP_CPU_ACTIVE_FREQ_MHZ[[:space:]]+180([[:space:]]|$)' \
-    "$PROJECT_ROOT/src/main/include/config/app_config.h"
+    "$PROJECT_ROOT/src_p4/main/include/config/app_config.h"
 
 # DET -> REC serialization remains inside Face Recognition Service.
 grep -q 'vision_ai_inference_guard_lock' \
-    "$PROJECT_ROOT/src/main/services/vision/ai_worker_pipeline.c"
+    "$PROJECT_ROOT/src_p4/main/services/vision/ai_worker_pipeline.c"
 
 # Vision requests boost through its hook; Application Logic wires that hook to
 # the neutral System Adapter port; the adapter delegates to cpu_power.
 grep -q 's_hooks\.acquire_face_boost' \
-    "$PROJECT_ROOT/src/main/services/vision/ai_worker_pipeline.c"
+    "$PROJECT_ROOT/src_p4/main/services/vision/ai_worker_pipeline.c"
 grep -q '\.acquire_face_boost[[:space:]]*=[[:space:]]*system_cpu_face_boost_begin' \
-    "$PROJECT_ROOT/src/main/app/camera/camera_session.c"
+    "$PROJECT_ROOT/src_p4/main/app/camera/camera_session.c"
 grep -q 'return cpu_power_face_boost_begin();' \
-    "$PROJECT_ROOT/src/main/platform/system/system_adapters_port.c"
+    "$PROJECT_ROOT/src_p4/main/platform/system/system_adapters_port.c"
 
 # DET and REC remain in the Face Recognition Service pipeline.
 grep -q 'face_detect_run_rgb' \
-    "$PROJECT_ROOT/src/main/services/vision/ai_worker_pipeline.c"
+    "$PROJECT_ROOT/src_p4/main/services/vision/ai_worker_pipeline.c"
 grep -q 'face_recognition_recognize' \
-    "$PROJECT_ROOT/src/main/services/vision/ai_worker_pipeline.c"
+    "$PROJECT_ROOT/src_p4/main/services/vision/ai_worker_pipeline.c"
 
 echo "  baseline CPU       : 180 MHz"
 echo "  AI high-performance: 360 MHz"

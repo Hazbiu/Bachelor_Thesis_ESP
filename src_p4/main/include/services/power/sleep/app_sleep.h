@@ -84,9 +84,24 @@ void app_sleep_set_mode_policy(bool light_enabled, bool deep_enabled);
 esp_err_t app_sleep_start_timeout(void);
 
 /**
-* Record user activity and restart the complete inactivity policy.
-*
-* Positive face detections and PIN-screen interaction both call this API.
+ * Pause automatic Light/Deep sleep transitions while the application owns a
+ * non-camera interaction state such as PIN entry. The inactivity task remains
+ * alive, but it is not allowed to claim a Light- or Deep-sleep transition.
+ */
+bool app_sleep_pause_inactivity_policy(void);
+
+/**
+ * Resume the automatic inactivity policy and start a fresh inactivity epoch.
+ * This is called only after the live camera/AI path is active again.
+ */
+void app_sleep_resume_inactivity_policy(void);
+
+/** Return true while automatic sleep transitions are paused. */
+bool app_sleep_inactivity_policy_is_paused(void);
+
+/**
+* Record camera/user activity and restart the inactivity epoch while the
+* automatic policy is active.
 */
 void app_sleep_notify_face_detected(void);
 

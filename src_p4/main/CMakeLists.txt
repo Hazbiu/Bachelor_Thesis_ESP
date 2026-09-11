@@ -18,6 +18,8 @@ idf_component_register(
         "ui/views/settings_screen.c"
         "ui/views/pin_screen.c"
         "ui/renderers/face_overlay_renderer.c"
+        "ui/assets/university_logo.c"
+        "ui/assets/launcher_heading.c"
 
         # Authentication session
         "app/authentication/authentication_session.c"
