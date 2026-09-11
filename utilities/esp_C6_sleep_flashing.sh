@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-C6_PROJECT="$ROOT/c6_deep_sleep_firmware"
+C6_PROJECT="${ROOT}/src_c6/c6_deep_sleep_firmware"
 BACKUP_DIR="$ROOT/c6_factory_backups"
 
 ACTION="${1:-}"

@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-C6="$ROOT/c6_deep_sleep_firmware"
-HOST="$ROOT/p4_c6_direct_flasher"
+C6="${ROOT}/src_c6/c6_deep_sleep_firmware"
+HOST="${ROOT}/src_c6/p4_c6_direct_flasher"
 
 ACTION="${1:-}"
 PORT="${2:-/dev/ttyACM0}"

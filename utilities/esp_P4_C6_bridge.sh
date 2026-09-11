@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BRIDGE_PROJECT="$ROOT/p4_c6_uart_bridge"
+BRIDGE_PROJECT="${ROOT}/src_c6/p4_c6_uart_bridge"
 
 ACTION="${1:-}"
 PORT="${2:-/dev/ttyACM0}"
