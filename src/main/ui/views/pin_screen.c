@@ -1,3 +1,4 @@
+
 #include "pin_screen.h"
 
 #include <stdbool.h>
@@ -5,7 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "services/power/sleep/app_sleep.h"
+#include "app/activity/app_activity.h"
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
 #include "esp_err.h"
@@ -136,7 +137,7 @@ static void key_pressed_event_cb(lv_event_t *event)
     }
 
     /* Touching the active authentication screen counts as user activity. */
-    app_sleep_notify_face_detected();
+    app_activity_notify_user();
 
     if (strcmp(key, "Clear") == 0) {
         reset_entry();
@@ -397,7 +398,7 @@ esp_err_t pin_screen_show(
     s_visible = true;
     bsp_display_unlock();
 
-    app_sleep_notify_face_detected();
+    app_activity_notify_user();
 
     ESP_LOGI(TAG, "PIN screen shown for recognized identity");
     return ESP_OK;

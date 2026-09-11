@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include <stdbool.h>
@@ -38,7 +39,7 @@ esp_err_t app_settings_init(void);
 /** Return a copy of the current in-memory settings. */
 app_settings_snapshot_t app_settings_get(void);
 
-/** Save and immediately apply the requested setting. */
+/** Save the requested setting. Hardware policy is applied by Application Logic. */
 esp_err_t app_settings_set_dark_mode(bool enabled);
 esp_err_t app_settings_set_ethernet_enabled(bool enabled);
 esp_err_t app_settings_set_wifi_enabled(bool enabled);
@@ -48,11 +49,9 @@ esp_err_t app_settings_set_sdcard_enabled(bool enabled);
 esp_err_t app_settings_set_light_sleep_enabled(bool enabled);
 esp_err_t app_settings_set_deep_sleep_enabled(bool enabled);
 
-/** Apply all saved component policies that are ready at the current boot stage. */
-esp_err_t app_settings_apply_power_policy(void);
 
 /**
- * Mount the microSD card when needed and rescan /sdcard/enroll.
+ * Rescan /sdcard/enroll. Application Logic guarantees microSD availability.
  * Every call performs a fresh directory scan.
  */
 esp_err_t app_settings_load_authorized_users(

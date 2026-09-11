@@ -1,10 +1,13 @@
+
 #include "services/power/component_runtime_policy.h"
 
 #include "bsp/esp-bsp.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "platform/power/component_audio.h"
+#include "platform/power/component_ethernet.h"
 #include "platform/power/component_sdcard.h"
+#include "platform/power/component_wifi.h"
 
 static const char *TAG = "runtime_policy";
 
@@ -59,4 +62,15 @@ esp_err_t component_runtime_set_sdcard_enabled(bool enabled)
 
     ESP_LOGI(TAG, "Runtime storage policy applied: microSD=ON and mounted");
     return ESP_OK;
+}
+
+
+esp_err_t component_runtime_set_wifi_enabled(bool enabled)
+{
+    return component_wifi_set_enabled(enabled);
+}
+
+esp_err_t component_runtime_set_ethernet_enabled(bool enabled)
+{
+    return component_ethernet_set_enabled(enabled);
 }

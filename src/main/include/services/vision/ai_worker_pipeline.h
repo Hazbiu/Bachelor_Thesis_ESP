@@ -18,7 +18,9 @@ extern "C" {
  * - application FSM transitions;
  * - display idle-scan state;
  * - PIN reservation/launch;
- * - the application-level face-boost release wrapper.
+ * - power/sleep policy;
+ * - authentication-session state;
+ * - the application-level face-boost acquire/release wrappers.
  *
  * Those concerns are supplied as callbacks so dependency direction remains:
  *
@@ -28,6 +30,11 @@ extern "C" {
  */
 typedef struct {
     bool (*idle_scan_display_is_suspended)(void);
+    bool (*sleep_is_requested)(void);
+    bool (*camera_processing_blocked)(void);
+    bool (*note_detection_result)(int face_count);
+    esp_err_t (*acquire_face_boost)(void);
+    void (*notify_activity)(void);
     void (*recognition_started)(void);
     bool (*request_pin)(const char *recognized_name);
     void (*recognition_not_authenticated)(void);

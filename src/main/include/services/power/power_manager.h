@@ -1,13 +1,15 @@
 #pragma once
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef esp_err_t (*power_manager_transition_callback_t)(
-    void *user_data);
+typedef esp_err_t (*power_manager_transition_callback_t)(void *user_data);
 
 typedef enum {
     POWER_MANAGER_SETUP_LIGHT_SLEEP_CALLBACKS = 0,
@@ -23,6 +25,7 @@ typedef struct {
 
     void (*deep_sleep_state_requested)(void);
     void (*block_new_work)(void);
+    bool (*drain_active_work)(uint32_t timeout_ms);
     esp_err_t (*release_face_boost)(const char *reason);
     void (*mark_backlight_off)(void);
 
@@ -31,10 +34,32 @@ typedef struct {
         esp_err_t error);
 } power_manager_hooks_t;
 
-esp_err_t power_manager_setup(
-    const power_manager_hooks_t *hooks);
+typedef struct {
+    bool ethernet_enabled;
+    bool wifi_enabled;
+    bool audio_enabled;
+    bool sdcard_enabled;
+    bool light_sleep_enabled;
+    bool deep_sleep_enabled;
+} power_manager_configuration_t;
 
+esp_err_t power_manager_setup(const power_manager_hooks_t *hooks);
 esp_err_t power_manager_start_inactivity_policy(void);
+
+/* Application-facing Power Management API. */
+esp_err_t power_manager_apply_configuration(
+    const power_manager_configuration_t *configuration);
+esp_err_t power_manager_set_ethernet_enabled(bool enabled);
+esp_err_t power_manager_set_wifi_enabled(bool enabled);
+esp_err_t power_manager_set_audio_enabled(bool enabled);
+esp_err_t power_manager_set_sdcard_enabled(bool enabled);
+bool power_manager_audio_policy_ready(void);
+void power_manager_set_sleep_modes(bool light_enabled, bool deep_enabled);
+void power_manager_notify_activity(void);
+bool power_manager_sleep_is_requested(void);
+bool power_manager_light_sleep_is_due(void);
+bool power_manager_deep_mode_is_enabled(void);
+void power_manager_request_deep_sleep(const char *reason);
 
 #ifdef __cplusplus
 }

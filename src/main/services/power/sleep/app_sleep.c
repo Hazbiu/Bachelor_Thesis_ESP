@@ -1,4 +1,5 @@
 
+
 #include "services/power/sleep/app_sleep.h"
 
 #include <inttypes.h>
@@ -27,7 +28,6 @@
 #include "platform/power/component_sdcard.h"
 #include "platform/power/component_wifi.h"
 #include "platform/power/cpu_power.h"
-#include "services/settings/app_settings.h"
 
 #if APP_LIGHT_SLEEP_TOUCH_POLL_MS == 0
 #error "APP_LIGHT_SLEEP_TOUCH_POLL_MS must be greater than zero"
@@ -58,6 +58,8 @@ static bool s_light_sleep_failed_until_activity;
 static int64_t s_last_face_detected_us;
 static bool s_light_mode_enabled;
 static bool s_deep_mode_enabled;
+static bool s_requested_light_mode_enabled = true;
+static bool s_requested_deep_mode_enabled = true;
 static uint32_t s_light_sleep_threshold_ms;
 static uint32_t s_deep_sleep_threshold_ms;
 
@@ -67,11 +69,23 @@ static app_sleep_light_transition_callback_t s_light_suspend_callback;
 static app_sleep_light_transition_callback_t s_light_resume_callback;
 static void *s_light_transition_user_data;
 
+void app_sleep_set_mode_policy(bool light_enabled, bool deep_enabled)
+{
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    s_requested_light_mode_enabled = light_enabled;
+    s_requested_deep_mode_enabled = deep_enabled;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+}
+
 static void configure_runtime_power_modes(void)
 {
-    const app_settings_snapshot_t settings = app_settings_get();
-    const bool light_enabled = settings.light_sleep_enabled;
-    const bool deep_enabled = settings.deep_sleep_enabled;
+    bool light_enabled;
+    bool deep_enabled;
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    light_enabled = s_requested_light_mode_enabled;
+    deep_enabled = s_requested_deep_mode_enabled;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
 
     uint32_t light_threshold_ms = 0;
     uint32_t deep_threshold_ms = 0;
@@ -356,11 +370,9 @@ bool app_sleep_light_sleep_is_due(void)
 bool app_sleep_deep_mode_is_enabled(void)
 {
     bool enabled;
-
     portENTER_CRITICAL(&s_sleep_request_lock);
-    enabled = s_deep_mode_enabled;
+    enabled = s_requested_deep_mode_enabled;
     portEXIT_CRITICAL(&s_sleep_request_lock);
-
     return enabled;
 }
 
@@ -1081,8 +1093,7 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
 
 void app_sleep_request(const char *reason)
 {
-    const app_settings_snapshot_t settings = app_settings_get();
-    if (!settings.deep_sleep_enabled) {
+    if (!app_sleep_deep_mode_is_enabled()) {
         ESP_LOGW(
             POWER_TAG,
             "event=DEEP_SLEEP_REQUEST_IGNORED policy=RUNTIME_DISABLED reason=\"%s\"",
@@ -1158,8 +1169,7 @@ static void deep_sleep_button_task(void *arg)
 
             if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0 &&
                 !button_event_is_reserved_for_light_sleep()) {
-                const app_settings_snapshot_t settings = app_settings_get();
-                if (settings.deep_sleep_enabled) {
+                if (app_sleep_deep_mode_is_enabled()) {
                     app_sleep_request("GPIO3 button");
                 } else {
                     ESP_LOGI(

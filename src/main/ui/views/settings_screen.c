@@ -13,7 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
-#include "services/settings/app_settings.h"
+#include "app/configuration/app_configuration.h"
 
 typedef enum {
     SETTINGS_TOGGLE_THEME,
@@ -199,7 +199,7 @@ static void create_user_row(
 static void create_authorized_users(
     lv_obj_t *content,
     const settings_palette_t *palette,
-    const app_settings_authorized_users_t *users,
+    const app_configuration_authorized_users_t *users,
     esp_err_t users_ret)
 {
     create_section_label(content, "AUTHORIZED USERS", palette);
@@ -237,7 +237,7 @@ static void create_authorized_users(
 }
 
 static bool setting_value_for_kind(
-    const app_settings_snapshot_t *settings,
+    const app_configuration_snapshot_t *settings,
     settings_toggle_kind_t kind)
 {
     switch (kind) {
@@ -264,17 +264,17 @@ static esp_err_t apply_toggle_setting(
 {
     switch (kind) {
     case SETTINGS_TOGGLE_THEME:
-        return app_settings_set_dark_mode(enabled);
+        return app_configuration_set_dark_mode(enabled);
     case SETTINGS_TOGGLE_ETHERNET:
-        return app_settings_set_ethernet_enabled(enabled);
+        return app_configuration_set_ethernet_enabled(enabled);
     case SETTINGS_TOGGLE_WIFI:
-        return app_settings_set_wifi_enabled(enabled);
+        return app_configuration_set_wifi_enabled(enabled);
     case SETTINGS_TOGGLE_AUDIO:
-        return app_settings_set_audio_enabled(enabled);
+        return app_configuration_set_audio_enabled(enabled);
     case SETTINGS_TOGGLE_LIGHT_SLEEP:
-        return app_settings_set_light_sleep_enabled(enabled);
+        return app_configuration_set_light_sleep_enabled(enabled);
     case SETTINGS_TOGGLE_DEEP_SLEEP:
-        return app_settings_set_deep_sleep_enabled(enabled);
+        return app_configuration_set_deep_sleep_enabled(enabled);
     }
 
     return ESP_ERR_INVALID_ARG;
@@ -354,7 +354,7 @@ static void toggle_apply_task(void *arg)
     const esp_err_t ret = apply_toggle_setting(
         request.kind,
         request.requested_enabled);
-    const app_settings_snapshot_t settings = app_settings_get();
+    const app_configuration_snapshot_t settings = app_configuration_get();
     const bool saved_enabled = setting_value_for_kind(&settings, request.kind);
     const bool rebuild_theme =
         ret == ESP_OK && request.kind == SETTINGS_TOGGLE_THEME;
@@ -405,7 +405,7 @@ static void toggle_event_cb(lv_event_t *event)
     if (s_toggle_write_in_progress ||
         (s_last_toggle_event_us != 0 &&
          now_us - s_last_toggle_event_us < SETTINGS_TOGGLE_DEBOUNCE_US)) {
-        const app_settings_snapshot_t settings = app_settings_get();
+        const app_configuration_snapshot_t settings = app_configuration_get();
         sync_toggle_state(toggle, setting_value_for_kind(&settings, kind));
         return;
     }
@@ -429,7 +429,7 @@ static void toggle_event_cb(lv_event_t *event)
         NULL);
 
     if (created != pdPASS) {
-        const app_settings_snapshot_t settings = app_settings_get();
+        const app_configuration_snapshot_t settings = app_configuration_get();
         sync_toggle_state(toggle, setting_value_for_kind(&settings, kind));
         set_settings_controls_enabled(true);
         s_toggle_write_in_progress = false;
@@ -527,9 +527,9 @@ void settings_screen_create(
     s_toggle_count = 0;
 
     /* Required fresh read: this function is called for every Settings press. */
-    app_settings_authorized_users_t users;
-    const esp_err_t users_ret = app_settings_load_authorized_users(&users);
-    const app_settings_snapshot_t settings = app_settings_get();
+    app_configuration_authorized_users_t users;
+    const esp_err_t users_ret = app_configuration_load_authorized_users(&users);
+    const app_configuration_snapshot_t settings = app_configuration_get();
     const settings_palette_t palette = palette_for(settings.dark_mode);
 
     if (settings_screen_lock() != ESP_OK) {

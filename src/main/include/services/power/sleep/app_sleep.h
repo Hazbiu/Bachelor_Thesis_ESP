@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include <stdbool.h>
@@ -77,6 +78,9 @@ esp_err_t app_sleep_start_button_monitor(
 * Positive face detections and existing application activity notifications
 * reset the inactivity timestamp exactly as before.
 */
+/** Set the saved Light/Deep policy supplied by Application Logic. */
+void app_sleep_set_mode_policy(bool light_enabled, bool deep_enabled);
+
 esp_err_t app_sleep_start_timeout(void);
 
 /**

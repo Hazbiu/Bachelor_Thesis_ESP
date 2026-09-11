@@ -10,9 +10,6 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "platform/power/cpu_power.h"
-#include "services/authentication/authentication_session.h"
-#include "services/power/sleep/app_sleep.h"
 #include "services/vision/ai_inference_guard.h"
 #include "services/vision/ai_snapshot_buffer.h"
 #include "services/vision/ai_worker_runtime.h"
@@ -34,6 +31,11 @@ static bool hooks_are_complete(
 {
     return hooks != NULL &&
         hooks->idle_scan_display_is_suspended != NULL &&
+        hooks->sleep_is_requested != NULL &&
+        hooks->camera_processing_blocked != NULL &&
+        hooks->note_detection_result != NULL &&
+        hooks->acquire_face_boost != NULL &&
+        hooks->notify_activity != NULL &&
         hooks->recognition_started != NULL &&
         hooks->request_pin != NULL &&
         hooks->recognition_not_authenticated != NULL &&
@@ -58,7 +60,7 @@ static void ai_worker_task(void *arg)
             continue;
         }
 
-        if (app_sleep_is_requested() || authentication_session_blocks_camera()) {
+        if (s_hooks.sleep_is_requested() || s_hooks.camera_processing_blocked()) {
             vision_ai_worker_state_mark_idle();
             continue;
         }
@@ -69,7 +71,7 @@ static void ai_worker_task(void *arg)
             continue;
         }
 
-        esp_err_t boost_ret = cpu_power_face_boost_begin();
+        esp_err_t boost_ret = s_hooks.acquire_face_boost();
         if (boost_ret != ESP_OK) {
             ESP_LOGW(TAG, "Could not request AI high-performance CPU lock: %s",
                      esp_err_to_name(boost_ret));
@@ -101,7 +103,7 @@ static void ai_worker_task(void *arg)
                  job.frame_id, face_count);
         diagnostics_ai_detection_result(face_count);
 
-        if (authentication_session_note_detection_result(face_count)) {
+        if (s_hooks.note_detection_result(face_count)) {
             ESP_LOGI(
                 TAG,
                 "Authentication rearmed after the face left the camera");
@@ -118,7 +120,7 @@ static void ai_worker_task(void *arg)
             continue;
         }
 
-        app_sleep_notify_face_detected();
+        s_hooks.notify_activity();
 
 #if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
         printf(

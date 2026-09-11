@@ -9,18 +9,24 @@ idf_component_register(
         "app/authentication/authentication_flow.c"
         "app/camera/camera_session.c"
         "app/navigation/app_navigation.c"
+        "app/configuration/app_configuration.c"
+        "app/activity/app_activity.c"
 
         # User interface
+        "ui/presentation_port.c"
         "ui/views/app_ui.c"
         "ui/views/settings_screen.c"
         "ui/views/pin_screen.c"
         "ui/renderers/face_overlay_renderer.c"
 
         # Authentication session
-        "services/authentication/authentication_session.c"
+        "app/authentication/authentication_session.c"
 
         # Persistent application settings
         "services/settings/app_settings.c"
+
+        # Neutral application port implemented by System Adapters
+        "platform/system/system_adapters_port.c"
 
         # Camera platform
         "platform/camera/camera_runtime.c"

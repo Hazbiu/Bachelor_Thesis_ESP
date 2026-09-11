@@ -1,8 +1,8 @@
+
 #include <stdio.h>
 
 #include "app/app_boot.h"
-#include "platform/storage/sd_card_storage.h"
-#include "platform/storage/spiffs_storage.h"
+#include "domain/ports/system_adapters_port.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "services/vision/face_detector.h"
@@ -13,11 +13,11 @@ static const char *TAG = "app_main";
 
 void app_boot_initialize_services(void)
 {
-    ESP_ERROR_CHECK(spiffs_storage_mount());
+    ESP_ERROR_CHECK(system_storage_spiffs_mount());
 
     /* SD CARD TEST */
     /* Settings may already have mounted the card to refresh authorized users. */
-    esp_err_t sd_ret = sd_card_storage_ensure_mounted();
+    esp_err_t sd_ret = system_storage_sdcard_ensure_mounted();
     if (sd_ret == ESP_OK) {
         ESP_LOGI(TAG, "SD card mounted at /sdcard");
 

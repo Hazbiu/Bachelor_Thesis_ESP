@@ -7,7 +7,7 @@
 #include "esp_log.h"
 #include "platform/power/cpu_power.h"
 #include "services/power/sleep/app_sleep.h"
-#include "services/vision/ai_worker_state.h"
+#include "services/power/component_runtime_policy.h"
 
 
 static const char *TAG = "app_main";
@@ -24,6 +24,7 @@ static bool hooks_are_complete(
         hooks->idle_scan_resume != NULL &&
         hooks->deep_sleep_state_requested != NULL &&
         hooks->block_new_work != NULL &&
+        hooks->drain_active_work != NULL &&
         hooks->release_face_boost != NULL &&
         hooks->mark_backlight_off != NULL;
 }
@@ -47,7 +48,7 @@ static void prepare_application_for_deep_sleep(
     s_hooks.deep_sleep_state_requested();
     s_hooks.block_new_work();
 
-    if (!vision_ai_worker_state_pause_and_drain(
+    if (!s_hooks.drain_active_work(
             APP_AI_WORKER_DRAIN_TIMEOUT_MS)) {
         ESP_LOGW(
             TAG,
@@ -121,4 +122,111 @@ esp_err_t power_manager_setup(
 esp_err_t power_manager_start_inactivity_policy(void)
 {
     return app_sleep_start_timeout();
+}
+
+
+
+esp_err_t power_manager_set_ethernet_enabled(bool enabled)
+{
+    return component_runtime_set_ethernet_enabled(enabled);
+}
+
+esp_err_t power_manager_set_wifi_enabled(bool enabled)
+{
+    return component_runtime_set_wifi_enabled(enabled);
+}
+
+esp_err_t power_manager_set_audio_enabled(bool enabled)
+{
+    return component_runtime_set_audio_enabled(enabled);
+}
+
+esp_err_t power_manager_set_sdcard_enabled(bool enabled)
+{
+    return component_runtime_set_sdcard_enabled(enabled);
+}
+
+bool power_manager_audio_policy_ready(void)
+{
+    return component_runtime_audio_policy_ready();
+}
+
+void power_manager_set_sleep_modes(bool light_enabled, bool deep_enabled)
+{
+    app_sleep_set_mode_policy(light_enabled, deep_enabled);
+}
+
+void power_manager_notify_activity(void)
+{
+    app_sleep_notify_face_detected();
+}
+
+bool power_manager_sleep_is_requested(void)
+{
+    return app_sleep_is_requested();
+}
+
+bool power_manager_light_sleep_is_due(void)
+{
+    return app_sleep_light_sleep_is_due();
+}
+
+bool power_manager_deep_mode_is_enabled(void)
+{
+    return app_sleep_deep_mode_is_enabled();
+}
+
+void power_manager_request_deep_sleep(const char *reason)
+{
+    app_sleep_request(reason);
+}
+
+esp_err_t power_manager_apply_configuration(
+    const power_manager_configuration_t *configuration)
+{
+    if (configuration == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    power_manager_set_sleep_modes(
+        configuration->light_sleep_enabled,
+        configuration->deep_sleep_enabled);
+
+    esp_err_t first_error = ESP_OK;
+
+    esp_err_t ret = power_manager_set_wifi_enabled(configuration->wifi_enabled);
+    if (ret != ESP_OK) {
+        first_error = ret;
+        ESP_LOGE(TAG, "Could not apply saved Wi-Fi policy: %s", esp_err_to_name(ret));
+    }
+
+    ret = power_manager_set_ethernet_enabled(configuration->ethernet_enabled);
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not apply saved Ethernet policy: %s", esp_err_to_name(ret));
+    }
+
+    ret = power_manager_set_sdcard_enabled(configuration->sdcard_enabled);
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not apply saved microSD policy: %s", esp_err_to_name(ret));
+    }
+
+    if (power_manager_audio_policy_ready()) {
+        ret = power_manager_set_audio_enabled(configuration->audio_enabled);
+        if (ret != ESP_OK && first_error == ESP_OK) {
+            first_error = ret;
+        }
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Could not apply saved Audio policy: %s", esp_err_to_name(ret));
+        }
+    } else {
+        ESP_LOGI(TAG, "Saved Audio policy will be applied after display/I2C startup");
+    }
+
+    return first_error;
 }

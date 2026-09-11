@@ -4,7 +4,6 @@
 #include <string.h>
 #include "esp_err.h"
 #include "esp_log.h"
-#include "esp_video_init.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_cache.h"
@@ -13,9 +12,6 @@
 #include "esp_timer.h"
 #include "esp_system.h"
 #include "driver/ppa.h"
-#include "platform/camera/video_capture.h"
-#include "platform/camera/camera_runtime.h"
-#include "platform/display/display_platform.h"
 #include "services/vision/face_detector.h"
 #include "services/vision/face_recognizer.h"
 #include "services/vision/recognition_policy.h"
@@ -35,13 +31,12 @@
 #include "diagnostics/ai_pipeline_status.h"
 #include "app/app_boot.h"
 #include "app/camera/camera_session.h"
+#include "app/configuration/app_configuration.h"
+#include "domain/ports/presentation_port.h"
+#include "domain/ports/system_adapters_port.h"
 #include "app/controller/app_controller.h"
 #include "app/authentication/authentication_flow.h"
-#include "services/authentication/authentication_session.h"
-#include "app_ui.h"
-#include "settings_screen.h"
-#include "pin_screen.h"
-#include "renderers/face_overlay_renderer.h"
+#include "app/authentication/authentication_session.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "bsp/display.h"
@@ -53,14 +48,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "platform/power/cpu_power.h"
 #include "config/app_config.h"
 #include "config/app_features.h"
 #include "config/log_config.h"
-#include "services/power/sleep/app_sleep.h"
-#include "services/power/component_runtime_policy.h"
 #include "services/power/power_manager.h"
-#include "services/settings/app_settings.h"
 
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 
@@ -142,7 +133,7 @@ esp_err_t camera_session_prepare_launcher_display(void)
      * Phase 1: normal LVGL rendering. The user sees a proper launcher and the
      * camera/AI pipeline is not initialized until Start Camera is pressed.
      */
-    disp = display_platform_start();
+    disp = system_display_start();
     if (!disp) {
         ESP_LOGE(TAG,
                  "Display/touch initialization failed. Check the selected Waveshare "
@@ -158,7 +149,7 @@ esp_err_t camera_session_prepare_launcher_display(void)
     vTaskDelay(pdMS_TO_TICKS(150));
 
     /* The display startup creates the shared BSP I2C bus used by ES8311. */
-    esp_err_t post_display_policy_ret = app_settings_apply_power_policy();
+    esp_err_t post_display_policy_ret = app_configuration_apply_saved_policy();
     if (post_display_policy_ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -166,13 +157,13 @@ esp_err_t camera_session_prepare_launcher_display(void)
             esp_err_to_name(post_display_policy_ret));
     }
 
-    display_platform_disable_lvgl_overlays(disp);
+    system_display_disable_lvgl_overlays(disp);
 
     /*
      * The BSP initializes GT911 and registers the LVGL input device inside
      * bsp_display_start(). Use the BSP-owned handle directly.
      */
-    launcher_touch_indev = display_platform_get_input_device();
+    launcher_touch_indev = system_display_get_input_device();
     if (launcher_touch_indev) {
         ESP_LOGI(TAG,
                  "BSP touchscreen ready: type=%d",
@@ -193,7 +184,7 @@ bool camera_session_launcher_touch_ready(void)
 
 void camera_session_enable_launcher_backlight(void)
 {
-    display_platform_backlight_on();
+    system_display_backlight_on();
     display_backlight_enabled = true;
 }
 
@@ -289,11 +280,11 @@ static void trim_display_buffers_for_sleep(void)
 
 static esp_err_t face_boost_release(const char *reason)
 {
-    if (!cpu_power_is_face_boost_active()) {
+    if (!system_cpu_face_boost_is_active()) {
         return ESP_OK;
     }
 
-    esp_err_t ret = cpu_power_face_boost_end();
+    esp_err_t ret = system_cpu_face_boost_end();
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -325,6 +316,12 @@ static void power_manager_block_new_work(void)
     dummy_mode_delay_flag = true;
 }
 
+
+static bool power_manager_drain_active_work(uint32_t timeout_ms)
+{
+    return vision_ai_worker_state_pause_and_drain(timeout_ms);
+}
+
 static void power_manager_mark_backlight_off(void)
 {
     /*
@@ -333,7 +330,7 @@ static void power_manager_mark_backlight_off(void)
      * the panel/DSI transport is already suspended, so request the physical
      * backlight OFF here rather than updating only the software shadow.
      */
-    display_platform_backlight_off();
+    system_display_backlight_off();
     display_backlight_enabled = false;
     ESP_LOGI(
         TAG,
@@ -350,7 +347,7 @@ static void power_manager_on_setup_error(
             TAG,
             "Failed to register Light-sleep transitions: %s",
             esp_err_to_name(error));
-        app_ui_show_error(
+        presentation_launcher_show_error(
             "Light-sleep setup failed. Restart the device.");
         break;
 
@@ -359,7 +356,7 @@ static void power_manager_on_setup_error(
             TAG,
             "Failed to register adaptive IDLE-SCAN transitions: %s",
             esp_err_to_name(error));
-        app_ui_show_error(
+        presentation_launcher_show_error(
             "Adaptive CPU power setup failed. Restart the device.");
         break;
 
@@ -368,7 +365,7 @@ static void power_manager_on_setup_error(
             TAG,
             "Failed to start deep-sleep button monitor: %s",
             esp_err_to_name(error));
-        app_ui_show_error(
+        presentation_launcher_show_error(
             "Deep-sleep button task failed. Restart the device.");
         break;
 
@@ -392,14 +389,14 @@ static void idle_scan_touch_poll_task(void *arg)
 
     /* Discard a coordinate consumed immediately before LVGL was stopped. */
     bool touched = false;
-    (void)display_platform_poll_touch_for_light_sleep(&touched);
+    (void)system_display_poll_touch_for_light_sleep(&touched);
 
     while (idle_scan_display_is_suspended() &&
            !display_suspended_for_light_sleep &&
-           !app_sleep_is_requested()) {
+           !power_manager_sleep_is_requested()) {
         vTaskDelay(pdMS_TO_TICKS(APP_LIGHT_SLEEP_TOUCH_POLL_MS));
 
-        esp_err_t ret = display_platform_poll_touch_for_light_sleep(&touched);
+        esp_err_t ret = system_display_poll_touch_for_light_sleep(&touched);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "IDLE-SCAN touch polling failed: %s",
                      esp_err_to_name(ret));
@@ -408,7 +405,7 @@ static void idle_scan_touch_poll_task(void *arg)
 
         if (touched) {
             ESP_LOGI(TAG, "IDLE-SCAN touchscreen activity detected");
-            app_sleep_notify_face_detected();
+            power_manager_notify_activity();
             break;
         }
     }
@@ -437,10 +434,10 @@ static esp_err_t suspend_display_for_idle_scan(void *user_data)
     ESP_LOGI(TAG, "IDLE-SCAN suspending LVGL and MIPI-DSI; camera stays active");
 
     dummy_mode_delay_flag = true;
-    display_platform_backlight_off();
+    system_display_backlight_off();
     display_backlight_enabled = false;
 
-    esp_err_t ret = display_platform_suspend_for_light_sleep(false);
+    esp_err_t ret = system_display_suspend_for_light_sleep(false);
     if (ret != ESP_OK) {
         xSemaphoreGive(display_mode_mutex);
         ESP_LOGE(TAG, "IDLE-SCAN display suspend failed: %s",
@@ -500,7 +497,7 @@ static void resume_display_from_idle_scan_task(void *arg)
 
     if (!idle_scan_display_is_suspended() ||
         display_suspended_for_light_sleep ||
-        app_sleep_is_requested()) {
+        power_manager_sleep_is_requested()) {
         portENTER_CRITICAL(&idle_scan_state_lock);
         idle_scan_resume_task_pending = false;
         portEXIT_CRITICAL(&idle_scan_state_lock);
@@ -522,7 +519,7 @@ static void resume_display_from_idle_scan_task(void *arg)
      * restore the complete display stack, then restart the same camera task.
      */
     ESP_LOGI(TAG, "ACTIVE pausing camera DMA before MIPI-DSI restoration");
-    esp_err_t ret = app_video_stream_task_stop(video_cam_fd0);
+    esp_err_t ret = system_camera_stream_stop(video_cam_fd0);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "ACTIVE camera pause before display restore failed: %s",
                  esp_err_to_name(ret));
@@ -531,7 +528,7 @@ static void resume_display_from_idle_scan_task(void *arg)
     }
 
     log_psram_state("before_bsp_display_resume");
-    disp = display_platform_resume_from_light_sleep();
+    disp = system_display_resume_from_light_sleep();
     if (disp == NULL) {
         ESP_LOGE(TAG, "ACTIVE display restoration failed");
         xSemaphoreGive(display_mode_mutex);
@@ -540,7 +537,7 @@ static void resume_display_from_idle_scan_task(void *arg)
 
     log_psram_state("after_bsp_display_resume");
     vTaskDelay(pdMS_TO_TICKS(150));
-    launcher_touch_indev = display_platform_get_input_device();
+    launcher_touch_indev = system_display_get_input_device();
 
     ret = allocate_display_buffers();
     if (ret != ESP_OK) {
@@ -560,10 +557,10 @@ static void resume_display_from_idle_scan_task(void *arg)
 
     dummy_draw_enabled = true;
     display_buffer_index = 0;
-    display_platform_disable_lvgl_overlays(disp);
+    system_display_disable_lvgl_overlays(disp);
     vision_face_result_store_clear();
 
-    ret = app_video_stream_task_restart(video_cam_fd0);
+    ret = system_camera_stream_restart(video_cam_fd0);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "ACTIVE camera restart after display restore failed: %s",
                  esp_err_to_name(ret));
@@ -585,7 +582,7 @@ static void resume_display_from_idle_scan_task(void *arg)
         TAG,
         "ACTIVE camera display restored; baseline=%d MHz boost=%s",
         APP_CPU_ACTIVE_FREQ_MHZ,
-        cpu_power_is_face_boost_active() ? "on" : "off");
+        system_cpu_face_boost_is_active() ? "on" : "off");
     vTaskDelete(NULL);
 }
 
@@ -641,11 +638,11 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
 
     /*
      * The worker may have found a face while this callback waited for a long
-     * FP32 inference to finish. In that case app_sleep_notify_face_detected()
+     * FP32 inference to finish. In that case power_manager_notify_activity()
      * reset the inactivity timer, so cancel the claimed Light-sleep before any
      * display/camera hardware is destroyed.
      */
-    if (!app_sleep_light_sleep_is_due()) {
+    if (!power_manager_light_sleep_is_due()) {
         vision_ai_worker_state_resume_accepting();
         ESP_LOGI(TAG, "Light-sleep canceled because AI/user activity arrived");
         return ESP_ERR_INVALID_STATE;
@@ -674,7 +671,7 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
     dummy_mode_delay_flag = true;
     ESP_LOGI(TAG, "Light-sleep display barrier acquired; stopping camera");
 
-    esp_err_t ret = app_video_stream_task_stop(video_cam_fd0);
+    esp_err_t ret = system_camera_stream_stop(video_cam_fd0);
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -684,7 +681,7 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
         return ret;
     }
 
-    ret = app_video_prepare_sensor_for_light_sleep();
+    ret = system_camera_prepare_sensor_for_light_sleep();
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -715,7 +712,7 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
          * panel handle is alive, then tear down MIPI-DSI/LVGL. Deep enablement
          * changes only what happens AFTER the Light-sleep residency window.
          */
-        ret = display_platform_suspend_for_light_sleep(true);
+        ret = system_display_suspend_for_light_sleep(true);
         if (ret == ESP_OK) {
             trim_display_buffers_for_sleep();
         }
@@ -728,7 +725,7 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
          * accepted SLEEP_IN and MIPI-DSI/LVGL were suspended. No framebuffer,
          * panel scanout, camera stream or AI work is restarted here.
          */
-        display_platform_backlight_on();
+        system_display_backlight_on();
         display_backlight_enabled = true;
         ESP_LOGI(
             TAG,
@@ -799,7 +796,7 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
      * The normal first complete camera frame will turn the backlight on again,
      * preserving the existing tear-free wake behavior.
      */
-    display_platform_backlight_off();
+    system_display_backlight_off();
     display_backlight_enabled = false;
     ESP_LOGI(
         TAG,
@@ -809,7 +806,7 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
     ESP_LOGI(TAG, "Restoring MIPI-DSI and camera after Light-sleep activity");
 
     log_psram_state("before_bsp_display_resume");
-    disp = display_platform_resume_from_light_sleep();
+    disp = system_display_resume_from_light_sleep();
     if (disp == NULL) {
         ESP_LOGE(TAG, "Display reinitialization after Light-sleep failed");
         xSemaphoreGive(display_mode_mutex);
@@ -818,7 +815,7 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
 
     log_psram_state("after_bsp_display_resume");
     vTaskDelay(pdMS_TO_TICKS(150));
-    launcher_touch_indev = display_platform_get_input_device();
+    launcher_touch_indev = system_display_get_input_device();
 
     esp_err_t ret = allocate_display_buffers();
     if (ret != ESP_OK) {
@@ -840,9 +837,9 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
 
     dummy_draw_enabled = true;
     display_buffer_index = 0;
-    display_platform_disable_lvgl_overlays(disp);
+    system_display_disable_lvgl_overlays(disp);
 
-    ret = app_video_restore_sensor_after_light_sleep();
+    ret = system_camera_restore_sensor_after_light_sleep();
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -852,7 +849,7 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
         return ret;
     }
 
-    ret = app_video_stream_task_restart(video_cam_fd0);
+    ret = system_camera_stream_restart(video_cam_fd0);
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -872,7 +869,7 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
     xSemaphoreGive(display_mode_mutex);
 
     /* Light-sleep restores generic peripherals; reassert saved OFF policies. */
-    ret = app_settings_apply_power_policy();
+    ret = app_configuration_apply_saved_policy();
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -910,27 +907,27 @@ static void camera_application_start_task(void *arg)
     esp_err_t ret;
 
     /* Re-apply saved component states immediately before Active camera mode. */
-    ret = app_settings_apply_power_policy();
+    ret = app_configuration_apply_saved_policy();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Saved power policy could not be applied: %s",
                  esp_err_to_name(ret));
-        app_ui_show_error(
+        presentation_launcher_show_error(
             "Power setting could not be applied. Check the serial log and restart.");
         application_start_requested = false;
         vTaskDelete(NULL);
         return;
     }
 
-    const app_settings_snapshot_t settings = app_settings_get();
+    const app_configuration_snapshot_t settings = app_configuration_get();
     if (!settings.camera_enabled) {
         ESP_LOGW(TAG, "Camera start blocked by the saved Camera OFF policy");
-        app_ui_show_error("Camera is disabled. Enable it in Settings first.");
+        presentation_launcher_show_error("Camera is disabled. Enable it in Settings first.");
         application_start_requested = false;
         vTaskDelete(NULL);
         return;
     }
 
-    app_ui_set_status("Initializing display accelerator...");
+    presentation_launcher_set_status("Initializing display accelerator...");
 
     ppa_client_config_t ppa_srm_config = {
         .oper_type = PPA_OPERATION_SRM,
@@ -939,12 +936,12 @@ static void camera_application_start_task(void *arg)
     ret = ppa_register_client(&ppa_srm_config, &ppa_srm_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "PPA client registration failed: %s", esp_err_to_name(ret));
-        app_ui_show_error("PPA initialization failed. Restart the device.");
+        presentation_launcher_show_error("PPA initialization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
-    app_ui_set_status("Initializing face detection and recognition...");
+    presentation_launcher_set_status("Initializing face detection and recognition...");
 
     /*
      * Models, enrollment images and the recognition database are loaded from
@@ -954,11 +951,11 @@ static void camera_application_start_task(void *arg)
      */
     const bool restore_sdcard_off_after_ai_init = !settings.sdcard_enabled;
     if (restore_sdcard_off_after_ai_init) {
-        ret = component_runtime_set_sdcard_enabled(true);
+        ret = power_manager_set_sdcard_enabled(true);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Temporary microSD startup access failed: %s",
                      esp_err_to_name(ret));
-            app_ui_show_error(
+            presentation_launcher_show_error(
                 "microSD could not be powered for AI initialization.");
             application_start_requested = false;
             vTaskDelete(NULL);
@@ -974,11 +971,11 @@ static void camera_application_start_task(void *arg)
     app_boot_initialize_services();
 
     if (restore_sdcard_off_after_ai_init) {
-        ret = component_runtime_set_sdcard_enabled(false);
+        ret = power_manager_set_sdcard_enabled(false);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Could not restore saved microSD OFF state: %s",
                      esp_err_to_name(ret));
-            app_ui_show_error(
+            presentation_launcher_show_error(
                 "AI loaded, but microSD could not be powered down safely.");
             application_start_requested = false;
             vTaskDelete(NULL);
@@ -994,39 +991,39 @@ static void camera_application_start_task(void *arg)
     ret = esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Cache alignment query failed: %s", esp_err_to_name(ret));
-        app_ui_show_error("Memory initialization failed. Restart the device.");
+        presentation_launcher_show_error("Memory initialization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
     lcd_fb_size = ALIGN_UP(
-        (size_t)display_platform_width() * display_platform_height() *
-            (APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? 2 : 3),
+        (size_t)system_display_width() * system_display_height() *
+            system_camera_bytes_per_pixel(),
         data_cache_line_size);
 
-    app_ui_set_status("Opening camera...");
+    presentation_launcher_set_status("Opening camera...");
 
-    ret = camera_runtime_initialize();
+    ret = system_camera_initialize();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Video initialization failed: %s", esp_err_to_name(ret));
-        app_ui_show_error("Camera initialization failed. Restart the device.");
+        presentation_launcher_show_error("Camera initialization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
-    video_cam_fd0 = app_video_open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, APP_VIDEO_FMT);
+    video_cam_fd0 = system_camera_open_default();
     if (video_cam_fd0 < 0) {
         ESP_LOGE(TAG, "Video camera open failed");
-        app_ui_show_error("Camera could not be opened. Restart the device.");
+        presentation_launcher_show_error("Camera could not be opened. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
-    app_ui_set_status("Allocating camera buffers...");
+    presentation_launcher_set_status("Allocating camera buffers...");
 
     ret = allocate_display_buffers();
     if (ret != ESP_OK) {
-        app_ui_show_error("Display-buffer allocation failed. Restart the device.");
+        presentation_launcher_show_error("Display-buffer allocation failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1041,24 +1038,24 @@ static void camera_application_start_task(void *arg)
         camera_buf[i] = heap_caps_aligned_calloc(
             data_cache_line_size,
             1,
-            app_video_get_buf_size(),
+            system_camera_buffer_size(),
             MALLOC_CAP_SPIRAM);
 
         if (!camera_buf[i]) {
             ESP_LOGE(TAG, "Failed to allocate camera buffer %d", i);
-            app_ui_show_error("Camera-buffer allocation failed. Restart the device.");
+            presentation_launcher_show_error("Camera-buffer allocation failed. Restart the device.");
             vTaskDelete(NULL);
             return;
         }
     }
 
-    ret = app_video_set_bufs(
+    ret = system_camera_set_buffers(
         video_cam_fd0,
         APP_CAMERA_BUFFER_COUNT,
         (const void **)camera_buf);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Camera buffer setup failed: %s", esp_err_to_name(ret));
-        app_ui_show_error("Camera-buffer setup failed. Restart the device.");
+        presentation_launcher_show_error("Camera-buffer setup failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1066,14 +1063,14 @@ static void camera_application_start_task(void *arg)
     if (vision_ai_snapshot_buffer_init(data_cache_line_size) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to allocate %u-byte AI snapshot buffer",
                  (unsigned)vision_ai_snapshot_buffer_capacity());
-        app_ui_show_error("AI snapshot allocation failed. Restart the device.");
+        presentation_launcher_show_error("AI snapshot allocation failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
     if (vision_ai_inference_guard_init() != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create AI inference mutex");
-        app_ui_show_error("AI synchronization failed. Restart the device.");
+        presentation_launcher_show_error("AI synchronization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1090,6 +1087,11 @@ static void camera_application_start_task(void *arg)
 
     const vision_ai_worker_pipeline_hooks_t ai_worker_hooks = {
         .idle_scan_display_is_suspended = idle_scan_display_is_suspended,
+        .sleep_is_requested = power_manager_sleep_is_requested,
+        .camera_processing_blocked = authentication_session_blocks_camera,
+        .note_detection_result = authentication_session_note_detection_result,
+        .acquire_face_boost = system_cpu_face_boost_begin,
+        .notify_activity = power_manager_notify_activity,
         .recognition_started =
             authentication_flow_on_recognition_started,
         .request_pin = authentication_flow_request_pin,
@@ -1105,7 +1107,7 @@ static void camera_application_start_task(void *arg)
 
     if (!ai_created) {
         ESP_LOGE(TAG, "Failed to create asynchronous AI worker");
-        app_ui_show_error("AI worker creation failed. Restart the device.");
+        presentation_launcher_show_error("AI worker creation failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1121,20 +1123,20 @@ static void camera_application_start_task(void *arg)
     display_mode_mutex = xSemaphoreCreateMutex();
     if (!display_mode_mutex) {
         ESP_LOGE(TAG, "Failed to create display-mode mutex");
-        app_ui_show_error("Display synchronization failed. Restart the device.");
+        presentation_launcher_show_error("Display synchronization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
-    ret = app_video_register_frame_operation_cb(camera_video_frame_operation);
+    ret = system_camera_register_frame_callback(camera_video_frame_operation);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Frame callback registration failed: %s", esp_err_to_name(ret));
-        app_ui_show_error("Camera callback setup failed. Restart the device.");
+        presentation_launcher_show_error("Camera callback setup failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
-    app_ui_set_status("Starting live application...");
+    presentation_launcher_set_status("Starting live application...");
 
     /*
      * Start capture while dummy draw is still disabled. Any frame arriving in
@@ -1143,24 +1145,24 @@ static void camera_application_start_task(void *arg)
     ESP_LOGI(TAG,
              "[CORE-PROOF] Requesting video stream task on system CPU%d",
              APP_SYSTEM_WORKER_CORE);
-    ret = app_video_stream_task_start(
+    ret = system_camera_stream_start(
         video_cam_fd0, APP_SYSTEM_WORKER_CORE, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Video stream task failed: %s", esp_err_to_name(ret));
-        app_ui_show_error("Camera stream failed to start. Restart the device.");
+        presentation_launcher_show_error("Camera stream failed to start. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
     /* Hide the launcher before granting direct display ownership to camera. */
-    display_platform_backlight_off();
+    system_display_backlight_off();
     display_backlight_enabled = false;
 
     /*
      * Remove every launcher object while LVGL still owns the display. Dummy
      * draw is enabled only after the UI has been destroyed safely.
      */
-    app_ui_destroy();
+    presentation_launcher_destroy();
     vTaskDelay(pdMS_TO_TICKS(50));
 
     ret = esp_lv_adapter_set_dummy_draw(disp, true);
@@ -1171,7 +1173,7 @@ static void camera_application_start_task(void *arg)
     }
 
     dummy_draw_enabled = true;
-    display_platform_disable_lvgl_overlays(disp);
+    system_display_disable_lvgl_overlays(disp);
 
     /* Start the 30-second face-inactivity window with the camera application. */
     ret = power_manager_start_inactivity_policy();
@@ -1227,7 +1229,7 @@ void camera_session_launcher_start_requested(void *user_data)
     if (created != pdPASS) {
         application_start_requested = false;
         ESP_LOGE(TAG, "Failed to create camera startup task");
-        app_ui_show_error("Could not start application task. Restart the device.");
+        presentation_launcher_show_error("Could not start application task. Restart the device.");
     }
 }
 
@@ -1242,6 +1244,7 @@ esp_err_t camera_session_setup_power_management(void)
         .deep_sleep_state_requested =
             power_manager_on_deep_sleep_state_requested,
         .block_new_work = power_manager_block_new_work,
+        .drain_active_work = power_manager_drain_active_work,
         .release_face_boost = face_boost_release,
         .mark_backlight_off = power_manager_mark_backlight_off,
         .setup_error = power_manager_on_setup_error,
@@ -1293,8 +1296,8 @@ static void camera_video_frame_process(
     (void)camera_buf_index;
     (void)user_data;
 
-    const uint32_t display_width = display_platform_width();
-    const uint32_t display_height = display_platform_height();
+    const uint32_t display_width = system_display_width();
+    const uint32_t display_height = system_display_height();
     if (display_width == 0 || display_height == 0) {
         ESP_LOGE(TAG, "Display dimensions are invalid");
         return;
@@ -1336,7 +1339,7 @@ static void camera_video_frame_process(
             .in.block_h = camera_buf_ves,
             .in.block_offset_x = 0,
             .in.block_offset_y = 0,
-            .in.srm_cm = APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+            .in.srm_cm = system_camera_is_rgb565()
                 ? PPA_SRM_COLOR_MODE_RGB565 : PPA_SRM_COLOR_MODE_RGB888,
 
             .out.buffer = target_fb,
@@ -1345,7 +1348,7 @@ static void camera_video_frame_process(
             .out.pic_h = display_height,
             .out.block_offset_x = 0,
             .out.block_offset_y = 0,
-            .out.srm_cm = APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+            .out.srm_cm = system_camera_is_rgb565()
                 ? PPA_SRM_COLOR_MODE_RGB565 : PPA_SRM_COLOR_MODE_RGB888,
 
             .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
@@ -1364,7 +1367,7 @@ static void camera_video_frame_process(
             return;
         }
 
-#if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+if (system_camera_is_rgb565()) {
         face_box_t overlay_boxes[APP_MAX_FACE_BOXES] = {0};
         char overlay_names[APP_MAX_FACE_BOXES][FACE_RECOG_MAX_NAME_LEN] = {{0}};
 
@@ -1390,7 +1393,7 @@ static void camera_video_frame_process(
                     strcmp(overlay_names[i], "unknown") != 0;
                 const uint16_t overlay_color = recognized ? 0x07E0 : 0xF800;
 
-                face_overlay_renderer_draw_box_rgb565(
+                presentation_face_overlay_draw_box_rgb565(
                     (uint16_t *)target_fb,
                     display_width,
                     display_height,
@@ -1401,7 +1404,7 @@ static void camera_video_frame_process(
                     APP_FACE_BOX_THICKNESS,
                     overlay_color);
 
-                face_overlay_renderer_draw_label_rgb565(
+                presentation_face_overlay_draw_label_rgb565(
                     (uint16_t *)target_fb,
                     display_width,
                     display_height,
@@ -1414,7 +1417,7 @@ static void camera_video_frame_process(
             esp_cache_msync(target_fb, lcd_fb_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
 #endif
         }
-#endif
+}
 
         if (dummy_draw_enabled && !dummy_mode_delay_flag) {
             ret = esp_lv_adapter_dummy_draw_blit(
@@ -1435,7 +1438,7 @@ static void camera_video_frame_process(
                 (display_buffer_index + 1) % active_display_buffer_count;
 
             if (!display_backlight_enabled) {
-                display_platform_backlight_on();
+                system_display_backlight_on();
                 display_backlight_enabled = true;
             }
         }
@@ -1459,7 +1462,7 @@ static void camera_video_frame_process(
      * the CPU0 camera task spends milliseconds here instead of seconds.
      */
     const uint32_t detect_interval_frames =
-        cpu_power_get_face_detect_interval_frames();
+        system_cpu_face_detect_interval_frames();
 
     if (detect_interval_frames > 0 &&
         (frame_count % detect_interval_frames) == 0U) {

@@ -9,7 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
-#include "services/settings/app_settings.h"
+#include "app/configuration/app_configuration.h"
 
 static const char *TAG = "app_ui";
 
@@ -65,7 +65,7 @@ static void dispatch_start_request(void)
         return;
     }
 
-    const app_settings_snapshot_t settings = app_settings_get();
+    const app_configuration_snapshot_t settings = app_configuration_get();
     if (!settings.camera_enabled) {
         if (s_status_label) {
             lv_label_set_text(
@@ -163,7 +163,7 @@ void app_ui_create(
     s_user_data = user_data;
     s_action_dispatched = false;
 
-    const app_settings_snapshot_t settings = app_settings_get();
+    const app_configuration_snapshot_t settings = app_configuration_get();
     const bool dark = settings.dark_mode;
     const bool camera_ready = settings.camera_enabled;
 

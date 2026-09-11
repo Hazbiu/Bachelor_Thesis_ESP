@@ -1,3 +1,4 @@
+
 #include "services/settings/app_settings.h"
 
 #include <dirent.h>
@@ -12,9 +13,6 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
-#include "platform/power/component_ethernet.h"
-#include "services/power/component_runtime_policy.h"
-#include "platform/power/component_wifi.h"
 
 #define SETTINGS_NAMESPACE "app_settings"
 #define KEY_DARK_MODE       "dark"
@@ -210,21 +208,14 @@ esp_err_t app_settings_set_ethernet_enabled(bool enabled)
         return ESP_OK;
     }
 
-    esp_err_t ret = component_ethernet_set_enabled(enabled);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Ethernet state change failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = save_bool(KEY_ETHERNET, enabled);
+    const esp_err_t ret = save_bool(KEY_ETHERNET, enabled);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Could not save Ethernet setting: %s", esp_err_to_name(ret));
-        (void)component_ethernet_set_enabled(previous);
         return ret;
     }
 
     s_settings.ethernet_enabled = enabled;
-    ESP_LOGI(TAG, "Ethernet policy saved and applied: %s", enabled ? "on" : "off");
+    ESP_LOGI(TAG, "Ethernet saved: %s", enabled ? "on" : "off");
     return ESP_OK;
 }
 
@@ -235,21 +226,14 @@ esp_err_t app_settings_set_wifi_enabled(bool enabled)
         return ESP_OK;
     }
 
-    esp_err_t ret = component_wifi_set_enabled(enabled);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Wi-Fi state change failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = save_bool(KEY_WIFI, enabled);
+    const esp_err_t ret = save_bool(KEY_WIFI, enabled);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Could not save Wi-Fi setting: %s", esp_err_to_name(ret));
-        (void)component_wifi_set_enabled(previous);
         return ret;
     }
 
     s_settings.wifi_enabled = enabled;
-    ESP_LOGI(TAG, "Wi-Fi policy saved and applied: %s", enabled ? "on" : "off");
+    ESP_LOGI(TAG, "Wi-Fi saved: %s", enabled ? "on" : "off");
     return ESP_OK;
 }
 
@@ -282,21 +266,14 @@ esp_err_t app_settings_set_audio_enabled(bool enabled)
         return ESP_OK;
     }
 
-    esp_err_t ret = component_runtime_set_audio_enabled(enabled);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Audio state change failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = save_bool(KEY_AUDIO, enabled);
+    const esp_err_t ret = save_bool(KEY_AUDIO, enabled);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Could not save Audio setting: %s", esp_err_to_name(ret));
-        (void)component_runtime_set_audio_enabled(previous);
         return ret;
     }
 
     s_settings.audio_enabled = enabled;
-    ESP_LOGI(TAG, "Audio policy saved and applied: %s", enabled ? "on" : "off");
+    ESP_LOGI(TAG, "Audio saved: %s", enabled ? "on" : "off");
     return ESP_OK;
 }
 
@@ -307,21 +284,14 @@ esp_err_t app_settings_set_sdcard_enabled(bool enabled)
         return ESP_OK;
     }
 
-    esp_err_t ret = component_runtime_set_sdcard_enabled(enabled);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "microSD state change failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = save_bool(KEY_SDCARD, enabled);
+    const esp_err_t ret = save_bool(KEY_SDCARD, enabled);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Could not save microSD setting: %s", esp_err_to_name(ret));
-        (void)component_runtime_set_sdcard_enabled(previous);
         return ret;
     }
 
     s_settings.sdcard_enabled = enabled;
-    ESP_LOGI(TAG, "microSD policy saved and applied: %s", enabled ? "on" : "off");
+    ESP_LOGI(TAG, "microSD saved: %s", enabled ? "on" : "off");
     return ESP_OK;
 }
 
@@ -361,52 +331,6 @@ esp_err_t app_settings_set_deep_sleep_enabled(bool enabled)
     return ESP_OK;
 }
 
-esp_err_t app_settings_apply_power_policy(void)
-{
-    esp_err_t first_error = ESP_OK;
-
-    esp_err_t ret = component_wifi_set_enabled(s_settings.wifi_enabled);
-    if (ret != ESP_OK) {
-        first_error = ret;
-        ESP_LOGE(TAG, "Could not apply saved Wi-Fi policy: %s", esp_err_to_name(ret));
-    }
-
-    ret = component_ethernet_set_enabled(s_settings.ethernet_enabled);
-    if (ret != ESP_OK && first_error == ESP_OK) {
-        first_error = ret;
-    }
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Could not apply saved Ethernet policy: %s", esp_err_to_name(ret));
-    }
-
-    ret = component_runtime_set_sdcard_enabled(s_settings.sdcard_enabled);
-    if (ret != ESP_OK && first_error == ESP_OK) {
-        first_error = ret;
-    }
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Could not apply saved microSD policy: %s", esp_err_to_name(ret));
-    }
-
-    if (component_runtime_audio_policy_ready()) {
-        ret = component_runtime_set_audio_enabled(s_settings.audio_enabled);
-        if (ret != ESP_OK && first_error == ESP_OK) {
-            first_error = ret;
-        }
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Could not apply saved Audio policy: %s", esp_err_to_name(ret));
-        }
-    } else {
-        ESP_LOGI(TAG, "Saved Audio policy will be applied after display/I2C startup");
-    }
-
-    ESP_LOGI(
-        TAG,
-        "Camera policy applied: pipeline=%s",
-        s_settings.camera_enabled ? "available" : "blocked and uninitialized");
-
-    return first_error;
-}
-
 static bool is_directory_entry(const struct dirent *entry)
 {
     /* FAT directory entries are not required to expose d_type; use stat. */
@@ -437,30 +361,15 @@ esp_err_t app_settings_load_authorized_users(
 
     memset(users_out, 0, sizeof(*users_out));
 
-    const bool restore_saved_off_state = !s_settings.sdcard_enabled;
-    esp_err_t access_ret = component_runtime_set_sdcard_enabled(true);
-    if (access_ret != ESP_OK) {
-        ESP_LOGE(TAG, "Could not power/mount microSD for user refresh: %s",
-                 esp_err_to_name(access_ret));
-        return access_ret;
-    }
-
-    ESP_LOGI(
-        TAG,
-        "microSD ready for authorized-user refresh%s",
-        restore_saved_off_state ? " (temporary access)" : "");
-
+    /*
+     * Configuration Service only scans configuration data. Application Logic
+     * is responsible for temporarily enabling/mounting microSD when the saved
+     * storage policy is OFF.
+     */
     DIR *directory = opendir(ENROLLMENT_ROOT);
     if (directory == NULL) {
         const esp_err_t scan_ret = errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
         ESP_LOGE(TAG, "Could not open %s: errno=%d", ENROLLMENT_ROOT, errno);
-        if (restore_saved_off_state) {
-            const esp_err_t restore_ret = component_runtime_set_sdcard_enabled(false);
-            if (restore_ret != ESP_OK) {
-                ESP_LOGE(TAG, "Could not restore saved microSD OFF state: %s",
-                         esp_err_to_name(restore_ret));
-            }
-        }
         return scan_ret;
     }
 
@@ -496,16 +405,6 @@ esp_err_t app_settings_load_authorized_users(
 
     ESP_LOGI(TAG, "Authorized users refreshed from SD card: %u",
              (unsigned)users_out->count);
-
-    if (restore_saved_off_state) {
-        const esp_err_t restore_ret = component_runtime_set_sdcard_enabled(false);
-        if (restore_ret != ESP_OK) {
-            ESP_LOGE(TAG, "Could not restore saved microSD OFF state: %s",
-                     esp_err_to_name(restore_ret));
-            return restore_ret;
-        }
-        ESP_LOGI(TAG, "microSD returned to the saved OFF state after refresh");
-    }
 
     return ESP_OK;
 }

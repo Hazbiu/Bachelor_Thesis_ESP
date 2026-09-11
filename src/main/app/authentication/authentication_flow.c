@@ -1,3 +1,4 @@
+
 #include "app/authentication/authentication_flow.h"
 
 #include "app/controller/app_controller.h"
@@ -10,12 +11,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "platform/camera/video_capture.h"
-#include "services/authentication/authentication_session.h"
-#include "services/power/sleep/app_sleep.h"
+#include "domain/ports/system_adapters_port.h"
+#include "domain/ports/presentation_port.h"
+#include "app/authentication/authentication_session.h"
+#include "services/power/power_manager.h"
 #include "services/vision/face_recognizer.h"
 #include "services/vision/face_result_store.h"
-#include "pin_screen.h"
 
 
 static const char *TAG = "app_main";
@@ -111,7 +112,7 @@ static void camera_resume_task(void *arg)
     /* Leave the success state visible briefly before restoring live video. */
     vTaskDelay(pdMS_TO_TICKS(350));
 
-    if (app_sleep_is_requested()) {
+    if (power_manager_sleep_is_requested()) {
         vTaskDelete(NULL);
         return;
     }
@@ -129,7 +130,7 @@ static void camera_resume_task(void *arg)
      * frame callbacks. Only after the stream is healthy do we reopen the
      * camera/display path to normal frames.
      */
-    pin_screen_hide();
+    presentation_pin_hide();
     vTaskDelay(pdMS_TO_TICKS(10));
 
     esp_err_t ret = esp_lv_adapter_set_dummy_draw(authentication_display(), true);
@@ -146,7 +147,7 @@ static void camera_resume_task(void *arg)
     authentication_set_display_buffer_index(0);
     authentication_set_dummy_draw_enabled(true);
 
-    ret = app_video_stream_task_restart(authentication_video_fd());
+    ret = system_camera_stream_restart(authentication_video_fd());
     if (ret != ESP_OK) {
         authentication_set_dummy_draw_enabled(false);
         ESP_LOGE(TAG,
@@ -165,7 +166,7 @@ static void camera_resume_task(void *arg)
      *
      *     PIN_ENTRY -> CAMERA_ACTIVE
      *
-     * Dispatch this only after app_video_stream_task_restart()
+     * Dispatch this only after system_camera_stream_restart()
      * succeeds so the FSM reflects the real application state.
      */
     if (app_controller_handle_event(APP_EVENT_PIN_COMPLETE)) {
@@ -178,7 +179,7 @@ static void camera_resume_task(void *arg)
             "[APP-STATE] PIN_COMPLETE did not cause a transition");
     }
 
-    app_sleep_notify_face_detected();
+    power_manager_notify_activity();
     xSemaphoreGive(authentication_display_mode_mutex());
 
     ESP_LOGI(TAG, "PIN accepted; camera stream and display mode restored");
@@ -189,7 +190,7 @@ static void pin_accepted_callback(void *user_data)
 {
     (void)user_data;
 
-    if (app_sleep_is_requested()) {
+    if (power_manager_sleep_is_requested()) {
         return;
     }
 
@@ -219,7 +220,7 @@ static void pin_screen_transition_task(void *arg)
         return;
     }
 
-    if (app_sleep_is_requested()) {
+    if (power_manager_sleep_is_requested()) {
         authentication_mark_transition_failed();
         xSemaphoreGive(authentication_display_mode_mutex());
         vTaskDelete(NULL);
@@ -232,7 +233,7 @@ static void pin_screen_transition_task(void *arg)
      * input and prevents an old camera framebuffer/face box from being scanned
      * out underneath the PIN UI.
      */
-    esp_err_t ret = app_video_stream_task_stop(authentication_video_fd());
+    esp_err_t ret = system_camera_stream_stop(authentication_video_fd());
     if (ret != ESP_OK) {
         ESP_LOGE(TAG,
                  "Could not pause camera for PIN screen: %s",
@@ -251,7 +252,7 @@ static void pin_screen_transition_task(void *arg)
         ESP_LOGE(TAG,
                  "Could not enable LVGL PIN-screen mode: %s",
                  esp_err_to_name(ret));
-        (void)app_video_stream_task_restart(authentication_video_fd());
+        (void)system_camera_stream_restart(authentication_video_fd());
         authentication_mark_transition_failed();
         xSemaphoreGive(authentication_display_mode_mutex());
         vTaskDelete(NULL);
@@ -266,7 +267,7 @@ static void pin_screen_transition_task(void *arg)
         pending_identity,
         sizeof(pending_identity));
 
-    ret = pin_screen_show(
+    ret = presentation_pin_show(
         pending_identity,
         pin_accepted_callback,
         NULL);
@@ -276,7 +277,7 @@ static void pin_screen_transition_task(void *arg)
         esp_err_t restore_ret = esp_lv_adapter_set_dummy_draw(authentication_display(), true);
         if (restore_ret == ESP_OK) {
             authentication_set_dummy_draw_enabled(true);
-            (void)app_video_stream_task_restart(authentication_video_fd());
+            (void)system_camera_stream_restart(authentication_video_fd());
         } else {
             ESP_LOGE(TAG,
                      "Could not recover camera display mode: %s",
@@ -292,7 +293,7 @@ static void pin_screen_transition_task(void *arg)
     authentication_session_mark_pin_active();
 
     /*
-     * pin_screen_show() succeeded and completed its synchronous first
+     * presentation_pin_show() succeeded and completed its synchronous first
      * full-screen render, so the PIN UI now genuinely owns the application.
      *
      *     AUTHENTICATING -> PIN_ENTRY
@@ -308,7 +309,7 @@ static void pin_screen_transition_task(void *arg)
     }
 
     /*
-     * pin_screen_show() performs a synchronous full-screen LVGL refresh before
+     * presentation_pin_show() performs a synchronous full-screen LVGL refresh before
      * returning. Keep the 360 MHz AI boost through that refresh, then return to
      * the normal 180 MHz baseline exactly as before.
      */
@@ -340,7 +341,7 @@ bool authentication_flow_request_pin(const char *recognized_name)
      * Sleep remains an application/power concern.
      * Authentication state itself belongs to the session service.
      */
-    if (app_sleep_is_requested()) {
+    if (power_manager_sleep_is_requested()) {
         return false;
     }
 

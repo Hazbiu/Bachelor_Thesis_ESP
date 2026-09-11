@@ -1,4 +1,5 @@
-#include "services/authentication/authentication_session.h"
+
+#include "app/authentication/authentication_session.h"
 
 #include <string.h>
 

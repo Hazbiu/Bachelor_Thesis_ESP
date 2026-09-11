@@ -1,3 +1,4 @@
+
 #include "app/app_runtime.h"
 
 #include "app/camera/camera_session.h"
@@ -10,9 +11,9 @@
 #include "diagnostics/cpu_stats.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "platform/power/cpu_power.h"
+#include "domain/ports/system_adapters_port.h"
 #include "services/power/sleep/wake_up.h"
-#include "services/settings/app_settings.h"
+#include "app/configuration/app_configuration.h"
 
 
 static const char *TAG = "app_main";
@@ -24,14 +25,14 @@ void app_runtime_start(void)
 
     app_controller_init(NULL, NULL);
 
-    esp_err_t settings_ret = app_settings_init();
+    esp_err_t settings_ret = app_configuration_init();
     if (settings_ret != ESP_OK) {
         ESP_LOGE(TAG,
                  "Persistent settings unavailable; in-memory defaults are active: %s",
                  esp_err_to_name(settings_ret));
     }
 
-    esp_err_t power_policy_ret = app_settings_apply_power_policy();
+    esp_err_t power_policy_ret = app_configuration_apply_saved_policy();
     if (power_policy_ret != ESP_OK) {
         ESP_LOGE(TAG,
                  "Initial power policy application failed: %s",
@@ -46,7 +47,7 @@ void app_runtime_start(void)
     report_wake_reason();
     core_trace(TAG, "APP_MAIN_START");
 
-    esp_err_t cpu_power_ret = cpu_power_init();
+    esp_err_t cpu_power_ret = system_cpu_power_init();
     if (cpu_power_ret != ESP_OK) {
         ESP_LOGE(
             TAG,

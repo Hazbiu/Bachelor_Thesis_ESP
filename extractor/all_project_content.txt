@@ -1,6 +1,6 @@
 ESP32-P4 MAIN APPLICATION SOURCE EXPORT
 
-Generated on: Thu Sep 10 01:16:21 PM CEST 2026
+Generated on: Fri Sep 11 05:59:32 PM CEST 2026
 Project: /home/admin/Programming/Bachelor_Thesis_ESP
 Source directory: src/main/
 
@@ -8,21 +8,24 @@ Source directory: src/main/
 FILE COUNTS
 ============================================================
 
-C files       : 47
-Header files  : 58
+C files       : 51
+Header files  : 62
 C++ files     : 10
 Other files   : 2
-Total files   : 117
+Total files   : 125
 
 ============================================================
 FILE MANIFEST
 ============================================================
 
+src/main/app/activity/app_activity.c
 src/main/app/app_boot.c
 src/main/app/app_main.c
 src/main/app/app_runtime.c
 src/main/app/authentication/authentication_flow.c
+src/main/app/authentication/authentication_session.c
 src/main/app/camera/camera_session.c
+src/main/app/configuration/app_configuration.c
 src/main/app/controller/app_controller.c
 src/main/app/navigation/app_navigation.c
 src/main/app/state/app_state_machine.c
@@ -32,10 +35,13 @@ src/main/diagnostics/app_logging.c
 src/main/diagnostics/cpu_stats.c
 src/main/diagnostics/sleep_power_profile.c
 src/main/idf_component.yml
+src/main/include/app/activity/app_activity.h
 src/main/include/app/app_boot.h
 src/main/include/app/app_runtime.h
 src/main/include/app/authentication/authentication_flow.h
+src/main/include/app/authentication/authentication_session.h
 src/main/include/app/camera/camera_session.h
+src/main/include/app/configuration/app_configuration.h
 src/main/include/app/controller/app_controller.h
 src/main/include/app/navigation/app_navigation.h
 src/main/include/app/state/app_state_machine.h
@@ -51,6 +57,8 @@ src/main/include/diagnostics/cpu_stats.h
 src/main/include/diagnostics/sleep_power_profile.h
 src/main/include/domain/app_event.h
 src/main/include/domain/app_state.h
+src/main/include/domain/ports/presentation_port.h
+src/main/include/domain/ports/system_adapters_port.h
 src/main/include/platform/camera/camera_runtime.h
 src/main/include/platform/camera/video_capture.h
 src/main/include/platform/display/display_platform.h
@@ -62,7 +70,6 @@ src/main/include/platform/power/component_wifi.h
 src/main/include/platform/power/cpu_power.h
 src/main/include/platform/storage/sd_card_storage.h
 src/main/include/platform/storage/spiffs_storage.h
-src/main/include/services/authentication/authentication_session.h
 src/main/include/services/power/component_runtime_policy.h
 src/main/include/services/power/power_manager.h
 src/main/include/services/power/sleep/app_sleep.h
@@ -98,7 +105,7 @@ src/main/platform/power/component_wifi.c
 src/main/platform/power/cpu_power.c
 src/main/platform/storage/sd_card_storage.c
 src/main/platform/storage/spiffs_storage.c
-src/main/services/authentication/authentication_session.c
+src/main/platform/system/system_adapters_port.c
 src/main/services/power/component_runtime_policy.c
 src/main/services/power/power_manager.c
 src/main/services/power/sleep/app_sleep.c
@@ -127,6 +134,7 @@ src/main/services/vision/face_recognition_result_processor.c
 src/main/services/vision/face_result_store.c
 src/main/services/vision/recognition_policy.c
 src/main/services/vision/tflm/tflm_model_runner.cpp
+src/main/ui/presentation_port.c
 src/main/ui/renderers/face_overlay_renderer.c
 src/main/ui/renderers/face_overlay_renderer.h
 src/main/ui/views/app_ui.c
@@ -142,14 +150,28 @@ FILE CONTENTS
 
 
 ============================================================
+FILE: src/main/app/activity/app_activity.c
+============================================================
+
+#include "app/activity/app_activity.h"
+
+#include "services/power/power_manager.h"
+
+void app_activity_notify_user(void)
+{
+    power_manager_notify_activity();
+}
+
+
+============================================================
 FILE: src/main/app/app_boot.c
 ============================================================
+
 
 #include <stdio.h>
 
 #include "app/app_boot.h"
-#include "platform/storage/sd_card_storage.h"
-#include "platform/storage/spiffs_storage.h"
+#include "domain/ports/system_adapters_port.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "services/vision/face_detector.h"
@@ -160,11 +182,11 @@ static const char *TAG = "app_main";
 
 void app_boot_initialize_services(void)
 {
-    ESP_ERROR_CHECK(spiffs_storage_mount());
+    ESP_ERROR_CHECK(system_storage_spiffs_mount());
 
     /* SD CARD TEST */
     /* Settings may already have mounted the card to refresh authorized users. */
-    esp_err_t sd_ret = sd_card_storage_ensure_mounted();
+    esp_err_t sd_ret = system_storage_sdcard_ensure_mounted();
     if (sd_ret == ESP_OK) {
         ESP_LOGI(TAG, "SD card mounted at /sdcard");
 
@@ -226,6 +248,7 @@ void app_main(void)
 FILE: src/main/app/app_runtime.c
 ============================================================
 
+
 #include "app/app_runtime.h"
 
 #include "app/camera/camera_session.h"
@@ -238,9 +261,9 @@ FILE: src/main/app/app_runtime.c
 #include "diagnostics/cpu_stats.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "platform/power/cpu_power.h"
+#include "domain/ports/system_adapters_port.h"
 #include "services/power/sleep/wake_up.h"
-#include "services/settings/app_settings.h"
+#include "app/configuration/app_configuration.h"
 
 
 static const char *TAG = "app_main";
@@ -252,14 +275,14 @@ void app_runtime_start(void)
 
     app_controller_init(NULL, NULL);
 
-    esp_err_t settings_ret = app_settings_init();
+    esp_err_t settings_ret = app_configuration_init();
     if (settings_ret != ESP_OK) {
         ESP_LOGE(TAG,
                  "Persistent settings unavailable; in-memory defaults are active: %s",
                  esp_err_to_name(settings_ret));
     }
 
-    esp_err_t power_policy_ret = app_settings_apply_power_policy();
+    esp_err_t power_policy_ret = app_configuration_apply_saved_policy();
     if (power_policy_ret != ESP_OK) {
         ESP_LOGE(TAG,
                  "Initial power policy application failed: %s",
@@ -274,7 +297,7 @@ void app_runtime_start(void)
     report_wake_reason();
     core_trace(TAG, "APP_MAIN_START");
 
-    esp_err_t cpu_power_ret = cpu_power_init();
+    esp_err_t cpu_power_ret = system_cpu_power_init();
     if (cpu_power_ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -298,6 +321,7 @@ void app_runtime_start(void)
 FILE: src/main/app/authentication/authentication_flow.c
 ============================================================
 
+
 #include "app/authentication/authentication_flow.h"
 
 #include "app/controller/app_controller.h"
@@ -310,12 +334,12 @@ FILE: src/main/app/authentication/authentication_flow.c
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "platform/camera/video_capture.h"
-#include "services/authentication/authentication_session.h"
-#include "services/power/sleep/app_sleep.h"
+#include "domain/ports/system_adapters_port.h"
+#include "domain/ports/presentation_port.h"
+#include "app/authentication/authentication_session.h"
+#include "services/power/power_manager.h"
 #include "services/vision/face_recognizer.h"
 #include "services/vision/face_result_store.h"
-#include "pin_screen.h"
 
 
 static const char *TAG = "app_main";
@@ -411,7 +435,7 @@ static void camera_resume_task(void *arg)
     /* Leave the success state visible briefly before restoring live video. */
     vTaskDelay(pdMS_TO_TICKS(350));
 
-    if (app_sleep_is_requested()) {
+    if (power_manager_sleep_is_requested()) {
         vTaskDelete(NULL);
         return;
     }
@@ -429,7 +453,7 @@ static void camera_resume_task(void *arg)
      * frame callbacks. Only after the stream is healthy do we reopen the
      * camera/display path to normal frames.
      */
-    pin_screen_hide();
+    presentation_pin_hide();
     vTaskDelay(pdMS_TO_TICKS(10));
 
     esp_err_t ret = esp_lv_adapter_set_dummy_draw(authentication_display(), true);
@@ -446,7 +470,7 @@ static void camera_resume_task(void *arg)
     authentication_set_display_buffer_index(0);
     authentication_set_dummy_draw_enabled(true);
 
-    ret = app_video_stream_task_restart(authentication_video_fd());
+    ret = system_camera_stream_restart(authentication_video_fd());
     if (ret != ESP_OK) {
         authentication_set_dummy_draw_enabled(false);
         ESP_LOGE(TAG,
@@ -465,7 +489,7 @@ static void camera_resume_task(void *arg)
      *
      *     PIN_ENTRY -> CAMERA_ACTIVE
      *
-     * Dispatch this only after app_video_stream_task_restart()
+     * Dispatch this only after system_camera_stream_restart()
      * succeeds so the FSM reflects the real application state.
      */
     if (app_controller_handle_event(APP_EVENT_PIN_COMPLETE)) {
@@ -478,7 +502,7 @@ static void camera_resume_task(void *arg)
             "[APP-STATE] PIN_COMPLETE did not cause a transition");
     }
 
-    app_sleep_notify_face_detected();
+    power_manager_notify_activity();
     xSemaphoreGive(authentication_display_mode_mutex());
 
     ESP_LOGI(TAG, "PIN accepted; camera stream and display mode restored");
@@ -489,7 +513,7 @@ static void pin_accepted_callback(void *user_data)
 {
     (void)user_data;
 
-    if (app_sleep_is_requested()) {
+    if (power_manager_sleep_is_requested()) {
         return;
     }
 
@@ -519,7 +543,7 @@ static void pin_screen_transition_task(void *arg)
         return;
     }
 
-    if (app_sleep_is_requested()) {
+    if (power_manager_sleep_is_requested()) {
         authentication_mark_transition_failed();
         xSemaphoreGive(authentication_display_mode_mutex());
         vTaskDelete(NULL);
@@ -532,7 +556,7 @@ static void pin_screen_transition_task(void *arg)
      * input and prevents an old camera framebuffer/face box from being scanned
      * out underneath the PIN UI.
      */
-    esp_err_t ret = app_video_stream_task_stop(authentication_video_fd());
+    esp_err_t ret = system_camera_stream_stop(authentication_video_fd());
     if (ret != ESP_OK) {
         ESP_LOGE(TAG,
                  "Could not pause camera for PIN screen: %s",
@@ -551,7 +575,7 @@ static void pin_screen_transition_task(void *arg)
         ESP_LOGE(TAG,
                  "Could not enable LVGL PIN-screen mode: %s",
                  esp_err_to_name(ret));
-        (void)app_video_stream_task_restart(authentication_video_fd());
+        (void)system_camera_stream_restart(authentication_video_fd());
         authentication_mark_transition_failed();
         xSemaphoreGive(authentication_display_mode_mutex());
         vTaskDelete(NULL);
@@ -566,7 +590,7 @@ static void pin_screen_transition_task(void *arg)
         pending_identity,
         sizeof(pending_identity));
 
-    ret = pin_screen_show(
+    ret = presentation_pin_show(
         pending_identity,
         pin_accepted_callback,
         NULL);
@@ -576,7 +600,7 @@ static void pin_screen_transition_task(void *arg)
         esp_err_t restore_ret = esp_lv_adapter_set_dummy_draw(authentication_display(), true);
         if (restore_ret == ESP_OK) {
             authentication_set_dummy_draw_enabled(true);
-            (void)app_video_stream_task_restart(authentication_video_fd());
+            (void)system_camera_stream_restart(authentication_video_fd());
         } else {
             ESP_LOGE(TAG,
                      "Could not recover camera display mode: %s",
@@ -592,7 +616,7 @@ static void pin_screen_transition_task(void *arg)
     authentication_session_mark_pin_active();
 
     /*
-     * pin_screen_show() succeeded and completed its synchronous first
+     * presentation_pin_show() succeeded and completed its synchronous first
      * full-screen render, so the PIN UI now genuinely owns the application.
      *
      *     AUTHENTICATING -> PIN_ENTRY
@@ -608,7 +632,7 @@ static void pin_screen_transition_task(void *arg)
     }
 
     /*
-     * pin_screen_show() performs a synchronous full-screen LVGL refresh before
+     * presentation_pin_show() performs a synchronous full-screen LVGL refresh before
      * returning. Keep the 360 MHz AI boost through that refresh, then return to
      * the normal 180 MHz baseline exactly as before.
      */
@@ -640,7 +664,7 @@ bool authentication_flow_request_pin(const char *recognized_name)
      * Sleep remains an application/power concern.
      * Authentication state itself belongs to the session service.
      */
-    if (app_sleep_is_requested()) {
+    if (power_manager_sleep_is_requested()) {
         return false;
     }
 
@@ -715,6 +739,201 @@ void authentication_flow_on_recognition_not_authenticated(void)
 
 
 ============================================================
+FILE: src/main/app/authentication/authentication_session.c
+============================================================
+
+
+#include "app/authentication/authentication_session.h"
+
+#include <string.h>
+
+#include "config/app_config.h"
+#include "freertos/FreeRTOS.h"
+#include "services/vision/face_recognizer.h"
+
+static portMUX_TYPE s_authentication_lock =
+    portMUX_INITIALIZER_UNLOCKED;
+
+static bool s_pin_transition_pending = false;
+static bool s_pin_screen_active = false;
+static bool s_pin_rearm_required = false;
+static int s_pin_rearm_no_face_passes = 0;
+
+static char s_pending_identity[FACE_RECOG_MAX_NAME_LEN] = {0};
+
+
+bool authentication_session_blocks_camera(void)
+{
+    bool blocked;
+
+    portENTER_CRITICAL(&s_authentication_lock);
+
+    blocked =
+        s_pin_transition_pending ||
+        s_pin_screen_active;
+
+    portEXIT_CRITICAL(&s_authentication_lock);
+
+    return blocked;
+}
+
+
+bool authentication_session_note_detection_result(
+    int face_count)
+{
+    bool rearmed = false;
+
+    portENTER_CRITICAL(&s_authentication_lock);
+
+    if (face_count > 0) {
+        s_pin_rearm_no_face_passes = 0;
+    } else if (
+        s_pin_rearm_required &&
+        !s_pin_transition_pending &&
+        !s_pin_screen_active) {
+
+        s_pin_rearm_no_face_passes++;
+
+        if (s_pin_rearm_no_face_passes >=
+            APP_FACE_BOX_HOLD_MISSES) {
+
+            s_pin_rearm_required = false;
+            s_pin_rearm_no_face_passes = 0;
+            rearmed = true;
+        }
+    }
+
+    portEXIT_CRITICAL(&s_authentication_lock);
+
+    return rearmed;
+}
+
+
+bool authentication_session_reserve_pin_identity(
+    const char *recognized_name)
+{
+    if (recognized_name == NULL ||
+        recognized_name[0] == '\0' ||
+        strcmp(recognized_name, "unknown") == 0) {
+        return false;
+    }
+
+    bool reserved = false;
+
+    portENTER_CRITICAL(&s_authentication_lock);
+
+    if (!s_pin_transition_pending &&
+        !s_pin_screen_active &&
+        !s_pin_rearm_required) {
+
+        s_pin_transition_pending = true;
+        s_pin_rearm_required = true;
+        s_pin_rearm_no_face_passes = 0;
+
+        const size_t identity_length =
+            strnlen(
+                recognized_name,
+                sizeof(s_pending_identity) - 1);
+
+        memcpy(
+            s_pending_identity,
+            recognized_name,
+            identity_length);
+
+        s_pending_identity[identity_length] = '\0';
+
+        reserved = true;
+    }
+
+    portEXIT_CRITICAL(&s_authentication_lock);
+
+    return reserved;
+}
+
+
+void authentication_session_copy_pending_identity(
+    char *destination,
+    size_t destination_size)
+{
+    if (destination == NULL ||
+        destination_size == 0) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_authentication_lock);
+
+    const size_t identity_length =
+        strnlen(
+            s_pending_identity,
+            destination_size - 1);
+
+    memcpy(
+        destination,
+        s_pending_identity,
+        identity_length);
+
+    destination[identity_length] = '\0';
+
+    portEXIT_CRITICAL(&s_authentication_lock);
+}
+
+
+void authentication_session_mark_transition_failed(void)
+{
+    portENTER_CRITICAL(&s_authentication_lock);
+
+    s_pin_transition_pending = false;
+    s_pin_screen_active = false;
+
+    /*
+     * Preserve the existing rearm requirement.
+     */
+
+    portEXIT_CRITICAL(&s_authentication_lock);
+}
+
+
+void authentication_session_mark_pin_active(void)
+{
+    portENTER_CRITICAL(&s_authentication_lock);
+
+    s_pin_transition_pending = false;
+    s_pin_screen_active = true;
+
+    portEXIT_CRITICAL(&s_authentication_lock);
+}
+
+
+void authentication_session_mark_camera_active_after_pin(void)
+{
+    portENTER_CRITICAL(&s_authentication_lock);
+
+    s_pin_transition_pending = false;
+    s_pin_screen_active = false;
+
+    /*
+     * Authentication remains disarmed until the face leaves.
+     */
+
+    portEXIT_CRITICAL(&s_authentication_lock);
+}
+
+
+void authentication_session_reset(void)
+{
+    portENTER_CRITICAL(&s_authentication_lock);
+
+    s_pin_transition_pending = false;
+    s_pin_screen_active = false;
+    s_pin_rearm_required = false;
+    s_pin_rearm_no_face_passes = 0;
+    s_pending_identity[0] = '\0';
+
+    portEXIT_CRITICAL(&s_authentication_lock);
+}
+
+
+============================================================
 FILE: src/main/app/camera/camera_session.c
 ============================================================
 
@@ -724,7 +943,6 @@ FILE: src/main/app/camera/camera_session.c
 #include <string.h>
 #include "esp_err.h"
 #include "esp_log.h"
-#include "esp_video_init.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_cache.h"
@@ -733,9 +951,6 @@ FILE: src/main/app/camera/camera_session.c
 #include "esp_timer.h"
 #include "esp_system.h"
 #include "driver/ppa.h"
-#include "platform/camera/video_capture.h"
-#include "platform/camera/camera_runtime.h"
-#include "platform/display/display_platform.h"
 #include "services/vision/face_detector.h"
 #include "services/vision/face_recognizer.h"
 #include "services/vision/recognition_policy.h"
@@ -755,13 +970,12 @@ FILE: src/main/app/camera/camera_session.c
 #include "diagnostics/ai_pipeline_status.h"
 #include "app/app_boot.h"
 #include "app/camera/camera_session.h"
+#include "app/configuration/app_configuration.h"
+#include "domain/ports/presentation_port.h"
+#include "domain/ports/system_adapters_port.h"
 #include "app/controller/app_controller.h"
 #include "app/authentication/authentication_flow.h"
-#include "services/authentication/authentication_session.h"
-#include "app_ui.h"
-#include "settings_screen.h"
-#include "pin_screen.h"
-#include "renderers/face_overlay_renderer.h"
+#include "app/authentication/authentication_session.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "bsp/display.h"
@@ -773,14 +987,10 @@ FILE: src/main/app/camera/camera_session.c
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "platform/power/cpu_power.h"
 #include "config/app_config.h"
 #include "config/app_features.h"
 #include "config/log_config.h"
-#include "services/power/sleep/app_sleep.h"
-#include "services/power/component_runtime_policy.h"
 #include "services/power/power_manager.h"
-#include "services/settings/app_settings.h"
 
 #define ALIGN_UP(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
 
@@ -862,7 +1072,7 @@ esp_err_t camera_session_prepare_launcher_display(void)
      * Phase 1: normal LVGL rendering. The user sees a proper launcher and the
      * camera/AI pipeline is not initialized until Start Camera is pressed.
      */
-    disp = display_platform_start();
+    disp = system_display_start();
     if (!disp) {
         ESP_LOGE(TAG,
                  "Display/touch initialization failed. Check the selected Waveshare "
@@ -878,7 +1088,7 @@ esp_err_t camera_session_prepare_launcher_display(void)
     vTaskDelay(pdMS_TO_TICKS(150));
 
     /* The display startup creates the shared BSP I2C bus used by ES8311. */
-    esp_err_t post_display_policy_ret = app_settings_apply_power_policy();
+    esp_err_t post_display_policy_ret = app_configuration_apply_saved_policy();
     if (post_display_policy_ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -886,13 +1096,13 @@ esp_err_t camera_session_prepare_launcher_display(void)
             esp_err_to_name(post_display_policy_ret));
     }
 
-    display_platform_disable_lvgl_overlays(disp);
+    system_display_disable_lvgl_overlays(disp);
 
     /*
      * The BSP initializes GT911 and registers the LVGL input device inside
      * bsp_display_start(). Use the BSP-owned handle directly.
      */
-    launcher_touch_indev = display_platform_get_input_device();
+    launcher_touch_indev = system_display_get_input_device();
     if (launcher_touch_indev) {
         ESP_LOGI(TAG,
                  "BSP touchscreen ready: type=%d",
@@ -913,7 +1123,7 @@ bool camera_session_launcher_touch_ready(void)
 
 void camera_session_enable_launcher_backlight(void)
 {
-    display_platform_backlight_on();
+    system_display_backlight_on();
     display_backlight_enabled = true;
 }
 
@@ -1009,11 +1219,11 @@ static void trim_display_buffers_for_sleep(void)
 
 static esp_err_t face_boost_release(const char *reason)
 {
-    if (!cpu_power_is_face_boost_active()) {
+    if (!system_cpu_face_boost_is_active()) {
         return ESP_OK;
     }
 
-    esp_err_t ret = cpu_power_face_boost_end();
+    esp_err_t ret = system_cpu_face_boost_end();
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -1045,6 +1255,12 @@ static void power_manager_block_new_work(void)
     dummy_mode_delay_flag = true;
 }
 
+
+static bool power_manager_drain_active_work(uint32_t timeout_ms)
+{
+    return vision_ai_worker_state_pause_and_drain(timeout_ms);
+}
+
 static void power_manager_mark_backlight_off(void)
 {
     /*
@@ -1053,7 +1269,7 @@ static void power_manager_mark_backlight_off(void)
      * the panel/DSI transport is already suspended, so request the physical
      * backlight OFF here rather than updating only the software shadow.
      */
-    display_platform_backlight_off();
+    system_display_backlight_off();
     display_backlight_enabled = false;
     ESP_LOGI(
         TAG,
@@ -1070,7 +1286,7 @@ static void power_manager_on_setup_error(
             TAG,
             "Failed to register Light-sleep transitions: %s",
             esp_err_to_name(error));
-        app_ui_show_error(
+        presentation_launcher_show_error(
             "Light-sleep setup failed. Restart the device.");
         break;
 
@@ -1079,7 +1295,7 @@ static void power_manager_on_setup_error(
             TAG,
             "Failed to register adaptive IDLE-SCAN transitions: %s",
             esp_err_to_name(error));
-        app_ui_show_error(
+        presentation_launcher_show_error(
             "Adaptive CPU power setup failed. Restart the device.");
         break;
 
@@ -1088,7 +1304,7 @@ static void power_manager_on_setup_error(
             TAG,
             "Failed to start deep-sleep button monitor: %s",
             esp_err_to_name(error));
-        app_ui_show_error(
+        presentation_launcher_show_error(
             "Deep-sleep button task failed. Restart the device.");
         break;
 
@@ -1112,14 +1328,14 @@ static void idle_scan_touch_poll_task(void *arg)
 
     /* Discard a coordinate consumed immediately before LVGL was stopped. */
     bool touched = false;
-    (void)display_platform_poll_touch_for_light_sleep(&touched);
+    (void)system_display_poll_touch_for_light_sleep(&touched);
 
     while (idle_scan_display_is_suspended() &&
            !display_suspended_for_light_sleep &&
-           !app_sleep_is_requested()) {
+           !power_manager_sleep_is_requested()) {
         vTaskDelay(pdMS_TO_TICKS(APP_LIGHT_SLEEP_TOUCH_POLL_MS));
 
-        esp_err_t ret = display_platform_poll_touch_for_light_sleep(&touched);
+        esp_err_t ret = system_display_poll_touch_for_light_sleep(&touched);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "IDLE-SCAN touch polling failed: %s",
                      esp_err_to_name(ret));
@@ -1128,7 +1344,7 @@ static void idle_scan_touch_poll_task(void *arg)
 
         if (touched) {
             ESP_LOGI(TAG, "IDLE-SCAN touchscreen activity detected");
-            app_sleep_notify_face_detected();
+            power_manager_notify_activity();
             break;
         }
     }
@@ -1157,10 +1373,10 @@ static esp_err_t suspend_display_for_idle_scan(void *user_data)
     ESP_LOGI(TAG, "IDLE-SCAN suspending LVGL and MIPI-DSI; camera stays active");
 
     dummy_mode_delay_flag = true;
-    display_platform_backlight_off();
+    system_display_backlight_off();
     display_backlight_enabled = false;
 
-    esp_err_t ret = display_platform_suspend_for_light_sleep(false);
+    esp_err_t ret = system_display_suspend_for_light_sleep(false);
     if (ret != ESP_OK) {
         xSemaphoreGive(display_mode_mutex);
         ESP_LOGE(TAG, "IDLE-SCAN display suspend failed: %s",
@@ -1220,7 +1436,7 @@ static void resume_display_from_idle_scan_task(void *arg)
 
     if (!idle_scan_display_is_suspended() ||
         display_suspended_for_light_sleep ||
-        app_sleep_is_requested()) {
+        power_manager_sleep_is_requested()) {
         portENTER_CRITICAL(&idle_scan_state_lock);
         idle_scan_resume_task_pending = false;
         portEXIT_CRITICAL(&idle_scan_state_lock);
@@ -1242,7 +1458,7 @@ static void resume_display_from_idle_scan_task(void *arg)
      * restore the complete display stack, then restart the same camera task.
      */
     ESP_LOGI(TAG, "ACTIVE pausing camera DMA before MIPI-DSI restoration");
-    esp_err_t ret = app_video_stream_task_stop(video_cam_fd0);
+    esp_err_t ret = system_camera_stream_stop(video_cam_fd0);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "ACTIVE camera pause before display restore failed: %s",
                  esp_err_to_name(ret));
@@ -1251,7 +1467,7 @@ static void resume_display_from_idle_scan_task(void *arg)
     }
 
     log_psram_state("before_bsp_display_resume");
-    disp = display_platform_resume_from_light_sleep();
+    disp = system_display_resume_from_light_sleep();
     if (disp == NULL) {
         ESP_LOGE(TAG, "ACTIVE display restoration failed");
         xSemaphoreGive(display_mode_mutex);
@@ -1260,7 +1476,7 @@ static void resume_display_from_idle_scan_task(void *arg)
 
     log_psram_state("after_bsp_display_resume");
     vTaskDelay(pdMS_TO_TICKS(150));
-    launcher_touch_indev = display_platform_get_input_device();
+    launcher_touch_indev = system_display_get_input_device();
 
     ret = allocate_display_buffers();
     if (ret != ESP_OK) {
@@ -1280,10 +1496,10 @@ static void resume_display_from_idle_scan_task(void *arg)
 
     dummy_draw_enabled = true;
     display_buffer_index = 0;
-    display_platform_disable_lvgl_overlays(disp);
+    system_display_disable_lvgl_overlays(disp);
     vision_face_result_store_clear();
 
-    ret = app_video_stream_task_restart(video_cam_fd0);
+    ret = system_camera_stream_restart(video_cam_fd0);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "ACTIVE camera restart after display restore failed: %s",
                  esp_err_to_name(ret));
@@ -1305,7 +1521,7 @@ static void resume_display_from_idle_scan_task(void *arg)
         TAG,
         "ACTIVE camera display restored; baseline=%d MHz boost=%s",
         APP_CPU_ACTIVE_FREQ_MHZ,
-        cpu_power_is_face_boost_active() ? "on" : "off");
+        system_cpu_face_boost_is_active() ? "on" : "off");
     vTaskDelete(NULL);
 }
 
@@ -1361,11 +1577,11 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
 
     /*
      * The worker may have found a face while this callback waited for a long
-     * FP32 inference to finish. In that case app_sleep_notify_face_detected()
+     * FP32 inference to finish. In that case power_manager_notify_activity()
      * reset the inactivity timer, so cancel the claimed Light-sleep before any
      * display/camera hardware is destroyed.
      */
-    if (!app_sleep_light_sleep_is_due()) {
+    if (!power_manager_light_sleep_is_due()) {
         vision_ai_worker_state_resume_accepting();
         ESP_LOGI(TAG, "Light-sleep canceled because AI/user activity arrived");
         return ESP_ERR_INVALID_STATE;
@@ -1394,7 +1610,7 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
     dummy_mode_delay_flag = true;
     ESP_LOGI(TAG, "Light-sleep display barrier acquired; stopping camera");
 
-    esp_err_t ret = app_video_stream_task_stop(video_cam_fd0);
+    esp_err_t ret = system_camera_stream_stop(video_cam_fd0);
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -1404,7 +1620,7 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
         return ret;
     }
 
-    ret = app_video_prepare_sensor_for_light_sleep();
+    ret = system_camera_prepare_sensor_for_light_sleep();
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -1435,7 +1651,7 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
          * panel handle is alive, then tear down MIPI-DSI/LVGL. Deep enablement
          * changes only what happens AFTER the Light-sleep residency window.
          */
-        ret = display_platform_suspend_for_light_sleep(true);
+        ret = system_display_suspend_for_light_sleep(true);
         if (ret == ESP_OK) {
             trim_display_buffers_for_sleep();
         }
@@ -1448,7 +1664,7 @@ static esp_err_t suspend_application_for_light_sleep(void *user_data)
          * accepted SLEEP_IN and MIPI-DSI/LVGL were suspended. No framebuffer,
          * panel scanout, camera stream or AI work is restarted here.
          */
-        display_platform_backlight_on();
+        system_display_backlight_on();
         display_backlight_enabled = true;
         ESP_LOGI(
             TAG,
@@ -1519,7 +1735,7 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
      * The normal first complete camera frame will turn the backlight on again,
      * preserving the existing tear-free wake behavior.
      */
-    display_platform_backlight_off();
+    system_display_backlight_off();
     display_backlight_enabled = false;
     ESP_LOGI(
         TAG,
@@ -1529,7 +1745,7 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
     ESP_LOGI(TAG, "Restoring MIPI-DSI and camera after Light-sleep activity");
 
     log_psram_state("before_bsp_display_resume");
-    disp = display_platform_resume_from_light_sleep();
+    disp = system_display_resume_from_light_sleep();
     if (disp == NULL) {
         ESP_LOGE(TAG, "Display reinitialization after Light-sleep failed");
         xSemaphoreGive(display_mode_mutex);
@@ -1538,7 +1754,7 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
 
     log_psram_state("after_bsp_display_resume");
     vTaskDelay(pdMS_TO_TICKS(150));
-    launcher_touch_indev = display_platform_get_input_device();
+    launcher_touch_indev = system_display_get_input_device();
 
     esp_err_t ret = allocate_display_buffers();
     if (ret != ESP_OK) {
@@ -1560,9 +1776,9 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
 
     dummy_draw_enabled = true;
     display_buffer_index = 0;
-    display_platform_disable_lvgl_overlays(disp);
+    system_display_disable_lvgl_overlays(disp);
 
-    ret = app_video_restore_sensor_after_light_sleep();
+    ret = system_camera_restore_sensor_after_light_sleep();
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -1572,7 +1788,7 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
         return ret;
     }
 
-    ret = app_video_stream_task_restart(video_cam_fd0);
+    ret = system_camera_stream_restart(video_cam_fd0);
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -1592,7 +1808,7 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
     xSemaphoreGive(display_mode_mutex);
 
     /* Light-sleep restores generic peripherals; reassert saved OFF policies. */
-    ret = app_settings_apply_power_policy();
+    ret = app_configuration_apply_saved_policy();
     if (ret != ESP_OK) {
         ESP_LOGE(
             TAG,
@@ -1630,27 +1846,27 @@ static void camera_application_start_task(void *arg)
     esp_err_t ret;
 
     /* Re-apply saved component states immediately before Active camera mode. */
-    ret = app_settings_apply_power_policy();
+    ret = app_configuration_apply_saved_policy();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Saved power policy could not be applied: %s",
                  esp_err_to_name(ret));
-        app_ui_show_error(
+        presentation_launcher_show_error(
             "Power setting could not be applied. Check the serial log and restart.");
         application_start_requested = false;
         vTaskDelete(NULL);
         return;
     }
 
-    const app_settings_snapshot_t settings = app_settings_get();
+    const app_configuration_snapshot_t settings = app_configuration_get();
     if (!settings.camera_enabled) {
         ESP_LOGW(TAG, "Camera start blocked by the saved Camera OFF policy");
-        app_ui_show_error("Camera is disabled. Enable it in Settings first.");
+        presentation_launcher_show_error("Camera is disabled. Enable it in Settings first.");
         application_start_requested = false;
         vTaskDelete(NULL);
         return;
     }
 
-    app_ui_set_status("Initializing display accelerator...");
+    presentation_launcher_set_status("Initializing display accelerator...");
 
     ppa_client_config_t ppa_srm_config = {
         .oper_type = PPA_OPERATION_SRM,
@@ -1659,12 +1875,12 @@ static void camera_application_start_task(void *arg)
     ret = ppa_register_client(&ppa_srm_config, &ppa_srm_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "PPA client registration failed: %s", esp_err_to_name(ret));
-        app_ui_show_error("PPA initialization failed. Restart the device.");
+        presentation_launcher_show_error("PPA initialization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
-    app_ui_set_status("Initializing face detection and recognition...");
+    presentation_launcher_set_status("Initializing face detection and recognition...");
 
     /*
      * Models, enrollment images and the recognition database are loaded from
@@ -1674,11 +1890,11 @@ static void camera_application_start_task(void *arg)
      */
     const bool restore_sdcard_off_after_ai_init = !settings.sdcard_enabled;
     if (restore_sdcard_off_after_ai_init) {
-        ret = component_runtime_set_sdcard_enabled(true);
+        ret = power_manager_set_sdcard_enabled(true);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Temporary microSD startup access failed: %s",
                      esp_err_to_name(ret));
-            app_ui_show_error(
+            presentation_launcher_show_error(
                 "microSD could not be powered for AI initialization.");
             application_start_requested = false;
             vTaskDelete(NULL);
@@ -1694,11 +1910,11 @@ static void camera_application_start_task(void *arg)
     app_boot_initialize_services();
 
     if (restore_sdcard_off_after_ai_init) {
-        ret = component_runtime_set_sdcard_enabled(false);
+        ret = power_manager_set_sdcard_enabled(false);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Could not restore saved microSD OFF state: %s",
                      esp_err_to_name(ret));
-            app_ui_show_error(
+            presentation_launcher_show_error(
                 "AI loaded, but microSD could not be powered down safely.");
             application_start_requested = false;
             vTaskDelete(NULL);
@@ -1714,39 +1930,39 @@ static void camera_application_start_task(void *arg)
     ret = esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Cache alignment query failed: %s", esp_err_to_name(ret));
-        app_ui_show_error("Memory initialization failed. Restart the device.");
+        presentation_launcher_show_error("Memory initialization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
     lcd_fb_size = ALIGN_UP(
-        (size_t)display_platform_width() * display_platform_height() *
-            (APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565 ? 2 : 3),
+        (size_t)system_display_width() * system_display_height() *
+            system_camera_bytes_per_pixel(),
         data_cache_line_size);
 
-    app_ui_set_status("Opening camera...");
+    presentation_launcher_set_status("Opening camera...");
 
-    ret = camera_runtime_initialize();
+    ret = system_camera_initialize();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Video initialization failed: %s", esp_err_to_name(ret));
-        app_ui_show_error("Camera initialization failed. Restart the device.");
+        presentation_launcher_show_error("Camera initialization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
-    video_cam_fd0 = app_video_open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, APP_VIDEO_FMT);
+    video_cam_fd0 = system_camera_open_default();
     if (video_cam_fd0 < 0) {
         ESP_LOGE(TAG, "Video camera open failed");
-        app_ui_show_error("Camera could not be opened. Restart the device.");
+        presentation_launcher_show_error("Camera could not be opened. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
-    app_ui_set_status("Allocating camera buffers...");
+    presentation_launcher_set_status("Allocating camera buffers...");
 
     ret = allocate_display_buffers();
     if (ret != ESP_OK) {
-        app_ui_show_error("Display-buffer allocation failed. Restart the device.");
+        presentation_launcher_show_error("Display-buffer allocation failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1761,24 +1977,24 @@ static void camera_application_start_task(void *arg)
         camera_buf[i] = heap_caps_aligned_calloc(
             data_cache_line_size,
             1,
-            app_video_get_buf_size(),
+            system_camera_buffer_size(),
             MALLOC_CAP_SPIRAM);
 
         if (!camera_buf[i]) {
             ESP_LOGE(TAG, "Failed to allocate camera buffer %d", i);
-            app_ui_show_error("Camera-buffer allocation failed. Restart the device.");
+            presentation_launcher_show_error("Camera-buffer allocation failed. Restart the device.");
             vTaskDelete(NULL);
             return;
         }
     }
 
-    ret = app_video_set_bufs(
+    ret = system_camera_set_buffers(
         video_cam_fd0,
         APP_CAMERA_BUFFER_COUNT,
         (const void **)camera_buf);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Camera buffer setup failed: %s", esp_err_to_name(ret));
-        app_ui_show_error("Camera-buffer setup failed. Restart the device.");
+        presentation_launcher_show_error("Camera-buffer setup failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1786,14 +2002,14 @@ static void camera_application_start_task(void *arg)
     if (vision_ai_snapshot_buffer_init(data_cache_line_size) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to allocate %u-byte AI snapshot buffer",
                  (unsigned)vision_ai_snapshot_buffer_capacity());
-        app_ui_show_error("AI snapshot allocation failed. Restart the device.");
+        presentation_launcher_show_error("AI snapshot allocation failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
     if (vision_ai_inference_guard_init() != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create AI inference mutex");
-        app_ui_show_error("AI synchronization failed. Restart the device.");
+        presentation_launcher_show_error("AI synchronization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1810,6 +2026,11 @@ static void camera_application_start_task(void *arg)
 
     const vision_ai_worker_pipeline_hooks_t ai_worker_hooks = {
         .idle_scan_display_is_suspended = idle_scan_display_is_suspended,
+        .sleep_is_requested = power_manager_sleep_is_requested,
+        .camera_processing_blocked = authentication_session_blocks_camera,
+        .note_detection_result = authentication_session_note_detection_result,
+        .acquire_face_boost = system_cpu_face_boost_begin,
+        .notify_activity = power_manager_notify_activity,
         .recognition_started =
             authentication_flow_on_recognition_started,
         .request_pin = authentication_flow_request_pin,
@@ -1825,7 +2046,7 @@ static void camera_application_start_task(void *arg)
 
     if (!ai_created) {
         ESP_LOGE(TAG, "Failed to create asynchronous AI worker");
-        app_ui_show_error("AI worker creation failed. Restart the device.");
+        presentation_launcher_show_error("AI worker creation failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1841,20 +2062,20 @@ static void camera_application_start_task(void *arg)
     display_mode_mutex = xSemaphoreCreateMutex();
     if (!display_mode_mutex) {
         ESP_LOGE(TAG, "Failed to create display-mode mutex");
-        app_ui_show_error("Display synchronization failed. Restart the device.");
+        presentation_launcher_show_error("Display synchronization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
-    ret = app_video_register_frame_operation_cb(camera_video_frame_operation);
+    ret = system_camera_register_frame_callback(camera_video_frame_operation);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Frame callback registration failed: %s", esp_err_to_name(ret));
-        app_ui_show_error("Camera callback setup failed. Restart the device.");
+        presentation_launcher_show_error("Camera callback setup failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
-    app_ui_set_status("Starting live application...");
+    presentation_launcher_set_status("Starting live application...");
 
     /*
      * Start capture while dummy draw is still disabled. Any frame arriving in
@@ -1863,24 +2084,24 @@ static void camera_application_start_task(void *arg)
     ESP_LOGI(TAG,
              "[CORE-PROOF] Requesting video stream task on system CPU%d",
              APP_SYSTEM_WORKER_CORE);
-    ret = app_video_stream_task_start(
+    ret = system_camera_stream_start(
         video_cam_fd0, APP_SYSTEM_WORKER_CORE, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Video stream task failed: %s", esp_err_to_name(ret));
-        app_ui_show_error("Camera stream failed to start. Restart the device.");
+        presentation_launcher_show_error("Camera stream failed to start. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
     /* Hide the launcher before granting direct display ownership to camera. */
-    display_platform_backlight_off();
+    system_display_backlight_off();
     display_backlight_enabled = false;
 
     /*
      * Remove every launcher object while LVGL still owns the display. Dummy
      * draw is enabled only after the UI has been destroyed safely.
      */
-    app_ui_destroy();
+    presentation_launcher_destroy();
     vTaskDelay(pdMS_TO_TICKS(50));
 
     ret = esp_lv_adapter_set_dummy_draw(disp, true);
@@ -1891,7 +2112,7 @@ static void camera_application_start_task(void *arg)
     }
 
     dummy_draw_enabled = true;
-    display_platform_disable_lvgl_overlays(disp);
+    system_display_disable_lvgl_overlays(disp);
 
     /* Start the 30-second face-inactivity window with the camera application. */
     ret = power_manager_start_inactivity_policy();
@@ -1947,7 +2168,7 @@ void camera_session_launcher_start_requested(void *user_data)
     if (created != pdPASS) {
         application_start_requested = false;
         ESP_LOGE(TAG, "Failed to create camera startup task");
-        app_ui_show_error("Could not start application task. Restart the device.");
+        presentation_launcher_show_error("Could not start application task. Restart the device.");
     }
 }
 
@@ -1962,6 +2183,7 @@ esp_err_t camera_session_setup_power_management(void)
         .deep_sleep_state_requested =
             power_manager_on_deep_sleep_state_requested,
         .block_new_work = power_manager_block_new_work,
+        .drain_active_work = power_manager_drain_active_work,
         .release_face_boost = face_boost_release,
         .mark_backlight_off = power_manager_mark_backlight_off,
         .setup_error = power_manager_on_setup_error,
@@ -2013,8 +2235,8 @@ static void camera_video_frame_process(
     (void)camera_buf_index;
     (void)user_data;
 
-    const uint32_t display_width = display_platform_width();
-    const uint32_t display_height = display_platform_height();
+    const uint32_t display_width = system_display_width();
+    const uint32_t display_height = system_display_height();
     if (display_width == 0 || display_height == 0) {
         ESP_LOGE(TAG, "Display dimensions are invalid");
         return;
@@ -2056,7 +2278,7 @@ static void camera_video_frame_process(
             .in.block_h = camera_buf_ves,
             .in.block_offset_x = 0,
             .in.block_offset_y = 0,
-            .in.srm_cm = APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+            .in.srm_cm = system_camera_is_rgb565()
                 ? PPA_SRM_COLOR_MODE_RGB565 : PPA_SRM_COLOR_MODE_RGB888,
 
             .out.buffer = target_fb,
@@ -2065,7 +2287,7 @@ static void camera_video_frame_process(
             .out.pic_h = display_height,
             .out.block_offset_x = 0,
             .out.block_offset_y = 0,
-            .out.srm_cm = APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+            .out.srm_cm = system_camera_is_rgb565()
                 ? PPA_SRM_COLOR_MODE_RGB565 : PPA_SRM_COLOR_MODE_RGB888,
 
             .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
@@ -2084,7 +2306,7 @@ static void camera_video_frame_process(
             return;
         }
 
-#if APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565
+if (system_camera_is_rgb565()) {
         face_box_t overlay_boxes[APP_MAX_FACE_BOXES] = {0};
         char overlay_names[APP_MAX_FACE_BOXES][FACE_RECOG_MAX_NAME_LEN] = {{0}};
 
@@ -2110,7 +2332,7 @@ static void camera_video_frame_process(
                     strcmp(overlay_names[i], "unknown") != 0;
                 const uint16_t overlay_color = recognized ? 0x07E0 : 0xF800;
 
-                face_overlay_renderer_draw_box_rgb565(
+                presentation_face_overlay_draw_box_rgb565(
                     (uint16_t *)target_fb,
                     display_width,
                     display_height,
@@ -2121,7 +2343,7 @@ static void camera_video_frame_process(
                     APP_FACE_BOX_THICKNESS,
                     overlay_color);
 
-                face_overlay_renderer_draw_label_rgb565(
+                presentation_face_overlay_draw_label_rgb565(
                     (uint16_t *)target_fb,
                     display_width,
                     display_height,
@@ -2134,7 +2356,7 @@ static void camera_video_frame_process(
             esp_cache_msync(target_fb, lcd_fb_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
 #endif
         }
-#endif
+}
 
         if (dummy_draw_enabled && !dummy_mode_delay_flag) {
             ret = esp_lv_adapter_dummy_draw_blit(
@@ -2155,7 +2377,7 @@ static void camera_video_frame_process(
                 (display_buffer_index + 1) % active_display_buffer_count;
 
             if (!display_backlight_enabled) {
-                display_platform_backlight_on();
+                system_display_backlight_on();
                 display_backlight_enabled = true;
             }
         }
@@ -2179,7 +2401,7 @@ static void camera_video_frame_process(
      * the CPU0 camera task spends milliseconds here instead of seconds.
      */
     const uint32_t detect_interval_frames =
-        cpu_power_get_face_detect_interval_frames();
+        system_cpu_face_detect_interval_frames();
 
     if (detect_interval_frames > 0 &&
         (frame_count % detect_interval_frames) == 0U) {
@@ -2191,6 +2413,244 @@ static void camera_video_frame_process(
             frame_count,
             idle_scan_frame);
     }
+}
+
+
+============================================================
+FILE: src/main/app/configuration/app_configuration.c
+============================================================
+
+#include "app/configuration/app_configuration.h"
+
+#include <string.h>
+
+#include "esp_log.h"
+#include "services/power/power_manager.h"
+#include "services/settings/app_settings.h"
+
+static const char *TAG = "app_configuration";
+
+_Static_assert(
+    APP_CONFIGURATION_MAX_AUTHORIZED_USERS == APP_SETTINGS_MAX_AUTHORIZED_USERS,
+    "Application/configuration authorized-user capacity must match the service");
+_Static_assert(
+    APP_CONFIGURATION_MAX_USER_NAME_LENGTH == APP_SETTINGS_MAX_USER_NAME_LENGTH,
+    "Application/configuration user-name size must match the service");
+
+static app_configuration_snapshot_t from_service(
+    const app_settings_snapshot_t settings)
+{
+    const app_configuration_snapshot_t configuration = {
+        .dark_mode = settings.dark_mode,
+        .ethernet_enabled = settings.ethernet_enabled,
+        .wifi_enabled = settings.wifi_enabled,
+        .camera_enabled = settings.camera_enabled,
+        .audio_enabled = settings.audio_enabled,
+        .sdcard_enabled = settings.sdcard_enabled,
+        .light_sleep_enabled = settings.light_sleep_enabled,
+        .deep_sleep_enabled = settings.deep_sleep_enabled,
+    };
+    return configuration;
+}
+
+static power_manager_configuration_t to_power_configuration(
+    const app_settings_snapshot_t settings)
+{
+    const power_manager_configuration_t configuration = {
+        .ethernet_enabled = settings.ethernet_enabled,
+        .wifi_enabled = settings.wifi_enabled,
+        .audio_enabled = settings.audio_enabled,
+        .sdcard_enabled = settings.sdcard_enabled,
+        .light_sleep_enabled = settings.light_sleep_enabled,
+        .deep_sleep_enabled = settings.deep_sleep_enabled,
+    };
+    return configuration;
+}
+
+esp_err_t app_configuration_init(void)
+{
+    const esp_err_t ret = app_settings_init();
+
+    /* Keep Power Management synchronized even when NVS is unavailable and
+     * Configuration Service falls back to its in-memory defaults. */
+    const app_settings_snapshot_t settings = app_settings_get();
+    power_manager_set_sleep_modes(
+        settings.light_sleep_enabled,
+        settings.deep_sleep_enabled);
+
+    return ret;
+}
+
+app_configuration_snapshot_t app_configuration_get(void)
+{
+    return from_service(app_settings_get());
+}
+
+esp_err_t app_configuration_apply_saved_policy(void)
+{
+    const app_settings_snapshot_t settings = app_settings_get();
+    const power_manager_configuration_t power = to_power_configuration(settings);
+    const esp_err_t ret = power_manager_apply_configuration(&power);
+
+    ESP_LOGI(
+        TAG,
+        "Camera policy applied: pipeline=%s",
+        settings.camera_enabled ? "available" : "blocked and uninitialized");
+
+    return ret;
+}
+
+esp_err_t app_configuration_set_dark_mode(bool enabled)
+{
+    return app_settings_set_dark_mode(enabled);
+}
+
+esp_err_t app_configuration_set_camera_enabled(bool enabled)
+{
+    return app_settings_set_camera_enabled(enabled);
+}
+
+esp_err_t app_configuration_set_ethernet_enabled(bool enabled)
+{
+    const app_settings_snapshot_t previous = app_settings_get();
+    if (previous.ethernet_enabled == enabled) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = power_manager_set_ethernet_enabled(enabled);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = app_settings_set_ethernet_enabled(enabled);
+    if (ret != ESP_OK) {
+        (void)power_manager_set_ethernet_enabled(previous.ethernet_enabled);
+    }
+    return ret;
+}
+
+esp_err_t app_configuration_set_wifi_enabled(bool enabled)
+{
+    const app_settings_snapshot_t previous = app_settings_get();
+    if (previous.wifi_enabled == enabled) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = power_manager_set_wifi_enabled(enabled);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = app_settings_set_wifi_enabled(enabled);
+    if (ret != ESP_OK) {
+        (void)power_manager_set_wifi_enabled(previous.wifi_enabled);
+    }
+    return ret;
+}
+
+esp_err_t app_configuration_set_audio_enabled(bool enabled)
+{
+    const app_settings_snapshot_t previous = app_settings_get();
+    if (previous.audio_enabled == enabled) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = power_manager_set_audio_enabled(enabled);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = app_settings_set_audio_enabled(enabled);
+    if (ret != ESP_OK) {
+        (void)power_manager_set_audio_enabled(previous.audio_enabled);
+    }
+    return ret;
+}
+
+esp_err_t app_configuration_set_sdcard_enabled(bool enabled)
+{
+    const app_settings_snapshot_t previous = app_settings_get();
+    if (previous.sdcard_enabled == enabled) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = power_manager_set_sdcard_enabled(enabled);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = app_settings_set_sdcard_enabled(enabled);
+    if (ret != ESP_OK) {
+        (void)power_manager_set_sdcard_enabled(previous.sdcard_enabled);
+    }
+    return ret;
+}
+
+static void synchronize_sleep_policy(void)
+{
+    const app_settings_snapshot_t settings = app_settings_get();
+    power_manager_set_sleep_modes(
+        settings.light_sleep_enabled,
+        settings.deep_sleep_enabled);
+}
+
+esp_err_t app_configuration_set_light_sleep_enabled(bool enabled)
+{
+    const esp_err_t ret = app_settings_set_light_sleep_enabled(enabled);
+    if (ret == ESP_OK) {
+        synchronize_sleep_policy();
+    }
+    return ret;
+}
+
+esp_err_t app_configuration_set_deep_sleep_enabled(bool enabled)
+{
+    const esp_err_t ret = app_settings_set_deep_sleep_enabled(enabled);
+    if (ret == ESP_OK) {
+        synchronize_sleep_policy();
+    }
+    return ret;
+}
+
+esp_err_t app_configuration_load_authorized_users(
+    app_configuration_authorized_users_t *users_out)
+{
+    if (users_out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const app_settings_snapshot_t settings = app_settings_get();
+    const bool restore_saved_off_state = !settings.sdcard_enabled;
+
+    esp_err_t ret = power_manager_set_sdcard_enabled(true);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not power/mount microSD for user refresh: %s",
+                 esp_err_to_name(ret));
+        return ret;
+    }
+
+    app_settings_authorized_users_t service_users = {0};
+    const esp_err_t scan_ret = app_settings_load_authorized_users(&service_users);
+
+    esp_err_t restore_ret = ESP_OK;
+    if (restore_saved_off_state) {
+        restore_ret = power_manager_set_sdcard_enabled(false);
+        if (restore_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Could not restore saved microSD OFF state: %s",
+                     esp_err_to_name(restore_ret));
+        }
+    }
+
+    memset(users_out, 0, sizeof(*users_out));
+    if (scan_ret == ESP_OK) {
+        users_out->count = service_users.count;
+        memcpy(users_out->names, service_users.names, sizeof(users_out->names));
+    }
+
+    if (scan_ret != ESP_OK) {
+        return scan_ret;
+    }
+    return restore_ret;
 }
 
 
@@ -2336,6 +2796,7 @@ bool app_controller_is_initialized(void)
 FILE: src/main/app/navigation/app_navigation.c
 ============================================================
 
+
 #include "app/navigation/app_navigation.h"
 
 #include "app/camera/camera_session.h"
@@ -2344,8 +2805,7 @@ FILE: src/main/app/navigation/app_navigation.c
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "app_ui.h"
-#include "settings_screen.h"
+#include "domain/ports/presentation_port.h"
 
 
 static const char *TAG = "app_main";
@@ -2358,8 +2818,8 @@ static void show_settings_task(void *arg)
     (void)arg;
 
     /* The launcher event has returned, so it is safe to take the LVGL mutex. */
-    app_ui_destroy();
-    settings_screen_create(settings_back_requested, NULL);
+    presentation_launcher_destroy();
+    presentation_settings_create(settings_back_requested, NULL);
 
     /*
      * The Settings view now owns the application UI.
@@ -2382,8 +2842,8 @@ static void show_launcher_task(void *arg)
     (void)arg;
 
     /* Reload the launcher using the currently saved light/dark theme. */
-    settings_screen_destroy();
-    app_ui_create(
+    presentation_settings_destroy();
+    presentation_launcher_create(
         camera_session_launcher_start_requested,
         launcher_settings_requested,
         NULL);
@@ -2447,13 +2907,13 @@ esp_err_t app_navigation_start(void)
         return ESP_FAIL;
     }
 
-    app_ui_create(
+    presentation_launcher_create(
         camera_session_launcher_start_requested,
         launcher_settings_requested,
         NULL);
 
     if (!camera_session_launcher_touch_ready()) {
-        app_ui_show_error(
+        presentation_launcher_show_error(
             "Touch controller unavailable. Check the touch cable and BSP display selection.");
     }
 
@@ -2719,18 +3179,24 @@ idf_component_register(
         "app/authentication/authentication_flow.c"
         "app/camera/camera_session.c"
         "app/navigation/app_navigation.c"
+        "app/configuration/app_configuration.c"
+        "app/activity/app_activity.c"
 
         # User interface
+        "ui/presentation_port.c"
         "ui/views/app_ui.c"
         "ui/views/settings_screen.c"
         "ui/views/pin_screen.c"
         "ui/renderers/face_overlay_renderer.c"
 
         # Authentication session
-        "services/authentication/authentication_session.c"
+        "app/authentication/authentication_session.c"
 
         # Persistent application settings
         "services/settings/app_settings.c"
+
+        # Neutral application port implemented by System Adapters
+        "platform/system/system_adapters_port.c"
 
         # Camera platform
         "platform/camera/camera_runtime.c"
@@ -3299,6 +3765,24 @@ dependencies:
 
 
 ============================================================
+FILE: src/main/include/app/activity/app_activity.h
+============================================================
+
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* UI-facing application command: record user activity. */
+void app_activity_notify_user(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+============================================================
 FILE: src/main/include/app/app_boot.h
 ============================================================
 
@@ -3369,6 +3853,63 @@ bool authentication_flow_launch_pin_transition(void);
 
 
 ============================================================
+FILE: src/main/include/app/authentication/authentication_session.h
+============================================================
+
+
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * Thread-safe authentication-session state.
+ *
+ * Owns:
+ * - PIN transition pending
+ * - PIN screen active
+ * - face-leave rearm requirement
+ * - pending recognized identity
+ *
+ * Does not control camera hardware, LVGL, CPU frequency,
+ * application FSM transitions, or sleep hardware.
+ */
+
+bool authentication_session_blocks_camera(void);
+
+bool authentication_session_note_detection_result(
+    int face_count);
+
+bool authentication_session_reserve_pin_identity(
+    const char *recognized_name);
+
+void authentication_session_copy_pending_identity(
+    char *destination,
+    size_t destination_size);
+
+void authentication_session_mark_transition_failed(void);
+
+void authentication_session_mark_pin_active(void);
+
+void authentication_session_mark_camera_active_after_pin(void);
+
+/*
+ * Fully reset authentication state.
+ *
+ * Used by the existing sleep/display-suspend paths.
+ */
+void authentication_session_reset(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+============================================================
 FILE: src/main/include/app/camera/camera_session.h
 ============================================================
 
@@ -3406,6 +3947,70 @@ void camera_session_enable_launcher_backlight(void);
 void camera_session_launcher_start_requested(void *user_data);
 
 esp_err_t camera_session_setup_power_management(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+============================================================
+FILE: src/main/include/app/configuration/app_configuration.h
+============================================================
+
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * Application Logic facade for the Configuration Service.
+ *
+ * UI -> Application Logic -> Configuration Service
+ *                        -> Power Management (when a saved setting has a
+ *                           hardware/power consequence)
+ */
+
+#define APP_CONFIGURATION_MAX_AUTHORIZED_USERS 24
+#define APP_CONFIGURATION_MAX_USER_NAME_LENGTH 64
+
+typedef struct {
+    bool dark_mode;
+    bool ethernet_enabled;
+    bool wifi_enabled;
+    bool camera_enabled;
+    bool audio_enabled;
+    bool sdcard_enabled;
+    bool light_sleep_enabled;
+    bool deep_sleep_enabled;
+} app_configuration_snapshot_t;
+
+typedef struct {
+    size_t count;
+    char names[APP_CONFIGURATION_MAX_AUTHORIZED_USERS]
+              [APP_CONFIGURATION_MAX_USER_NAME_LENGTH];
+} app_configuration_authorized_users_t;
+
+esp_err_t app_configuration_init(void);
+app_configuration_snapshot_t app_configuration_get(void);
+esp_err_t app_configuration_apply_saved_policy(void);
+
+esp_err_t app_configuration_set_dark_mode(bool enabled);
+esp_err_t app_configuration_set_ethernet_enabled(bool enabled);
+esp_err_t app_configuration_set_wifi_enabled(bool enabled);
+esp_err_t app_configuration_set_camera_enabled(bool enabled);
+esp_err_t app_configuration_set_audio_enabled(bool enabled);
+esp_err_t app_configuration_set_sdcard_enabled(bool enabled);
+esp_err_t app_configuration_set_light_sleep_enabled(bool enabled);
+esp_err_t app_configuration_set_deep_sleep_enabled(bool enabled);
+
+esp_err_t app_configuration_load_authorized_users(
+    app_configuration_authorized_users_t *users_out);
 
 #ifdef __cplusplus
 }
@@ -4523,6 +5128,141 @@ typedef enum
 
 
 ============================================================
+FILE: src/main/include/domain/ports/presentation_port.h
+============================================================
+
+#pragma once
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef void (*presentation_action_callback_t)(void *user_data);
+
+void presentation_launcher_create(
+    presentation_action_callback_t start_callback,
+    presentation_action_callback_t settings_callback,
+    void *user_data);
+void presentation_launcher_set_status(const char *text);
+void presentation_launcher_show_error(const char *text);
+void presentation_launcher_destroy(void);
+
+void presentation_settings_create(
+    presentation_action_callback_t back_callback,
+    void *user_data);
+void presentation_settings_destroy(void);
+
+esp_err_t presentation_pin_show(
+    const char *recognized_name,
+    presentation_action_callback_t success_callback,
+    void *user_data);
+void presentation_pin_hide(void);
+bool presentation_pin_is_visible(void);
+
+void presentation_face_overlay_draw_box_rgb565(
+    uint16_t *fb,
+    uint32_t fb_w,
+    uint32_t fb_h,
+    int x1,
+    int y1,
+    int x2,
+    int y2,
+    int thickness,
+    uint16_t color);
+
+void presentation_face_overlay_draw_label_rgb565(
+    uint16_t *fb,
+    uint32_t fb_w,
+    uint32_t fb_h,
+    int box_x2,
+    int box_y1,
+    const char *name,
+    uint16_t background_color);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+============================================================
+FILE: src/main/include/domain/ports/system_adapters_port.h
+============================================================
+
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "esp_err.h"
+#include "lvgl.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * Application-facing port implemented by src/main/platform/.
+ * Application Logic depends on this neutral contract, not on concrete
+ * platform headers. The platform layer remains the owner of board/driver APIs.
+ */
+
+typedef void (*system_camera_frame_callback_t)(
+    uint8_t *camera_buf,
+    uint8_t camera_buf_index,
+    uint32_t camera_buf_hes,
+    uint32_t camera_buf_ves,
+    size_t camera_buf_len,
+    void *user_data);
+
+/* Storage */
+esp_err_t system_storage_spiffs_mount(void);
+esp_err_t system_storage_sdcard_ensure_mounted(void);
+
+/* CPU power */
+esp_err_t system_cpu_power_init(void);
+esp_err_t system_cpu_face_boost_begin(void);
+esp_err_t system_cpu_face_boost_end(void);
+bool system_cpu_face_boost_is_active(void);
+uint32_t system_cpu_face_detect_interval_frames(void);
+
+/* Display */
+lv_display_t *system_display_start(void);
+void system_display_disable_lvgl_overlays(lv_display_t *display);
+void system_display_backlight_on(void);
+void system_display_backlight_off(void);
+esp_err_t system_display_suspend_for_light_sleep(bool prepare_panel_for_deep);
+lv_display_t *system_display_resume_from_light_sleep(void);
+lv_indev_t *system_display_get_input_device(void);
+esp_err_t system_display_poll_touch_for_light_sleep(bool *touched);
+uint32_t system_display_width(void);
+uint32_t system_display_height(void);
+
+/* Camera/video */
+esp_err_t system_camera_initialize(void);
+int system_camera_open_default(void);
+esp_err_t system_camera_set_buffers(int video_fd, uint32_t fb_num, const void **fb);
+uint32_t system_camera_buffer_size(void);
+esp_err_t system_camera_stream_start(int video_fd, int core_id, void *user_data);
+esp_err_t system_camera_stream_restart(int video_fd);
+esp_err_t system_camera_stream_stop(int video_fd);
+esp_err_t system_camera_prepare_sensor_for_light_sleep(void);
+esp_err_t system_camera_restore_sensor_after_light_sleep(void);
+esp_err_t system_camera_register_frame_callback(system_camera_frame_callback_t callback);
+bool system_camera_is_rgb565(void);
+uint32_t system_camera_bytes_per_pixel(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+============================================================
 FILE: src/main/include/platform/camera/camera_runtime.h
 ============================================================
 
@@ -5215,62 +5955,6 @@ esp_err_t spiffs_storage_mount(void);
 
 
 ============================================================
-FILE: src/main/include/services/authentication/authentication_session.h
-============================================================
-
-#pragma once
-
-#include <stdbool.h>
-#include <stddef.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-/*
- * Thread-safe authentication-session state.
- *
- * Owns:
- * - PIN transition pending
- * - PIN screen active
- * - face-leave rearm requirement
- * - pending recognized identity
- *
- * Does not control camera hardware, LVGL, CPU frequency,
- * application FSM transitions, or sleep hardware.
- */
-
-bool authentication_session_blocks_camera(void);
-
-bool authentication_session_note_detection_result(
-    int face_count);
-
-bool authentication_session_reserve_pin_identity(
-    const char *recognized_name);
-
-void authentication_session_copy_pending_identity(
-    char *destination,
-    size_t destination_size);
-
-void authentication_session_mark_transition_failed(void);
-
-void authentication_session_mark_pin_active(void);
-
-void authentication_session_mark_camera_active_after_pin(void);
-
-/*
- * Fully reset authentication state.
- *
- * Used by the existing sleep/display-suspend paths.
- */
-void authentication_session_reset(void);
-
-#ifdef __cplusplus
-}
-#endif
-
-
-============================================================
 FILE: src/main/include/services/power/component_runtime_policy.h
 ============================================================
 
@@ -5284,24 +5968,11 @@ FILE: src/main/include/services/power/component_runtime_policy.h
 extern "C" {
 #endif
 
-/** True after the BSP shared I2C bus is available for ES8311 access. */
 bool component_runtime_audio_policy_ready(void);
-
-/**
- * Apply the persistent Active-mode audio policy.
- *
- * OFF suspends the ES8311 codec and disables the NS4150B amplifier. ON restores
- * the exact codec register snapshot captured while switching it off.
- */
 esp_err_t component_runtime_set_audio_enabled(bool enabled);
-
-/**
- * Apply the persistent Active-mode microSD policy.
- *
- * OFF safely unmounts FATFS and removes SD1_VDD. ON restores the GPIO45 rail
- * and mounts the card at /sdcard.
- */
 esp_err_t component_runtime_set_sdcard_enabled(bool enabled);
+esp_err_t component_runtime_set_wifi_enabled(bool enabled);
+esp_err_t component_runtime_set_ethernet_enabled(bool enabled);
 
 #ifdef __cplusplus
 }
@@ -5314,14 +5985,16 @@ FILE: src/main/include/services/power/power_manager.h
 
 #pragma once
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef esp_err_t (*power_manager_transition_callback_t)(
-    void *user_data);
+typedef esp_err_t (*power_manager_transition_callback_t)(void *user_data);
 
 typedef enum {
     POWER_MANAGER_SETUP_LIGHT_SLEEP_CALLBACKS = 0,
@@ -5337,6 +6010,7 @@ typedef struct {
 
     void (*deep_sleep_state_requested)(void);
     void (*block_new_work)(void);
+    bool (*drain_active_work)(uint32_t timeout_ms);
     esp_err_t (*release_face_boost)(const char *reason);
     void (*mark_backlight_off)(void);
 
@@ -5345,10 +6019,32 @@ typedef struct {
         esp_err_t error);
 } power_manager_hooks_t;
 
-esp_err_t power_manager_setup(
-    const power_manager_hooks_t *hooks);
+typedef struct {
+    bool ethernet_enabled;
+    bool wifi_enabled;
+    bool audio_enabled;
+    bool sdcard_enabled;
+    bool light_sleep_enabled;
+    bool deep_sleep_enabled;
+} power_manager_configuration_t;
 
+esp_err_t power_manager_setup(const power_manager_hooks_t *hooks);
 esp_err_t power_manager_start_inactivity_policy(void);
+
+/* Application-facing Power Management API. */
+esp_err_t power_manager_apply_configuration(
+    const power_manager_configuration_t *configuration);
+esp_err_t power_manager_set_ethernet_enabled(bool enabled);
+esp_err_t power_manager_set_wifi_enabled(bool enabled);
+esp_err_t power_manager_set_audio_enabled(bool enabled);
+esp_err_t power_manager_set_sdcard_enabled(bool enabled);
+bool power_manager_audio_policy_ready(void);
+void power_manager_set_sleep_modes(bool light_enabled, bool deep_enabled);
+void power_manager_notify_activity(void);
+bool power_manager_sleep_is_requested(void);
+bool power_manager_light_sleep_is_due(void);
+bool power_manager_deep_mode_is_enabled(void);
+void power_manager_request_deep_sleep(const char *reason);
 
 #ifdef __cplusplus
 }
@@ -5358,6 +6054,7 @@ esp_err_t power_manager_start_inactivity_policy(void);
 ============================================================
 FILE: src/main/include/services/power/sleep/app_sleep.h
 ============================================================
+
 
 #pragma once
 
@@ -5438,6 +6135,9 @@ esp_err_t app_sleep_start_button_monitor(
 * Positive face detections and existing application activity notifications
 * reset the inactivity timestamp exactly as before.
 */
+/** Set the saved Light/Deep policy supplied by Application Logic. */
+void app_sleep_set_mode_policy(bool light_enabled, bool deep_enabled);
+
 esp_err_t app_sleep_start_timeout(void);
 
 /**
@@ -5577,6 +6277,7 @@ void report_wake_reason(void);
 FILE: src/main/include/services/settings/app_settings.h
 ============================================================
 
+
 #pragma once
 
 #include <stdbool.h>
@@ -5617,7 +6318,7 @@ esp_err_t app_settings_init(void);
 /** Return a copy of the current in-memory settings. */
 app_settings_snapshot_t app_settings_get(void);
 
-/** Save and immediately apply the requested setting. */
+/** Save the requested setting. Hardware policy is applied by Application Logic. */
 esp_err_t app_settings_set_dark_mode(bool enabled);
 esp_err_t app_settings_set_ethernet_enabled(bool enabled);
 esp_err_t app_settings_set_wifi_enabled(bool enabled);
@@ -5627,11 +6328,9 @@ esp_err_t app_settings_set_sdcard_enabled(bool enabled);
 esp_err_t app_settings_set_light_sleep_enabled(bool enabled);
 esp_err_t app_settings_set_deep_sleep_enabled(bool enabled);
 
-/** Apply all saved component policies that are ready at the current boot stage. */
-esp_err_t app_settings_apply_power_policy(void);
 
 /**
- * Mount the microSD card when needed and rescan /sdcard/enroll.
+ * Rescan /sdcard/enroll. Application Logic guarantees microSD availability.
  * Every call performs a fresh directory scan.
  */
 esp_err_t app_settings_load_authorized_users(
@@ -5855,7 +6554,9 @@ extern "C" {
  * - application FSM transitions;
  * - display idle-scan state;
  * - PIN reservation/launch;
- * - the application-level face-boost release wrapper.
+ * - power/sleep policy;
+ * - authentication-session state;
+ * - the application-level face-boost acquire/release wrappers.
  *
  * Those concerns are supplied as callbacks so dependency direction remains:
  *
@@ -5865,6 +6566,11 @@ extern "C" {
  */
 typedef struct {
     bool (*idle_scan_display_is_suspended)(void);
+    bool (*sleep_is_requested)(void);
+    bool (*camera_processing_blocked)(void);
+    bool (*note_detection_result)(int face_count);
+    esp_err_t (*acquire_face_boost)(void);
+    void (*notify_activity)(void);
     void (*recognition_started)(void);
     bool (*request_pin)(const char *recognized_name);
     void (*recognition_not_authenticated)(void);
@@ -12331,196 +13037,162 @@ esp_err_t spiffs_storage_mount(void)
 
 
 ============================================================
-FILE: src/main/services/authentication/authentication_session.c
+FILE: src/main/platform/system/system_adapters_port.c
 ============================================================
 
-#include "services/authentication/authentication_session.h"
+#include "domain/ports/system_adapters_port.h"
 
-#include <string.h>
+#include "esp_video_init.h"
+#include "platform/camera/camera_runtime.h"
+#include "platform/camera/video_capture.h"
+#include "platform/display/display_platform.h"
+#include "platform/power/cpu_power.h"
+#include "platform/storage/sd_card_storage.h"
+#include "platform/storage/spiffs_storage.h"
 
-#include "config/app_config.h"
-#include "freertos/FreeRTOS.h"
-#include "services/vision/face_recognizer.h"
-
-static portMUX_TYPE s_authentication_lock =
-    portMUX_INITIALIZER_UNLOCKED;
-
-static bool s_pin_transition_pending = false;
-static bool s_pin_screen_active = false;
-static bool s_pin_rearm_required = false;
-static int s_pin_rearm_no_face_passes = 0;
-
-static char s_pending_identity[FACE_RECOG_MAX_NAME_LEN] = {0};
-
-
-bool authentication_session_blocks_camera(void)
+esp_err_t system_storage_spiffs_mount(void)
 {
-    bool blocked;
-
-    portENTER_CRITICAL(&s_authentication_lock);
-
-    blocked =
-        s_pin_transition_pending ||
-        s_pin_screen_active;
-
-    portEXIT_CRITICAL(&s_authentication_lock);
-
-    return blocked;
+    return spiffs_storage_mount();
 }
 
-
-bool authentication_session_note_detection_result(
-    int face_count)
+esp_err_t system_storage_sdcard_ensure_mounted(void)
 {
-    bool rearmed = false;
-
-    portENTER_CRITICAL(&s_authentication_lock);
-
-    if (face_count > 0) {
-        s_pin_rearm_no_face_passes = 0;
-    } else if (
-        s_pin_rearm_required &&
-        !s_pin_transition_pending &&
-        !s_pin_screen_active) {
-
-        s_pin_rearm_no_face_passes++;
-
-        if (s_pin_rearm_no_face_passes >=
-            APP_FACE_BOX_HOLD_MISSES) {
-
-            s_pin_rearm_required = false;
-            s_pin_rearm_no_face_passes = 0;
-            rearmed = true;
-        }
-    }
-
-    portEXIT_CRITICAL(&s_authentication_lock);
-
-    return rearmed;
+    return sd_card_storage_ensure_mounted();
 }
 
-
-bool authentication_session_reserve_pin_identity(
-    const char *recognized_name)
+esp_err_t system_cpu_power_init(void)
 {
-    if (recognized_name == NULL ||
-        recognized_name[0] == '\0' ||
-        strcmp(recognized_name, "unknown") == 0) {
-        return false;
-    }
-
-    bool reserved = false;
-
-    portENTER_CRITICAL(&s_authentication_lock);
-
-    if (!s_pin_transition_pending &&
-        !s_pin_screen_active &&
-        !s_pin_rearm_required) {
-
-        s_pin_transition_pending = true;
-        s_pin_rearm_required = true;
-        s_pin_rearm_no_face_passes = 0;
-
-        const size_t identity_length =
-            strnlen(
-                recognized_name,
-                sizeof(s_pending_identity) - 1);
-
-        memcpy(
-            s_pending_identity,
-            recognized_name,
-            identity_length);
-
-        s_pending_identity[identity_length] = '\0';
-
-        reserved = true;
-    }
-
-    portEXIT_CRITICAL(&s_authentication_lock);
-
-    return reserved;
+    return cpu_power_init();
 }
 
-
-void authentication_session_copy_pending_identity(
-    char *destination,
-    size_t destination_size)
+esp_err_t system_cpu_face_boost_begin(void)
 {
-    if (destination == NULL ||
-        destination_size == 0) {
-        return;
-    }
-
-    portENTER_CRITICAL(&s_authentication_lock);
-
-    const size_t identity_length =
-        strnlen(
-            s_pending_identity,
-            destination_size - 1);
-
-    memcpy(
-        destination,
-        s_pending_identity,
-        identity_length);
-
-    destination[identity_length] = '\0';
-
-    portEXIT_CRITICAL(&s_authentication_lock);
+    return cpu_power_face_boost_begin();
 }
 
-
-void authentication_session_mark_transition_failed(void)
+esp_err_t system_cpu_face_boost_end(void)
 {
-    portENTER_CRITICAL(&s_authentication_lock);
-
-    s_pin_transition_pending = false;
-    s_pin_screen_active = false;
-
-    /*
-     * Preserve the existing rearm requirement.
-     */
-
-    portEXIT_CRITICAL(&s_authentication_lock);
+    return cpu_power_face_boost_end();
 }
 
-
-void authentication_session_mark_pin_active(void)
+bool system_cpu_face_boost_is_active(void)
 {
-    portENTER_CRITICAL(&s_authentication_lock);
-
-    s_pin_transition_pending = false;
-    s_pin_screen_active = true;
-
-    portEXIT_CRITICAL(&s_authentication_lock);
+    return cpu_power_is_face_boost_active();
 }
 
-
-void authentication_session_mark_camera_active_after_pin(void)
+uint32_t system_cpu_face_detect_interval_frames(void)
 {
-    portENTER_CRITICAL(&s_authentication_lock);
-
-    s_pin_transition_pending = false;
-    s_pin_screen_active = false;
-
-    /*
-     * Authentication remains disarmed until the face leaves.
-     */
-
-    portEXIT_CRITICAL(&s_authentication_lock);
+    return cpu_power_get_face_detect_interval_frames();
 }
 
-
-void authentication_session_reset(void)
+lv_display_t *system_display_start(void)
 {
-    portENTER_CRITICAL(&s_authentication_lock);
+    return display_platform_start();
+}
 
-    s_pin_transition_pending = false;
-    s_pin_screen_active = false;
-    s_pin_rearm_required = false;
-    s_pin_rearm_no_face_passes = 0;
-    s_pending_identity[0] = '\0';
+void system_display_disable_lvgl_overlays(lv_display_t *display)
+{
+    display_platform_disable_lvgl_overlays(display);
+}
 
-    portEXIT_CRITICAL(&s_authentication_lock);
+void system_display_backlight_on(void)
+{
+    display_platform_backlight_on();
+}
+
+void system_display_backlight_off(void)
+{
+    display_platform_backlight_off();
+}
+
+esp_err_t system_display_suspend_for_light_sleep(bool prepare_panel_for_deep)
+{
+    return display_platform_suspend_for_light_sleep(prepare_panel_for_deep);
+}
+
+lv_display_t *system_display_resume_from_light_sleep(void)
+{
+    return display_platform_resume_from_light_sleep();
+}
+
+lv_indev_t *system_display_get_input_device(void)
+{
+    return display_platform_get_input_device();
+}
+
+esp_err_t system_display_poll_touch_for_light_sleep(bool *touched)
+{
+    return display_platform_poll_touch_for_light_sleep(touched);
+}
+
+uint32_t system_display_width(void)
+{
+    return display_platform_width();
+}
+
+uint32_t system_display_height(void)
+{
+    return display_platform_height();
+}
+
+esp_err_t system_camera_initialize(void)
+{
+    return camera_runtime_initialize();
+}
+
+int system_camera_open_default(void)
+{
+    return app_video_open((char *)ESP_VIDEO_MIPI_CSI_DEVICE_NAME, APP_VIDEO_FMT);
+}
+
+esp_err_t system_camera_set_buffers(int video_fd, uint32_t fb_num, const void **fb)
+{
+    return app_video_set_bufs(video_fd, fb_num, fb);
+}
+
+uint32_t system_camera_buffer_size(void)
+{
+    return app_video_get_buf_size();
+}
+
+esp_err_t system_camera_stream_start(int video_fd, int core_id, void *user_data)
+{
+    return app_video_stream_task_start(video_fd, core_id, user_data);
+}
+
+esp_err_t system_camera_stream_restart(int video_fd)
+{
+    return app_video_stream_task_restart(video_fd);
+}
+
+esp_err_t system_camera_stream_stop(int video_fd)
+{
+    return app_video_stream_task_stop(video_fd);
+}
+
+esp_err_t system_camera_prepare_sensor_for_light_sleep(void)
+{
+    return app_video_prepare_sensor_for_light_sleep();
+}
+
+esp_err_t system_camera_restore_sensor_after_light_sleep(void)
+{
+    return app_video_restore_sensor_after_light_sleep();
+}
+
+esp_err_t system_camera_register_frame_callback(system_camera_frame_callback_t callback)
+{
+    return app_video_register_frame_operation_cb(callback);
+}
+
+bool system_camera_is_rgb565(void)
+{
+    return APP_VIDEO_FMT == APP_VIDEO_FMT_RGB565;
+}
+
+uint32_t system_camera_bytes_per_pixel(void)
+{
+    return system_camera_is_rgb565() ? 2U : 3U;
 }
 
 
@@ -12528,13 +13200,16 @@ void authentication_session_reset(void)
 FILE: src/main/services/power/component_runtime_policy.c
 ============================================================
 
+
 #include "services/power/component_runtime_policy.h"
 
 #include "bsp/esp-bsp.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "platform/power/component_audio.h"
+#include "platform/power/component_ethernet.h"
 #include "platform/power/component_sdcard.h"
+#include "platform/power/component_wifi.h"
 
 static const char *TAG = "runtime_policy";
 
@@ -12592,6 +13267,17 @@ esp_err_t component_runtime_set_sdcard_enabled(bool enabled)
 }
 
 
+esp_err_t component_runtime_set_wifi_enabled(bool enabled)
+{
+    return component_wifi_set_enabled(enabled);
+}
+
+esp_err_t component_runtime_set_ethernet_enabled(bool enabled)
+{
+    return component_ethernet_set_enabled(enabled);
+}
+
+
 ============================================================
 FILE: src/main/services/power/power_manager.c
 ============================================================
@@ -12605,7 +13291,7 @@ FILE: src/main/services/power/power_manager.c
 #include "esp_log.h"
 #include "platform/power/cpu_power.h"
 #include "services/power/sleep/app_sleep.h"
-#include "services/vision/ai_worker_state.h"
+#include "services/power/component_runtime_policy.h"
 
 
 static const char *TAG = "app_main";
@@ -12622,6 +13308,7 @@ static bool hooks_are_complete(
         hooks->idle_scan_resume != NULL &&
         hooks->deep_sleep_state_requested != NULL &&
         hooks->block_new_work != NULL &&
+        hooks->drain_active_work != NULL &&
         hooks->release_face_boost != NULL &&
         hooks->mark_backlight_off != NULL;
 }
@@ -12645,7 +13332,7 @@ static void prepare_application_for_deep_sleep(
     s_hooks.deep_sleep_state_requested();
     s_hooks.block_new_work();
 
-    if (!vision_ai_worker_state_pause_and_drain(
+    if (!s_hooks.drain_active_work(
             APP_AI_WORKER_DRAIN_TIMEOUT_MS)) {
         ESP_LOGW(
             TAG,
@@ -12722,9 +13409,117 @@ esp_err_t power_manager_start_inactivity_policy(void)
 }
 
 
+
+esp_err_t power_manager_set_ethernet_enabled(bool enabled)
+{
+    return component_runtime_set_ethernet_enabled(enabled);
+}
+
+esp_err_t power_manager_set_wifi_enabled(bool enabled)
+{
+    return component_runtime_set_wifi_enabled(enabled);
+}
+
+esp_err_t power_manager_set_audio_enabled(bool enabled)
+{
+    return component_runtime_set_audio_enabled(enabled);
+}
+
+esp_err_t power_manager_set_sdcard_enabled(bool enabled)
+{
+    return component_runtime_set_sdcard_enabled(enabled);
+}
+
+bool power_manager_audio_policy_ready(void)
+{
+    return component_runtime_audio_policy_ready();
+}
+
+void power_manager_set_sleep_modes(bool light_enabled, bool deep_enabled)
+{
+    app_sleep_set_mode_policy(light_enabled, deep_enabled);
+}
+
+void power_manager_notify_activity(void)
+{
+    app_sleep_notify_face_detected();
+}
+
+bool power_manager_sleep_is_requested(void)
+{
+    return app_sleep_is_requested();
+}
+
+bool power_manager_light_sleep_is_due(void)
+{
+    return app_sleep_light_sleep_is_due();
+}
+
+bool power_manager_deep_mode_is_enabled(void)
+{
+    return app_sleep_deep_mode_is_enabled();
+}
+
+void power_manager_request_deep_sleep(const char *reason)
+{
+    app_sleep_request(reason);
+}
+
+esp_err_t power_manager_apply_configuration(
+    const power_manager_configuration_t *configuration)
+{
+    if (configuration == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    power_manager_set_sleep_modes(
+        configuration->light_sleep_enabled,
+        configuration->deep_sleep_enabled);
+
+    esp_err_t first_error = ESP_OK;
+
+    esp_err_t ret = power_manager_set_wifi_enabled(configuration->wifi_enabled);
+    if (ret != ESP_OK) {
+        first_error = ret;
+        ESP_LOGE(TAG, "Could not apply saved Wi-Fi policy: %s", esp_err_to_name(ret));
+    }
+
+    ret = power_manager_set_ethernet_enabled(configuration->ethernet_enabled);
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not apply saved Ethernet policy: %s", esp_err_to_name(ret));
+    }
+
+    ret = power_manager_set_sdcard_enabled(configuration->sdcard_enabled);
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not apply saved microSD policy: %s", esp_err_to_name(ret));
+    }
+
+    if (power_manager_audio_policy_ready()) {
+        ret = power_manager_set_audio_enabled(configuration->audio_enabled);
+        if (ret != ESP_OK && first_error == ESP_OK) {
+            first_error = ret;
+        }
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Could not apply saved Audio policy: %s", esp_err_to_name(ret));
+        }
+    } else {
+        ESP_LOGI(TAG, "Saved Audio policy will be applied after display/I2C startup");
+    }
+
+    return first_error;
+}
+
+
 ============================================================
 FILE: src/main/services/power/sleep/app_sleep.c
 ============================================================
+
 
 
 #include "services/power/sleep/app_sleep.h"
@@ -12755,7 +13550,6 @@ FILE: src/main/services/power/sleep/app_sleep.c
 #include "platform/power/component_sdcard.h"
 #include "platform/power/component_wifi.h"
 #include "platform/power/cpu_power.h"
-#include "services/settings/app_settings.h"
 
 #if APP_LIGHT_SLEEP_TOUCH_POLL_MS == 0
 #error "APP_LIGHT_SLEEP_TOUCH_POLL_MS must be greater than zero"
@@ -12786,6 +13580,8 @@ static bool s_light_sleep_failed_until_activity;
 static int64_t s_last_face_detected_us;
 static bool s_light_mode_enabled;
 static bool s_deep_mode_enabled;
+static bool s_requested_light_mode_enabled = true;
+static bool s_requested_deep_mode_enabled = true;
 static uint32_t s_light_sleep_threshold_ms;
 static uint32_t s_deep_sleep_threshold_ms;
 
@@ -12795,11 +13591,23 @@ static app_sleep_light_transition_callback_t s_light_suspend_callback;
 static app_sleep_light_transition_callback_t s_light_resume_callback;
 static void *s_light_transition_user_data;
 
+void app_sleep_set_mode_policy(bool light_enabled, bool deep_enabled)
+{
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    s_requested_light_mode_enabled = light_enabled;
+    s_requested_deep_mode_enabled = deep_enabled;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+}
+
 static void configure_runtime_power_modes(void)
 {
-    const app_settings_snapshot_t settings = app_settings_get();
-    const bool light_enabled = settings.light_sleep_enabled;
-    const bool deep_enabled = settings.deep_sleep_enabled;
+    bool light_enabled;
+    bool deep_enabled;
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    light_enabled = s_requested_light_mode_enabled;
+    deep_enabled = s_requested_deep_mode_enabled;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
 
     uint32_t light_threshold_ms = 0;
     uint32_t deep_threshold_ms = 0;
@@ -13084,11 +13892,9 @@ bool app_sleep_light_sleep_is_due(void)
 bool app_sleep_deep_mode_is_enabled(void)
 {
     bool enabled;
-
     portENTER_CRITICAL(&s_sleep_request_lock);
-    enabled = s_deep_mode_enabled;
+    enabled = s_requested_deep_mode_enabled;
     portEXIT_CRITICAL(&s_sleep_request_lock);
-
     return enabled;
 }
 
@@ -13809,8 +14615,7 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
 
 void app_sleep_request(const char *reason)
 {
-    const app_settings_snapshot_t settings = app_settings_get();
-    if (!settings.deep_sleep_enabled) {
+    if (!app_sleep_deep_mode_is_enabled()) {
         ESP_LOGW(
             POWER_TAG,
             "event=DEEP_SLEEP_REQUEST_IGNORED policy=RUNTIME_DISABLED reason=\"%s\"",
@@ -13886,8 +14691,7 @@ static void deep_sleep_button_task(void *arg)
 
             if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0 &&
                 !button_event_is_reserved_for_light_sleep()) {
-                const app_settings_snapshot_t settings = app_settings_get();
-                if (settings.deep_sleep_enabled) {
+                if (app_sleep_deep_mode_is_enabled()) {
                     app_sleep_request("GPIO3 button");
                 } else {
                     ESP_LOGI(
@@ -15969,6 +16773,7 @@ void report_wake_reason(void)
 FILE: src/main/services/settings/app_settings.c
 ============================================================
 
+
 #include "services/settings/app_settings.h"
 
 #include <dirent.h>
@@ -15983,9 +16788,6 @@ FILE: src/main/services/settings/app_settings.c
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
-#include "platform/power/component_ethernet.h"
-#include "services/power/component_runtime_policy.h"
-#include "platform/power/component_wifi.h"
 
 #define SETTINGS_NAMESPACE "app_settings"
 #define KEY_DARK_MODE       "dark"
@@ -16181,21 +16983,14 @@ esp_err_t app_settings_set_ethernet_enabled(bool enabled)
         return ESP_OK;
     }
 
-    esp_err_t ret = component_ethernet_set_enabled(enabled);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Ethernet state change failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = save_bool(KEY_ETHERNET, enabled);
+    const esp_err_t ret = save_bool(KEY_ETHERNET, enabled);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Could not save Ethernet setting: %s", esp_err_to_name(ret));
-        (void)component_ethernet_set_enabled(previous);
         return ret;
     }
 
     s_settings.ethernet_enabled = enabled;
-    ESP_LOGI(TAG, "Ethernet policy saved and applied: %s", enabled ? "on" : "off");
+    ESP_LOGI(TAG, "Ethernet saved: %s", enabled ? "on" : "off");
     return ESP_OK;
 }
 
@@ -16206,21 +17001,14 @@ esp_err_t app_settings_set_wifi_enabled(bool enabled)
         return ESP_OK;
     }
 
-    esp_err_t ret = component_wifi_set_enabled(enabled);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Wi-Fi state change failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = save_bool(KEY_WIFI, enabled);
+    const esp_err_t ret = save_bool(KEY_WIFI, enabled);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Could not save Wi-Fi setting: %s", esp_err_to_name(ret));
-        (void)component_wifi_set_enabled(previous);
         return ret;
     }
 
     s_settings.wifi_enabled = enabled;
-    ESP_LOGI(TAG, "Wi-Fi policy saved and applied: %s", enabled ? "on" : "off");
+    ESP_LOGI(TAG, "Wi-Fi saved: %s", enabled ? "on" : "off");
     return ESP_OK;
 }
 
@@ -16253,21 +17041,14 @@ esp_err_t app_settings_set_audio_enabled(bool enabled)
         return ESP_OK;
     }
 
-    esp_err_t ret = component_runtime_set_audio_enabled(enabled);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Audio state change failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = save_bool(KEY_AUDIO, enabled);
+    const esp_err_t ret = save_bool(KEY_AUDIO, enabled);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Could not save Audio setting: %s", esp_err_to_name(ret));
-        (void)component_runtime_set_audio_enabled(previous);
         return ret;
     }
 
     s_settings.audio_enabled = enabled;
-    ESP_LOGI(TAG, "Audio policy saved and applied: %s", enabled ? "on" : "off");
+    ESP_LOGI(TAG, "Audio saved: %s", enabled ? "on" : "off");
     return ESP_OK;
 }
 
@@ -16278,21 +17059,14 @@ esp_err_t app_settings_set_sdcard_enabled(bool enabled)
         return ESP_OK;
     }
 
-    esp_err_t ret = component_runtime_set_sdcard_enabled(enabled);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "microSD state change failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = save_bool(KEY_SDCARD, enabled);
+    const esp_err_t ret = save_bool(KEY_SDCARD, enabled);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Could not save microSD setting: %s", esp_err_to_name(ret));
-        (void)component_runtime_set_sdcard_enabled(previous);
         return ret;
     }
 
     s_settings.sdcard_enabled = enabled;
-    ESP_LOGI(TAG, "microSD policy saved and applied: %s", enabled ? "on" : "off");
+    ESP_LOGI(TAG, "microSD saved: %s", enabled ? "on" : "off");
     return ESP_OK;
 }
 
@@ -16332,52 +17106,6 @@ esp_err_t app_settings_set_deep_sleep_enabled(bool enabled)
     return ESP_OK;
 }
 
-esp_err_t app_settings_apply_power_policy(void)
-{
-    esp_err_t first_error = ESP_OK;
-
-    esp_err_t ret = component_wifi_set_enabled(s_settings.wifi_enabled);
-    if (ret != ESP_OK) {
-        first_error = ret;
-        ESP_LOGE(TAG, "Could not apply saved Wi-Fi policy: %s", esp_err_to_name(ret));
-    }
-
-    ret = component_ethernet_set_enabled(s_settings.ethernet_enabled);
-    if (ret != ESP_OK && first_error == ESP_OK) {
-        first_error = ret;
-    }
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Could not apply saved Ethernet policy: %s", esp_err_to_name(ret));
-    }
-
-    ret = component_runtime_set_sdcard_enabled(s_settings.sdcard_enabled);
-    if (ret != ESP_OK && first_error == ESP_OK) {
-        first_error = ret;
-    }
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Could not apply saved microSD policy: %s", esp_err_to_name(ret));
-    }
-
-    if (component_runtime_audio_policy_ready()) {
-        ret = component_runtime_set_audio_enabled(s_settings.audio_enabled);
-        if (ret != ESP_OK && first_error == ESP_OK) {
-            first_error = ret;
-        }
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Could not apply saved Audio policy: %s", esp_err_to_name(ret));
-        }
-    } else {
-        ESP_LOGI(TAG, "Saved Audio policy will be applied after display/I2C startup");
-    }
-
-    ESP_LOGI(
-        TAG,
-        "Camera policy applied: pipeline=%s",
-        s_settings.camera_enabled ? "available" : "blocked and uninitialized");
-
-    return first_error;
-}
-
 static bool is_directory_entry(const struct dirent *entry)
 {
     /* FAT directory entries are not required to expose d_type; use stat. */
@@ -16408,30 +17136,15 @@ esp_err_t app_settings_load_authorized_users(
 
     memset(users_out, 0, sizeof(*users_out));
 
-    const bool restore_saved_off_state = !s_settings.sdcard_enabled;
-    esp_err_t access_ret = component_runtime_set_sdcard_enabled(true);
-    if (access_ret != ESP_OK) {
-        ESP_LOGE(TAG, "Could not power/mount microSD for user refresh: %s",
-                 esp_err_to_name(access_ret));
-        return access_ret;
-    }
-
-    ESP_LOGI(
-        TAG,
-        "microSD ready for authorized-user refresh%s",
-        restore_saved_off_state ? " (temporary access)" : "");
-
+    /*
+     * Configuration Service only scans configuration data. Application Logic
+     * is responsible for temporarily enabling/mounting microSD when the saved
+     * storage policy is OFF.
+     */
     DIR *directory = opendir(ENROLLMENT_ROOT);
     if (directory == NULL) {
         const esp_err_t scan_ret = errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
         ESP_LOGE(TAG, "Could not open %s: errno=%d", ENROLLMENT_ROOT, errno);
-        if (restore_saved_off_state) {
-            const esp_err_t restore_ret = component_runtime_set_sdcard_enabled(false);
-            if (restore_ret != ESP_OK) {
-                ESP_LOGE(TAG, "Could not restore saved microSD OFF state: %s",
-                         esp_err_to_name(restore_ret));
-            }
-        }
         return scan_ret;
     }
 
@@ -16467,16 +17180,6 @@ esp_err_t app_settings_load_authorized_users(
 
     ESP_LOGI(TAG, "Authorized users refreshed from SD card: %u",
              (unsigned)users_out->count);
-
-    if (restore_saved_off_state) {
-        const esp_err_t restore_ret = component_runtime_set_sdcard_enabled(false);
-        if (restore_ret != ESP_OK) {
-            ESP_LOGE(TAG, "Could not restore saved microSD OFF state: %s",
-                     esp_err_to_name(restore_ret));
-            return restore_ret;
-        }
-        ESP_LOGI(TAG, "microSD returned to the saved OFF state after refresh");
-    }
 
     return ESP_OK;
 }
@@ -16886,9 +17589,6 @@ FILE: src/main/services/vision/ai_worker_pipeline.c
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "platform/power/cpu_power.h"
-#include "services/authentication/authentication_session.h"
-#include "services/power/sleep/app_sleep.h"
 #include "services/vision/ai_inference_guard.h"
 #include "services/vision/ai_snapshot_buffer.h"
 #include "services/vision/ai_worker_runtime.h"
@@ -16910,6 +17610,11 @@ static bool hooks_are_complete(
 {
     return hooks != NULL &&
         hooks->idle_scan_display_is_suspended != NULL &&
+        hooks->sleep_is_requested != NULL &&
+        hooks->camera_processing_blocked != NULL &&
+        hooks->note_detection_result != NULL &&
+        hooks->acquire_face_boost != NULL &&
+        hooks->notify_activity != NULL &&
         hooks->recognition_started != NULL &&
         hooks->request_pin != NULL &&
         hooks->recognition_not_authenticated != NULL &&
@@ -16934,7 +17639,7 @@ static void ai_worker_task(void *arg)
             continue;
         }
 
-        if (app_sleep_is_requested() || authentication_session_blocks_camera()) {
+        if (s_hooks.sleep_is_requested() || s_hooks.camera_processing_blocked()) {
             vision_ai_worker_state_mark_idle();
             continue;
         }
@@ -16945,7 +17650,7 @@ static void ai_worker_task(void *arg)
             continue;
         }
 
-        esp_err_t boost_ret = cpu_power_face_boost_begin();
+        esp_err_t boost_ret = s_hooks.acquire_face_boost();
         if (boost_ret != ESP_OK) {
             ESP_LOGW(TAG, "Could not request AI high-performance CPU lock: %s",
                      esp_err_to_name(boost_ret));
@@ -16977,7 +17682,7 @@ static void ai_worker_task(void *arg)
                  job.frame_id, face_count);
         diagnostics_ai_detection_result(face_count);
 
-        if (authentication_session_note_detection_result(face_count)) {
+        if (s_hooks.note_detection_result(face_count)) {
             ESP_LOGI(
                 TAG,
                 "Authentication rearmed after the face left the camera");
@@ -16994,7 +17699,7 @@ static void ai_worker_task(void *arg)
             continue;
         }
 
-        app_sleep_notify_face_detected();
+        s_hooks.notify_activity();
 
 #if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
         printf(
@@ -23305,6 +24010,99 @@ esp_err_t tflm_tensor_write_real(TfLiteTensor *tensor, size_t index, float value
 
 
 ============================================================
+FILE: src/main/ui/presentation_port.c
+============================================================
+
+#include "domain/ports/presentation_port.h"
+
+#include "renderers/face_overlay_renderer.h"
+#include "views/app_ui.h"
+#include "views/pin_screen.h"
+#include "views/settings_screen.h"
+
+void presentation_launcher_create(
+    presentation_action_callback_t start_callback,
+    presentation_action_callback_t settings_callback,
+    void *user_data)
+{
+    app_ui_create(start_callback, settings_callback, user_data);
+}
+
+void presentation_launcher_set_status(const char *text)
+{
+    app_ui_set_status(text);
+}
+
+void presentation_launcher_show_error(const char *text)
+{
+    app_ui_show_error(text);
+}
+
+void presentation_launcher_destroy(void)
+{
+    app_ui_destroy();
+}
+
+void presentation_settings_create(
+    presentation_action_callback_t back_callback,
+    void *user_data)
+{
+    settings_screen_create(back_callback, user_data);
+}
+
+void presentation_settings_destroy(void)
+{
+    settings_screen_destroy();
+}
+
+esp_err_t presentation_pin_show(
+    const char *recognized_name,
+    presentation_action_callback_t success_callback,
+    void *user_data)
+{
+    return pin_screen_show(recognized_name, success_callback, user_data);
+}
+
+void presentation_pin_hide(void)
+{
+    pin_screen_hide();
+}
+
+bool presentation_pin_is_visible(void)
+{
+    return pin_screen_is_visible();
+}
+
+void presentation_face_overlay_draw_box_rgb565(
+    uint16_t *fb,
+    uint32_t fb_w,
+    uint32_t fb_h,
+    int x1,
+    int y1,
+    int x2,
+    int y2,
+    int thickness,
+    uint16_t color)
+{
+    face_overlay_renderer_draw_box_rgb565(
+        fb, fb_w, fb_h, x1, y1, x2, y2, thickness, color);
+}
+
+void presentation_face_overlay_draw_label_rgb565(
+    uint16_t *fb,
+    uint32_t fb_w,
+    uint32_t fb_h,
+    int box_x2,
+    int box_y1,
+    const char *name,
+    uint16_t background_color)
+{
+    face_overlay_renderer_draw_label_rgb565(
+        fb, fb_w, fb_h, box_x2, box_y1, name, background_color);
+}
+
+
+============================================================
 FILE: src/main/ui/renderers/face_overlay_renderer.c
 ============================================================
 
@@ -23629,7 +24427,7 @@ FILE: src/main/ui/views/app_ui.c
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
-#include "services/settings/app_settings.h"
+#include "app/configuration/app_configuration.h"
 
 static const char *TAG = "app_ui";
 
@@ -23685,7 +24483,7 @@ static void dispatch_start_request(void)
         return;
     }
 
-    const app_settings_snapshot_t settings = app_settings_get();
+    const app_configuration_snapshot_t settings = app_configuration_get();
     if (!settings.camera_enabled) {
         if (s_status_label) {
             lv_label_set_text(
@@ -23783,7 +24581,7 @@ void app_ui_create(
     s_user_data = user_data;
     s_action_dispatched = false;
 
-    const app_settings_snapshot_t settings = app_settings_get();
+    const app_configuration_snapshot_t settings = app_configuration_get();
     const bool dark = settings.dark_mode;
     const bool camera_ready = settings.camera_enabled;
 
@@ -24037,6 +24835,7 @@ void app_ui_destroy(void);
 FILE: src/main/ui/views/pin_screen.c
 ============================================================
 
+
 #include "pin_screen.h"
 
 #include <stdbool.h>
@@ -24044,7 +24843,7 @@ FILE: src/main/ui/views/pin_screen.c
 #include <stdio.h>
 #include <string.h>
 
-#include "services/power/sleep/app_sleep.h"
+#include "app/activity/app_activity.h"
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
 #include "esp_err.h"
@@ -24175,7 +24974,7 @@ static void key_pressed_event_cb(lv_event_t *event)
     }
 
     /* Touching the active authentication screen counts as user activity. */
-    app_sleep_notify_face_detected();
+    app_activity_notify_user();
 
     if (strcmp(key, "Clear") == 0) {
         reset_entry();
@@ -24436,7 +25235,7 @@ esp_err_t pin_screen_show(
     s_visible = true;
     bsp_display_unlock();
 
-    app_sleep_notify_face_detected();
+    app_activity_notify_user();
 
     ESP_LOGI(TAG, "PIN screen shown for recognized identity");
     return ESP_OK;
@@ -24532,7 +25331,7 @@ FILE: src/main/ui/views/settings_screen.c
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
-#include "services/settings/app_settings.h"
+#include "app/configuration/app_configuration.h"
 
 typedef enum {
     SETTINGS_TOGGLE_THEME,
@@ -24718,7 +25517,7 @@ static void create_user_row(
 static void create_authorized_users(
     lv_obj_t *content,
     const settings_palette_t *palette,
-    const app_settings_authorized_users_t *users,
+    const app_configuration_authorized_users_t *users,
     esp_err_t users_ret)
 {
     create_section_label(content, "AUTHORIZED USERS", palette);
@@ -24756,7 +25555,7 @@ static void create_authorized_users(
 }
 
 static bool setting_value_for_kind(
-    const app_settings_snapshot_t *settings,
+    const app_configuration_snapshot_t *settings,
     settings_toggle_kind_t kind)
 {
     switch (kind) {
@@ -24783,17 +25582,17 @@ static esp_err_t apply_toggle_setting(
 {
     switch (kind) {
     case SETTINGS_TOGGLE_THEME:
-        return app_settings_set_dark_mode(enabled);
+        return app_configuration_set_dark_mode(enabled);
     case SETTINGS_TOGGLE_ETHERNET:
-        return app_settings_set_ethernet_enabled(enabled);
+        return app_configuration_set_ethernet_enabled(enabled);
     case SETTINGS_TOGGLE_WIFI:
-        return app_settings_set_wifi_enabled(enabled);
+        return app_configuration_set_wifi_enabled(enabled);
     case SETTINGS_TOGGLE_AUDIO:
-        return app_settings_set_audio_enabled(enabled);
+        return app_configuration_set_audio_enabled(enabled);
     case SETTINGS_TOGGLE_LIGHT_SLEEP:
-        return app_settings_set_light_sleep_enabled(enabled);
+        return app_configuration_set_light_sleep_enabled(enabled);
     case SETTINGS_TOGGLE_DEEP_SLEEP:
-        return app_settings_set_deep_sleep_enabled(enabled);
+        return app_configuration_set_deep_sleep_enabled(enabled);
     }
 
     return ESP_ERR_INVALID_ARG;
@@ -24873,7 +25672,7 @@ static void toggle_apply_task(void *arg)
     const esp_err_t ret = apply_toggle_setting(
         request.kind,
         request.requested_enabled);
-    const app_settings_snapshot_t settings = app_settings_get();
+    const app_configuration_snapshot_t settings = app_configuration_get();
     const bool saved_enabled = setting_value_for_kind(&settings, request.kind);
     const bool rebuild_theme =
         ret == ESP_OK && request.kind == SETTINGS_TOGGLE_THEME;
@@ -24924,7 +25723,7 @@ static void toggle_event_cb(lv_event_t *event)
     if (s_toggle_write_in_progress ||
         (s_last_toggle_event_us != 0 &&
          now_us - s_last_toggle_event_us < SETTINGS_TOGGLE_DEBOUNCE_US)) {
-        const app_settings_snapshot_t settings = app_settings_get();
+        const app_configuration_snapshot_t settings = app_configuration_get();
         sync_toggle_state(toggle, setting_value_for_kind(&settings, kind));
         return;
     }
@@ -24948,7 +25747,7 @@ static void toggle_event_cb(lv_event_t *event)
         NULL);
 
     if (created != pdPASS) {
-        const app_settings_snapshot_t settings = app_settings_get();
+        const app_configuration_snapshot_t settings = app_configuration_get();
         sync_toggle_state(toggle, setting_value_for_kind(&settings, kind));
         set_settings_controls_enabled(true);
         s_toggle_write_in_progress = false;
@@ -25046,9 +25845,9 @@ void settings_screen_create(
     s_toggle_count = 0;
 
     /* Required fresh read: this function is called for every Settings press. */
-    app_settings_authorized_users_t users;
-    const esp_err_t users_ret = app_settings_load_authorized_users(&users);
-    const app_settings_snapshot_t settings = app_settings_get();
+    app_configuration_authorized_users_t users;
+    const esp_err_t users_ret = app_configuration_load_authorized_users(&users);
+    const app_configuration_snapshot_t settings = app_configuration_get();
     const settings_palette_t palette = palette_for(settings.dark_mode);
 
     if (settings_screen_lock() != ESP_OK) {

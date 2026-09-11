@@ -1,3 +1,4 @@
+
 #include "app/navigation/app_navigation.h"
 
 #include "app/camera/camera_session.h"
@@ -6,8 +7,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "app_ui.h"
-#include "settings_screen.h"
+#include "domain/ports/presentation_port.h"
 
 
 static const char *TAG = "app_main";
@@ -20,8 +20,8 @@ static void show_settings_task(void *arg)
     (void)arg;
 
     /* The launcher event has returned, so it is safe to take the LVGL mutex. */
-    app_ui_destroy();
-    settings_screen_create(settings_back_requested, NULL);
+    presentation_launcher_destroy();
+    presentation_settings_create(settings_back_requested, NULL);
 
     /*
      * The Settings view now owns the application UI.
@@ -44,8 +44,8 @@ static void show_launcher_task(void *arg)
     (void)arg;
 
     /* Reload the launcher using the currently saved light/dark theme. */
-    settings_screen_destroy();
-    app_ui_create(
+    presentation_settings_destroy();
+    presentation_launcher_create(
         camera_session_launcher_start_requested,
         launcher_settings_requested,
         NULL);
@@ -109,13 +109,13 @@ esp_err_t app_navigation_start(void)
         return ESP_FAIL;
     }
 
-    app_ui_create(
+    presentation_launcher_create(
         camera_session_launcher_start_requested,
         launcher_settings_requested,
         NULL);
 
     if (!camera_session_launcher_touch_ready()) {
-        app_ui_show_error(
+        presentation_launcher_show_error(
             "Touch controller unavailable. Check the touch cable and BSP display selection.");
     }
 
