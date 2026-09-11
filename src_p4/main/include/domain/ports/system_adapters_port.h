@@ -12,7 +12,7 @@ extern "C" {
 #endif
 
 /*
- * Application-facing port implemented by src/main/platform/.
+ * Application-facing port implemented by src_p4/main/platform/.
  * Application Logic depends on this neutral contract, not on concrete
  * platform headers. The platform layer remains the owner of board/driver APIs.
  */
