@@ -5,3 +5,16 @@ src/dependencies.lock
 /backup_ai_backend_20260818_222402
 /tools/.venv-tflite-int8
 /extractor
+
+# IDE
+.vscode/
+# Python generated files
+__pycache__/
+*.pyc
+*.pyo
+# Local Python environment
+tools/.venv-tflite-int8/
+# ESP-IDF generated build directories
+# Temporary backup files
+*.bak
+*.backup_*
