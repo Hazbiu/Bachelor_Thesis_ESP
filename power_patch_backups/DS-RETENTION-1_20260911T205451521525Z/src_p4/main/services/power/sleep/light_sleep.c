@@ -46,8 +46,6 @@ static const char *TAG = "light_sleep";
 static esp_sleep_wakeup_cause_t s_last_wakeup_cause =
     ESP_SLEEP_WAKEUP_UNDEFINED;
 
-static bool s_vddsdio_request_owned;
-
 static esp_err_t configure_documented_light_sleep_domains(void)
 {
     /*
@@ -56,9 +54,6 @@ static esp_err_t configure_documented_light_sleep_domains(void)
     * supply-power-down path. The leakage workarounds above reduce CS leakage
     * while the rail remains powered.
     */
-    if (s_vddsdio_request_owned) {
-        return ESP_ERR_INVALID_STATE;
-    }
     esp_err_t ret = esp_sleep_pd_config(
         ESP_PD_DOMAIN_VDDSDIO,
         ESP_PD_OPTION_ON);
@@ -69,8 +64,6 @@ static esp_err_t configure_documented_light_sleep_domains(void)
             esp_err_to_name(ret));
         return ret;
     }
-
-    s_vddsdio_request_owned = true;
 
     /*
     * RTC_PERIPH is intentionally not touched here. ESP-IDF/component drivers
@@ -85,22 +78,21 @@ static esp_err_t configure_documented_light_sleep_domains(void)
 
 static void restore_light_sleep_domain_defaults(void)
 {
-    /* Release exactly our ON reference. AUTO would erase other owners'
-     * references in ESP-IDF 5.5.4's esp_sleep_pd_config(). */
-    if (!s_vddsdio_request_owned) {
-        return;
-    }
+    /*
+    * Do not leave a manual VDD_SPI ON request behind for the later
+    * Deep-sleep path. AUTO still keeps the rail powered in ACTIVE mode; it
+    * only lets ESP-IDF choose the correct state at the next sleep entry.
+    */
     esp_err_t ret = esp_sleep_pd_config(
         ESP_PD_DOMAIN_VDDSDIO,
-        ESP_PD_OPTION_OFF);
-    if (ret == ESP_OK) {
-        s_vddsdio_request_owned = false;
-    } else {
-        ESP_LOGE(TAG, "Could not release owned VDD_SPI sleep request: %s",
-                 esp_err_to_name(ret));
+        ESP_PD_OPTION_AUTO);
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Could not restore VDD_SPI/PSRAM sleep domain to AUTO: %s",
+            esp_err_to_name(ret));
     }
 }
-
 
 static esp_err_t disable_sleep_source_if_enabled(esp_sleep_source_t source)
 {

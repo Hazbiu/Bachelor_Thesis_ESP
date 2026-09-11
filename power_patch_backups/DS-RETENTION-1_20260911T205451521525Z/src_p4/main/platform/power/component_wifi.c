@@ -1,3 +1,4 @@
+
 #include "platform/power/component_wifi.h"
 
 #include <inttypes.h>
@@ -231,8 +232,9 @@ static esp_err_t configure_c6_chip_pu_low(
          * Never allow an internal pull-up on C6 CHIP_PU. Enable the internal
          * pull-down as a secondary safeguard while the HP GPIO block is alive.
          *
-         * This internal pull alone does not establish a post-entry clamp.
-         * The final Deep-sleep boundary separately arms PMU pad retention.
+         * IMPORTANT: ESP32-P4 revision v1.3 cannot rely on this internal pull
+         * after the HP GPIO domain powers down. A board-level pull-down remains
+         * the only guaranteed Deep-sleep clamp.
          */
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_ENABLE,
@@ -282,8 +284,13 @@ static esp_err_t configure_c6_chip_pu_low(
         return ret;
     }
 
-    /* Prepare the per-pin latch while awake. On older P4 silicon the
-     * PMU sleep-state hold is also needed when TOP loses power. */
+    /*
+     * Latch output-enable, LOW output value, GPIO function and drive strength.
+     * This is useful while the hardware supports the latch, but on this board
+     * the silicon is ESP32-P4 v1.3 and the measured GPIO54 level still rises
+     * after the real Deep-sleep transition. Do not treat this hold as a
+     * replacement for the external C6 CHIP_PU pull-down.
+     */
     ret = gpio_hold_en(pin);
     if (ret != ESP_OK) {
         ESP_LOGE(
@@ -326,8 +333,8 @@ static esp_err_t configure_c6_chip_pu_low(
             TAG,
             "C6-FINAL: GPIO%d CHIP_PU re-clamped LOW immediately before "
             "Deep-sleep (read-back=%d, pullup=OFF pulldown=ON sleep-switch=OFF). "
-            "This is a pre-entry check; deep_sleep.c separately arms the "
-            "PMU sleep-state hold on supported old-P4/IDF builds.",
+            "ESP32-P4 silicon is v1.3: external CHIP_PU pull-down is still "
+            "required for guaranteed LOW after HP GPIO power-down.",
             pin,
             level_after_hold);
     } else {
@@ -483,9 +490,9 @@ esp_err_t component_wifi_prepare_mode_for_deep_sleep(void)
 esp_err_t component_wifi_disable_for_deep_sleep(void)
 {
     /*
-     * Request mode LOW and clamp CHIP_PU LOW. deep_sleep.c arms the PMU
-     * sleep-state hold so CHIP_PU need not rise when TOP loses power.
-     * The external companion firmware is not verified by this P4 code.
+     * Preserve the existing P4 Deep-sleep strategy. GPIO6/C6-GPIO2 LOW means
+     * that when GPIO54 later rises after the P4 HP GPIO domain powers down, the
+     * freshly booting companion immediately enters C6 self-Deep-sleep.
      */
     esp_err_t ret = component_wifi_prepare_mode_for_deep_sleep();
     if (ret != ESP_OK) {

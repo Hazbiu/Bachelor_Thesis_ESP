@@ -1,3 +1,4 @@
+
 #include "services/power/sleep/deep_sleep.h"
 
 #include <stdbool.h>
@@ -11,9 +12,6 @@
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
 #include "esp_err.h"
-#include "esp_chip_info.h"
-#include "esp_idf_version.h"
-#include "esp_system.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "platform/power/component_audio.h"
@@ -22,44 +20,7 @@
 #include "platform/power/component_wifi.h"
 #include "soc/soc_caps.h"
 
-#if APP_PWR_DEEP_SLEEP_PMU_HP_PAD_HOLD && CONFIG_ESP32P4_SELECTS_REV_LESS_V3
-#if ESP_IDF_VERSION != ESP_IDF_VERSION_VAL(5, 5, 4)
-#error "DS-RETENTION-1 private PMU workaround reviewed for ESP-IDF 5.5.4 only; review SDK or disable APP_PWR_DEEP_SLEEP_PMU_HP_PAD_HOLD"
-#endif
-#include "hal/pmu_ll.h"
-#include "soc/pmu_struct.h"
-#endif
-
 static const char *TAG = "deep_sleep";
-
-/* Program only the PMU SLEEP-state policy. Flash/UART remain operational
- * in ACTIVE; esp_deep_sleep_start() performs its normal memory shutdown.
- * Reference: IDF v5.5.4 gpio_ll.h, pmu_param.c and pmu_sleep_digital_init().
- * The latter updates LP hold but does not overwrite HP pad hold.
- */
-static esp_err_t arm_hp_pad_retention_for_deep_sleep(void)
-{
-    esp_chip_info_t chip;
-    esp_chip_info(&chip);
-    ESP_LOGI(TAG, "DS-RETENTION-1: IDF=%s chip_revision=%u.%u",
-             esp_get_idf_version(), (unsigned)(chip.revision / 100),
-             (unsigned)(chip.revision % 100));
-#if APP_PWR_DEEP_SLEEP_PMU_HP_PAD_HOLD && CONFIG_ESP32P4_SELECTS_REV_LESS_V3
-    if (chip.revision < 300) {
-        const unsigned before =
-            PMU.hp_sys[PMU_MODE_HP_SLEEP].syscntl.hp_pad_hold_all;
-        pmu_ll_hp_set_hold_all_hp_pad(&PMU, PMU_MODE_HP_SLEEP, true);
-        const unsigned after =
-            PMU.hp_sys[PMU_MODE_HP_SLEEP].syscntl.hp_pad_hold_all;
-        ESP_LOGI(TAG, "DS-RETENTION-1: PMU HP_SLEEP pad_hold_all %u -> %u; "
-                 "policy armed, verify GPIO45/51/53/54 during actual sleep",
-                 before, after);
-        return after == 1U ? ESP_OK : ESP_ERR_INVALID_STATE;
-    }
-#endif
-    ESP_LOGI(TAG, "DS-RETENTION-1: PMU workaround skipped (disabled or rev >= 3)");
-    return ESP_OK;
-}
 
 #define WAKE_BUTTON_GPIO APP_DEEP_SLEEP_BUTTON_GPIO
 
@@ -82,12 +43,29 @@ static esp_err_t arm_hp_pad_retention_for_deep_sleep(void)
 #define SHARED_I2C_SCL_GPIO APP_PWR_SHARED_I2C_SCL_GPIO
 
 /*
- * Per-pin HP hold alone is insufficient when TOP loses power on old P4
- * silicon. The separate PMU HP_SLEEP pad hold is armed at the final boundary.
- * No immediate gpio_force_hold_all() is used. LP wake GPIO3 remains under
- * ESP-IDF wake-source management. Successful register readback proves only
- * the pre-entry configuration, never the physical post-entry voltage.
- */
+* NOTE ON GPIO HOLDS AND THIS BOARD'S ESP32-P4 REVISION
+*
+* The tested board reports ESP32-P4 revision v1.3. GPIO54 is an HP/digital
+* GPIO and physically drives ESP32-C6 CHIP_PU. Bench measurement showed:
+*
+*     before esp_deep_sleep_start(): GPIO54 ~= 0 V
+*     in real Deep-sleep:            GPIO54 ~= 3.3 V
+*
+* Therefore the generic SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP capability
+* macro must not be interpreted as a guarantee that this v1.3 board will keep
+* GPIO54 LOW after the HP GPIO domain powers down.
+*
+* We still use per-pin gpio_hold_en() as the best software preparation and
+* re-apply GPIO54 at the final application-controlled boundary. On this
+* project GPIO54 rising in real P4 Deep-sleep is now intentional: it releases
+* C6 CHIP_PU, the already-installed C6 self-sleep firmware boots, and the C6
+* immediately enters its own Deep-sleep. Therefore no external pull-down and
+* no additional GPIO54 hold trick is requested here.
+*
+* gpio_force_hold_all() is deliberately NOT used: it would also freeze flash,
+* UART and GPIO3, and ESP-IDF explicitly warns against using the global force
+* hold as a normal Deep-sleep retention solution.
+*/
 
 static void record_first_error(
     esp_err_t operation_result,
@@ -266,10 +244,10 @@ static void audit_rails_before_deep_sleep(void)
     if (mismatches == 0) {
         ESP_LOGI(
             AUDIT_TAG,
-            "Pre-entry checks passed; post-entry rail levels are NOT measured here: "
-            "C6 mode GPIO LOW + CHIP_PU LOW, IP101GRI RESET LOW held, "
+            "All software-controlled Deep-sleep states verified: "
+            "C6 mode GPIO LOW + self-sleep policy armed, IP101GRI RESET LOW held, "
             "ES8311 suspend, NS4150B off, GT911 FULL SLEEP, microSD rail off "
-            "and shared I2C high. Display shutdown requested "
+            "and shared I2C high. Hybrid display continuity also guarantees "
             "LCD SLEEP_IN before the Light-sleep transport is destroyed.");
     } else {
         ESP_LOGE(AUDIT_TAG,
@@ -928,19 +906,13 @@ void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
         TAG,
         "C6-FINAL-AUDIT: GPIO%d CHIP_PU level=%d expected=%d "
         "mode_gpio%d=%d expected_mode=%d "
-        "scope=PRE_ENTRY_ONLY",
+        "silicon=v1.3 deep_sleep_behavior=C6_self_sleep_trigger",
         APP_PWR_WIFI_C6_CHIP_PU_GPIO,
         c6_final_level,
         APP_PWR_WIFI_C6_DISABLED_LEVEL,
         APP_PWR_WIFI_C6_MODE_GPIO,
         gpio_get_level(APP_PWR_WIFI_C6_MODE_GPIO),
         APP_PWR_WIFI_C6_MODE_DEEP_LEVEL);
-
-    const esp_err_t retention_ret = arm_hp_pad_retention_for_deep_sleep();
-    if (retention_ret != ESP_OK) {
-        ESP_LOGE(TAG, "DS-RETENTION-1: PMU hold could not be armed: %s",
-                 esp_err_to_name(retention_ret));
-    }
 
     ESP_LOGI(
         TAG,

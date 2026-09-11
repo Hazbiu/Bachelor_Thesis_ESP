@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include <stdbool.h>
@@ -33,8 +34,8 @@ esp_err_t component_wifi_restore_after_light_sleep(void);
 
 /**
  * Drive and hold the C6 mode sideband LOW for the real Deep-sleep boundary.
- * This establishes the pre-entry sideband state; it does not verify that
- * the external C6 firmware has entered sleep.
+ * This keeps the existing self-Deep-sleep behavior deterministic when GPIO54
+ * rises after the ESP32-P4 v1.3 HP GPIO domain powers down.
  */
 esp_err_t component_wifi_prepare_mode_for_deep_sleep(void);
 
@@ -55,9 +56,9 @@ esp_err_t component_wifi_disable_for_deep_sleep(void);
  * Re-apply GPIO54 LOW at the last possible application-controlled point before
  * esp_deep_sleep_start().
  *
- * This prepares the per-pin clamp. deep_sleep.c additionally arms the
- * PMU sleep-state HP-pad hold on the reviewed old-P4/ESP-IDF configuration.
- * Physical voltage during sleep must be checked on the board.
+ * This is a best-effort software clamp for ESP32-P4 revision v1.3. GPIO54 is
+ * an HP/digital GPIO, so an external pull-down on C6 CHIP_PU is still required
+ * for guaranteed LOW level while the HP GPIO domain is powered off.
  */
 esp_err_t component_wifi_force_off_at_sleep_boundary(void);
 

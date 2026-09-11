@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include "driver/gpio.h"
@@ -379,29 +380,19 @@
 #define APP_PWR_GT911_GREEN_IDLE_SECONDS            0U
 
 /*
- * DS-RETENTION-1: ESP-IDF 5.5.4 initializes HP_SLEEP.hp_pad_hold_all=0.
- * On P4 rev < 3.0, individual HP pad hold registers are in the TOP domain.
- * Arm the PMU SLEEP-state hold before real Deep-sleep to retain peripheral
- * control levels while TOP is off. This does not force-hold pads in ACTIVE.
- * Private HAL coupling is deliberately limited to the reviewed SDK version.
- */
-#ifndef APP_PWR_DEEP_SLEEP_PMU_HP_PAD_HOLD
-#define APP_PWR_DEEP_SLEEP_PMU_HP_PAD_HOLD          1
-#endif
-
-/*
  * Final ESP32-P4 software-only Deep-sleep pass.
  *
- * - Leave domain ownership to ESP-IDF. Its real Deep-sleep path already
- *   forces TOP, CPU, memory, VDDSDIO, XTAL and CNNT off. Extra application
- *   OFF requests are disabled; they do not fix peripheral pad retention.
+ * - Explicitly request OFF for P4 power domains that are not needed by the
+ *   single GPIO3 wake source. ESP-IDF's default AUTO policy should already
+ *   remove these domains, but the explicit requests make the intent auditable
+ *   and prevent a stale application setting from keeping them on.
  * - Float only board peripheral signal pins whose owning peripherals have
  *   already been shut down. Control rails (GPIO45/53/54) and wake GPIO3 are
  *   deliberately excluded.
  * - UART0 GPIO37/38 are floated at the very last boundary, after fflush(), so
  *   the CH343P-side pins cannot create a P4 I/O leakage path during sleep.
  */
-#define APP_PWR_DEEP_SLEEP_FORCE_DOMAINS_OFF        0
+#define APP_PWR_DEEP_SLEEP_FORCE_DOMAINS_OFF        1
 #define APP_PWR_QUIESCE_PERIPHERAL_SIGNAL_PINS      1
 #define APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY       1
 
