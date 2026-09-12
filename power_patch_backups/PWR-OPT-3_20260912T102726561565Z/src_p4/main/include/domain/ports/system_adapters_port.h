@@ -35,16 +35,12 @@ esp_err_t system_cpu_face_boost_begin(void);
 esp_err_t system_cpu_face_boost_end(void);
 bool system_cpu_face_boost_is_active(void);
 uint32_t system_cpu_face_detect_interval_frames(void);
-uint32_t system_cpu_ai_min_interval_ms(void);
-uint32_t system_cpu_preview_min_interval_ms(void);
-int system_cpu_backlight_percent(void);
 
 /* Display */
 lv_display_t *system_display_start(void);
 void system_display_disable_lvgl_overlays(lv_display_t *display);
 void system_display_backlight_on(void);
 void system_display_backlight_off(void);
-esp_err_t system_display_backlight_set_percent(int percent);
 esp_err_t system_display_suspend_for_light_sleep(bool prepare_panel_for_deep);
 lv_display_t *system_display_resume_from_light_sleep(void);
 lv_indev_t *system_display_get_input_device(void);

@@ -98,7 +98,7 @@ static void ai_worker_task(void *arg)
             APP_MAX_FACE_BOXES);
 #endif
 
-        ESP_LOGI(TAG,
+        ESP_LOGD(TAG,
                  "AI worker detection complete: frame=%" PRIu32 " faces=%d",
                  job.frame_id, face_count);
         diagnostics_ai_detection_result(face_count);
@@ -122,7 +122,7 @@ static void ai_worker_task(void *arg)
 
         s_hooks.notify_activity();
 
-#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8 && APP_POWER_VERBOSE_AI_TRACE
         printf(
             "[INT8-POSITIVE-PATH] frame=%" PRIu32
             " faces=%d idle_scan=%d display_suspended=%d\n",
@@ -171,7 +171,7 @@ static void ai_worker_task(void *arg)
                 char name[FACE_RECOG_MAX_NAME_LEN] = "unknown";
                 float recog_score = 0.0f;
 
-#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
+#if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8 && APP_POWER_VERBOSE_AI_TRACE
                 printf(
                     "[INT8-RECOG-TRIGGER] frame=%" PRIu32
                     " face=%d detector_score=%.6f\n",
@@ -209,7 +209,7 @@ static void ai_worker_task(void *arg)
                     s_hooks.recognition_not_authenticated();
                 }
 
-                ESP_LOGI(TAG,
+                ESP_LOGD(TAG,
                          "Face %d recognition: name=%s similarity=%.3f result=%s",
                          i,
                          name,

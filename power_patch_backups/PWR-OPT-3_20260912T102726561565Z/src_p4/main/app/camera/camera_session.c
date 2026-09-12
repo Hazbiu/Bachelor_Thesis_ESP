@@ -107,15 +107,6 @@ static bool idle_scan_resume_task_pending = false;
 static portMUX_TYPE idle_scan_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static uint32_t frame_count = 0;
-static int64_t s_last_preview_start_us = -1;
-static int64_t s_last_ai_submit_us = -1;
-
-static bool work_interval_elapsed(int64_t now_us, int64_t last_us,
-                                  uint32_t interval_ms)
-{
-    return last_us < 0 || now_us < last_us ||
-        now_us - last_us >= (int64_t)interval_ms * 1000;
-}
 
 /*
  * AI runs on CPU1 from a private, downscaled snapshot. The camera/display
@@ -1314,10 +1305,6 @@ static void camera_video_frame_process(
 
     void *target_fb = NULL;
     esp_err_t ret = ESP_OK;
-    const int64_t frame_start_us = esp_timer_get_time();
-    const bool preview_due = !display_backlight_enabled ||
-        work_interval_elapsed(frame_start_us, s_last_preview_start_us,
-                              system_cpu_preview_min_interval_ms());
 
     /*
      * DISPLAY FIRST.
@@ -1327,7 +1314,7 @@ static void camera_video_frame_process(
      * the PPA scale, overlays the most recently completed AI result, submits
      * the frame, and returns. AI runs independently on CPU1.
      */
-    if (!idle_scan_frame && preview_due) {
+    if (!idle_scan_frame) {
         if (active_display_buffer_count == 0) {
             ESP_LOGE(TAG, "No active display buffer");
             return;
@@ -1449,13 +1436,9 @@ if (system_camera_is_rgb565()) {
 
             display_buffer_index =
                 (display_buffer_index + 1) % active_display_buffer_count;
-            s_last_preview_start_us = frame_start_us;
 
-            /* First frame, real activity and idle stages all use the same
-             * brightness adapter. It caches successful values, so this does
-             * not create an I2C transaction on every rendered frame. */
-            if (system_display_backlight_set_percent(
-                    system_cpu_backlight_percent()) == ESP_OK) {
+            if (!display_backlight_enabled) {
+                system_display_backlight_on();
                 display_backlight_enabled = true;
             }
         }
@@ -1464,7 +1447,7 @@ if (system_camera_is_rgb565()) {
     frame_count++;
 
     if ((frame_count % 100U) == 0U) {
-        ESP_LOGD(TAG,
+        ESP_LOGI(TAG,
                  "[CORE-PROOF] DISPLAY frame=%" PRIu32
                  " cpu=%d task=%s affinity=%d",
                  frame_count,
@@ -1481,22 +1464,14 @@ if (system_camera_is_rgb565()) {
     const uint32_t detect_interval_frames =
         system_cpu_face_detect_interval_frames();
 
-    /* Rendering can be skipped while camera buffers continue to circulate.
-     * AI scheduling stays outside the preview gate and still uses the newest
-     * camera buffer. Failed/busy submissions do not consume the time budget. */
-    const int64_t submit_us = esp_timer_get_time();
     if (detect_interval_frames > 0 &&
-        (frame_count % detect_interval_frames) == 0U &&
-        work_interval_elapsed(submit_us, s_last_ai_submit_us,
-                              system_cpu_ai_min_interval_ms())) {
-        if (vision_ai_snapshot_scheduler_schedule(
+        (frame_count % detect_interval_frames) == 0U) {
+        (void)vision_ai_snapshot_scheduler_schedule(
             camera_buf,
             camera_buf_len,
             camera_buf_hes,
             camera_buf_ves,
             frame_count,
-            idle_scan_frame)) {
-            s_last_ai_submit_us = submit_us;
-        }
+            idle_scan_frame);
     }
 }

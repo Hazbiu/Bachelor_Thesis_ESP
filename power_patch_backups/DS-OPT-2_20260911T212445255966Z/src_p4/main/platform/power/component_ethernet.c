@@ -22,10 +22,6 @@
 
 /* IP101G standard IEEE 802.3 MII Control Register (BMCR, register 0). */
 #define IP101G_REG_BMCR              0U
-#define IP101G_REG_PHYID1            2U
-#define IP101G_REG_PHYID2            3U
-#define IP101G_OUI                   0x0090C3U
-#define IP101G_MODEL                 0x05U
 #define IP101G_BMCR_RESET            (1U << 15)
 #define IP101G_BMCR_LOOPBACK         (1U << 14)
 #define IP101G_BMCR_SPEED_100        (1U << 13)
@@ -39,8 +35,6 @@
 #define IP101G_MDIO_HALF_US          2U
 #define IP101G_REDUCED_SETTLE_MS     20U
 #define IP101G_RESTORE_SETTLE_MS     20U
-#define IP101G_RESET_ASSERT_US       10000U
-#define IP101G_RESET_RELEASE_US      10000U
 
 static const char *TAG = "component_ethernet";
 
@@ -49,8 +43,6 @@ static bool s_user_enabled = true;
 static bool s_light_reduced_mode_active;
 static bool s_bmcr_snapshot_valid;
 static uint16_t s_bmcr_snapshot;
-static bool s_deep_bmcr_power_down;
-static bool s_policy_initialized;
 
 
 static int wait_for_pad_level(
@@ -84,10 +76,8 @@ static int wait_for_pad_level(
  *     MDC  = GPIO31
  *     MDIO = GPIO52
  *
- * The Waveshare schematic provides a 1.5k external MDIO pull-up (R59).
- * Use open-drain MDIO to avoid driving against the PHY at turnaround.
- * The Deep-sleep path separately holds MDC idle LOW and disables the MDIO
- * input/output buffers; it never holds MDIO LOW against that pull-up.
+ * We use the pins only at the Light-sleep boundary, then return them to
+ * INPUT/no-pull so they are not continuously driven while the P4 sleeps.
  */
 static inline void mdio_delay_half_period(void)
 {
@@ -97,10 +87,6 @@ static inline void mdio_delay_half_period(void)
 
 static esp_err_t mdio_prepare_bus(void)
 {
-    esp_err_t ret = gpio_hold_dis(ETHERNET_MDC_GPIO);
-    if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
-        return ret;
-    }
     gpio_config_t mdc_cfg = {
         .pin_bit_mask = 1ULL << ETHERNET_MDC_GPIO,
         .mode = GPIO_MODE_OUTPUT,
@@ -108,15 +94,15 @@ static esp_err_t mdio_prepare_bus(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    ret = gpio_config(&mdc_cfg);
+    esp_err_t ret = gpio_config(&mdc_cfg);
     if (ret != ESP_OK) {
         return ret;
     }
 
     gpio_config_t mdio_cfg = {
         .pin_bit_mask = 1ULL << ETHERNET_MDIO_GPIO,
-        .mode = GPIO_MODE_INPUT_OUTPUT_OD,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
@@ -125,11 +111,9 @@ static esp_err_t mdio_prepare_bus(void)
         return ret;
     }
 
-    ret = gpio_set_level(ETHERNET_MDC_GPIO, 0);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    return gpio_set_level(ETHERNET_MDIO_GPIO, 1);
+    gpio_set_level(ETHERNET_MDC_GPIO, 0);
+    gpio_set_level(ETHERNET_MDIO_GPIO, 1);
+    return ESP_OK;
 }
 
 
@@ -179,7 +163,7 @@ static void mdio_write_bits(uint32_t value, unsigned bit_count)
 
 static void mdio_preamble(void)
 {
-    gpio_set_direction(ETHERNET_MDIO_GPIO, GPIO_MODE_INPUT_OUTPUT_OD);
+    gpio_set_direction(ETHERNET_MDIO_GPIO, GPIO_MODE_INPUT_OUTPUT);
     for (unsigned i = 0; i < 32U; ++i) {
         mdio_write_bit(1);
     }
@@ -331,109 +315,6 @@ static esp_err_t configure_phy_reset_level(
 
     return ESP_OK;
 }
-
-
-/* IP101 reset timings match ESP-IDF v5.5.4's IP101 PHY driver. */
-static esp_err_t reset_phy_to_defaults(void)
-{
-    esp_err_t ret = configure_phy_reset_level(
-        ETHERNET_PHY_RESET_ACTIVE, false, true);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    s_deep_bmcr_power_down = false;
-    esp_rom_delay_us(IP101G_RESET_ASSERT_US);
-    ret = configure_phy_reset_level(
-        ETHERNET_PHY_RESET_RELEASED, false, true);
-    if (ret == ESP_OK) {
-        esp_rom_delay_us(IP101G_RESET_RELEASE_US);
-    }
-    return ret;
-}
-
-
-static esp_err_t hold_deep_mdio_idle(void)
-{
-    esp_err_t ret = gpio_hold_dis(ETHERNET_MDC_GPIO);
-    if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
-        return ret;
-    }
-    gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << ETHERNET_MDC_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ret = gpio_config(&cfg);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    ret = gpio_set_level(ETHERNET_MDC_GPIO, 0);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    ret = gpio_sleep_sel_dis(ETHERNET_MDC_GPIO);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    ret = gpio_hold_en(ETHERNET_MDC_GPIO);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    cfg.pin_bit_mask = 1ULL << ETHERNET_MDIO_GPIO;
-    cfg.mode = GPIO_MODE_DISABLE;
-    ret = gpio_config(&cfg);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    return gpio_sleep_sel_dis(ETHERNET_MDIO_GPIO);
-}
-
-
-static esp_err_t enter_deep_reset_state(void)
-{
-    const esp_err_t ret = configure_phy_reset_level(
-        ETHERNET_PHY_RESET_ACTIVE, true, true);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    s_deep_bmcr_power_down = false;
-    return hold_deep_mdio_idle();
-}
-
-
-static esp_err_t deep_reset_fallback(esp_err_t cause)
-{
-    const esp_err_t ret = enter_deep_reset_state();
-    ESP_LOGW(TAG, "DS-OPT-2: Ethernet BMCR verification failed (%s); "
-             "RESET_LOW fallback=%s. Register power-down is NOT verified.",
-             esp_err_to_name(cause), esp_err_to_name(ret));
-    /* Preserve the failure so callers do not report verified BMCR shutdown. */
-    return ret == ESP_OK ? cause : ret;
-}
-
-
-#if APP_PWR_ETHERNET_DEEP_BMCR_POWER_DOWN
-static esp_err_t identify_ip101(void)
-{
-    uint16_t id1 = 0, id2 = 0;
-    esp_err_t ret = mdio_read_register(IP101G_REG_PHYID1, &id1);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    ret = mdio_read_register(IP101G_REG_PHYID2, &id2);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    const uint32_t oui = ((uint32_t)id1 << 6) | (id2 >> 10);
-    const unsigned model = (id2 >> 4) & 0x3FU;
-    ESP_LOGI(TAG, "DS-OPT-2: PHY%d ID1=0x%04x ID2=0x%04x OUI=0x%06" PRIx32
-             " model=0x%02x", ETHERNET_PHY_ADDRESS, id1, id2, oui, model);
-    return oui == IP101G_OUI && model == IP101G_MODEL
-        ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
-}
-#endif
 
 
 esp_err_t component_ethernet_enter_light_sleep_reduced_mode(void)
@@ -613,128 +494,78 @@ esp_err_t component_ethernet_restore_after_light_sleep(void)
 
 esp_err_t component_ethernet_disable_for_deep_sleep(void)
 {
+    /*
+     * Deep-sleep remains the hard-off boundary. Even if Light-sleep used the
+     * powered 10 Mbps reduced mode, assert hardware RESET LOW here.
+     */
     s_light_reduced_mode_active = false;
     s_bmcr_snapshot_valid = false;
 
-#if APP_PWR_ETHERNET_DEEP_BMCR_POWER_DOWN
-    /* Reset first so a previous reduced-mode/register-page state cannot
-     * change the meaning of the standard Clause-22 registers below. */
-    esp_err_t ret = reset_phy_to_defaults();
-    if (ret != ESP_OK) {
-        return deep_reset_fallback(ret);
-    }
-    ret = identify_ip101();
-    if (ret != ESP_OK) {
-        return deep_reset_fallback(ret);
+    const esp_err_t ret = configure_phy_reset_level(
+        ETHERNET_PHY_RESET_ACTIVE,
+        true,
+        true);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "IP101GRI Deep-sleep state: hardware RESET GPIO%d LOW and held; "
+            "BMCR wake/reprogram step intentionally skipped",
+            ETHERNET_PHY_RESET_GPIO);
     }
 
-    uint16_t bmcr = 0;
-    ret = mdio_read_register(IP101G_REG_BMCR, &bmcr);
-    if (ret != ESP_OK) {
-        return deep_reset_fallback(ret);
-    }
-    if (bmcr == 0xFFFFU || (bmcr & IP101G_BMCR_RESET) != 0U) {
-        return deep_reset_fallback(ESP_ERR_INVALID_RESPONSE);
-    }
-    const uint16_t requested = (bmcr | IP101G_BMCR_POWER_DOWN) &
-        (uint16_t)~(IP101G_BMCR_RESET | IP101G_BMCR_RESTART_AUTONEG);
-    ret = mdio_write_register(IP101G_REG_BMCR, requested);
-    if (ret != ESP_OK) {
-        return deep_reset_fallback(ret);
-    }
-    vTaskDelay(pdMS_TO_TICKS(IP101G_REDUCED_SETTLE_MS));
-
-    uint16_t readback = 0;
-    ret = mdio_read_register(IP101G_REG_BMCR, &readback);
-    if (ret != ESP_OK) {
-        return deep_reset_fallback(ret);
-    }
-    if ((readback & (IP101G_BMCR_POWER_DOWN | IP101G_BMCR_RESET)) !=
-            IP101G_BMCR_POWER_DOWN) {
-        return deep_reset_fallback(ESP_ERR_INVALID_STATE);
-    }
-
-    /* Asserting RESET here would erase BMCR. Retain HIGH deliberately.
-     * DS-RETENTION-1 must retain this pad once the P4 HP domain turns off. */
-    ret = configure_phy_reset_level(ETHERNET_PHY_RESET_RELEASED, true, true);
-    if (ret != ESP_OK) {
-        return deep_reset_fallback(ret);
-    }
-    ret = hold_deep_mdio_idle();
-    if (ret != ESP_OK) {
-        return deep_reset_fallback(ret);
-    }
-    s_deep_bmcr_power_down = true;
-    ESP_LOGI(TAG, "DS-OPT-2: PHY BMCR_POWER_DOWN verified: before=0x%04x "
-             "readback=0x%04x RESET=HIGH held MDC=LOW MDIO=Hi-Z; "
-             "scope=PRE_ENTRY_ONLY", bmcr, readback);
-    return ESP_OK;
-#else
-    const esp_err_t ret = enter_deep_reset_state();
-    ESP_LOGI(TAG, "DS-OPT-2: Ethernet comparison policy=RESET_LOW result=%s",
-             esp_err_to_name(ret));
     return ret;
-#endif
 }
 
 
 esp_err_t component_ethernet_verify_power_down(void)
 {
     const int level = gpio_get_level(ETHERNET_PHY_RESET_GPIO);
-    const int expected = component_ethernet_deep_sleep_reset_level();
-    if (level != expected) {
-        return deep_reset_fallback(ESP_ERR_INVALID_STATE);
+
+    if (level != ETHERNET_PHY_RESET_ACTIVE) {
+        ESP_LOGE(
+            TAG,
+            "IP101GRI Deep-sleep verification failed: RESET GPIO%d=%d "
+            "expected=%d",
+            ETHERNET_PHY_RESET_GPIO,
+            level,
+            ETHERNET_PHY_RESET_ACTIVE);
+        return ESP_ERR_INVALID_STATE;
     }
 
-    if (s_deep_bmcr_power_down) {
-        uint16_t bmcr = 0;
-        esp_err_t ret = mdio_read_register(IP101G_REG_BMCR, &bmcr);
-        if (ret != ESP_OK) {
-            return deep_reset_fallback(ret);
-        }
-        if ((bmcr & (IP101G_BMCR_POWER_DOWN | IP101G_BMCR_RESET)) !=
-                IP101G_BMCR_POWER_DOWN) {
-            return deep_reset_fallback(ESP_ERR_INVALID_STATE);
-        }
-        ret = hold_deep_mdio_idle();
-        if (ret != ESP_OK) {
-            return deep_reset_fallback(ret);
-        }
-        ESP_LOGI(TAG, "DS-OPT-2: PHY final audit BMCR=0x%04x "
-                 "POWER_DOWN=1 RESET=HIGH; scope=PRE_ENTRY_ONLY", bmcr);
-    } else {
-        const esp_err_t ret = hold_deep_mdio_idle();
-        if (ret != ESP_OK) {
-            return ret;
-        }
-        ESP_LOGI(TAG, "DS-OPT-2: PHY final audit RESET=LOW; "
-                 "BMCR power-down not used; scope=PRE_ENTRY_ONLY");
-    }
+    ESP_LOGI(
+        TAG,
+        "IP101GRI final audit OK: hardware RESET GPIO%d LOW",
+        ETHERNET_PHY_RESET_GPIO);
 
     return ESP_OK;
 }
 
 
-int component_ethernet_deep_sleep_reset_level(void)
-{
-    return s_deep_bmcr_power_down
-        ? ETHERNET_PHY_RESET_RELEASED : ETHERNET_PHY_RESET_ACTIVE;
-}
-
-
-const char *component_ethernet_deep_sleep_state(void)
-{
-    if (s_deep_bmcr_power_down) {
-        return "BMCR_POWER_DOWN";
-    }
-    return s_reset_asserted ? "RESET_LOW" : "NOT_PREPARED";
-}
-
-
 esp_err_t component_ethernet_restore_after_failed_sleep(void)
 {
-    /* Reapply the saved policy, clearing retained POWER_DOWN when enabled. */
-    return component_ethernet_set_enabled(s_user_enabled);
+    if (!s_user_enabled) {
+        ESP_LOGI(
+            TAG,
+            "IP101GRI remains in hardware RESET because saved Ethernet policy is OFF");
+        return configure_phy_reset_level(
+            ETHERNET_PHY_RESET_ACTIVE,
+            true,
+            true);
+    }
+
+    const esp_err_t ret = configure_phy_reset_level(
+        ETHERNET_PHY_RESET_RELEASED,
+        false,
+        true);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "IP101GRI hardware RESET released after failed Deep-sleep entry");
+    }
+
+    return ret;
 }
 
 
@@ -745,29 +576,15 @@ esp_err_t component_ethernet_set_enabled(bool enabled)
     s_light_reduced_mode_active = false;
     s_bmcr_snapshot_valid = false;
 
-    /* Deep-sleep restarts the P4, but not the externally powered PHY.
-     * On first policy application, reset a retained BMCR before enabling.
-     * Later idempotent ON calls leave an already-active PHY undisturbed. */
-    const bool needs_reset = enabled &&
-        (!s_policy_initialized || s_deep_bmcr_power_down || s_reset_asserted);
-    const esp_err_t ret = needs_reset
-        ? reset_phy_to_defaults()
-        : configure_phy_reset_level(
-              enabled ? ETHERNET_PHY_RESET_RELEASED : ETHERNET_PHY_RESET_ACTIVE,
-              !enabled, true);
+    const esp_err_t ret = configure_phy_reset_level(
+        enabled ? ETHERNET_PHY_RESET_RELEASED : ETHERNET_PHY_RESET_ACTIVE,
+        !enabled,
+        true);
 
     if (ret != ESP_OK) {
         s_user_enabled = previous_policy;
         return ret;
     }
-    s_policy_initialized = true;
-    s_deep_bmcr_power_down = false;
-
-    const esp_err_t bus_ret = gpio_hold_dis(ETHERNET_MDC_GPIO);
-    if (bus_ret != ESP_OK && bus_ret != ESP_ERR_NOT_SUPPORTED) {
-        return bus_ret;
-    }
-    mdio_release_bus();
 
     ESP_LOGI(
         TAG,
@@ -780,5 +597,5 @@ esp_err_t component_ethernet_set_enabled(bool enabled)
 
 bool component_ethernet_is_enabled(void)
 {
-    return s_user_enabled && !s_reset_asserted && !s_deep_bmcr_power_down;
+    return s_user_enabled && !s_reset_asserted;
 }

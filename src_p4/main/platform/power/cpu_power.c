@@ -176,13 +176,25 @@ esp_err_t cpu_power_init(void)
 
     ESP_LOGI(
         TAG,
-        "event=CPU_POLICY active_baseline_mhz=%d max_mhz=%d "
+        "PWR-OPT-3 event=CPU_POLICY active_baseline_mhz=%d max_mhz=%d "
         "eco_scan_8_after_ms=%u eco_scan_16_after_ms=%u "
         "camera_display_teardown=disabled",
         APP_CPU_ACTIVE_FREQ_MHZ,
         APP_CPU_MAX_FREQ_MHZ,
         (unsigned)APP_CPU_IDLE_180_AFTER_MS,
         (unsigned)APP_CPU_IDLE_90_AFTER_MS);
+
+    ESP_LOGI(TAG, "PWR-OPT-3: profile=%d backlight_pct=%d/%d/%d "
+             "ai_min_ms=%u/%u/%u preview_min_ms=%u/%u/%u",
+             APP_POWER_OPTIMIZATION_PROFILE,
+             APP_BACKLIGHT_ACTIVE_PERCENT, APP_BACKLIGHT_ECO1_PERCENT,
+             APP_BACKLIGHT_ECO2_PERCENT,
+             (unsigned)APP_AI_ACTIVE_MIN_INTERVAL_MS,
+             (unsigned)APP_AI_ECO1_MIN_INTERVAL_MS,
+             (unsigned)APP_AI_ECO2_MIN_INTERVAL_MS,
+             (unsigned)APP_PREVIEW_ACTIVE_MIN_INTERVAL_MS,
+             (unsigned)APP_PREVIEW_ECO1_MIN_INTERVAL_MS,
+             (unsigned)APP_PREVIEW_ECO2_MIN_INTERVAL_MS);
 
     return ESP_OK;
 }
@@ -253,7 +265,7 @@ esp_err_t cpu_power_face_boost_begin(void)
         return ret;
     }
 
-    ESP_LOGI(TAG, "event=FACE_BOOST_ACQUIRED target_mhz=%d",
+    ESP_LOGD(TAG, "event=FACE_BOOST_ACQUIRED target_mhz=%d",
              APP_CPU_MAX_FREQ_MHZ);
     return ESP_OK;
 }
@@ -294,7 +306,7 @@ esp_err_t cpu_power_face_boost_end(void)
         return ret;
     }
 
-    ESP_LOGI(TAG, "event=FACE_BOOST_RELEASED active_baseline_mhz=%d",
+    ESP_LOGD(TAG, "event=FACE_BOOST_RELEASED active_baseline_mhz=%d",
              APP_CPU_ACTIVE_FREQ_MHZ);
     return ret;
 }
@@ -316,10 +328,9 @@ static void select_scan_state(
         return;
     }
 
-    cpu_power_state_t target_state = requested_state;
-    if (s_face_boost_active) {
-        target_state = CPU_POWER_STATE_ACTIVE;
-    }
+    /* A no-face detector also uses the boost. Frequency-lock ownership is
+     * separate from inactivity; only actual activity restores the fast scan. */
+    const cpu_power_state_t target_state = requested_state;
 
     cpu_power_state_t previous_state;
     portENTER_CRITICAL(&s_state_lock);
@@ -354,12 +365,6 @@ void cpu_power_update_inactivity(uint32_t inactive_ms)
         return;
     }
 
-    /* A face-authentication burst always has priority over idle staging. */
-    if (cpu_power_is_face_boost_active()) {
-        restore_active();
-        return;
-    }
-
     if (inactive_ms >= APP_CPU_IDLE_90_AFTER_MS) {
         select_scan_state(CPU_POWER_STATE_ECO_SCAN_16, inactive_ms);
     } else if (inactive_ms >= APP_CPU_IDLE_180_AFTER_MS) {
@@ -388,4 +393,43 @@ uint32_t cpu_power_get_face_detect_interval_frames(void)
 bool cpu_power_is_idle_scan_active(void)
 {
     return false;
+}
+
+
+static cpu_power_state_t current_scan_state(void)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    const cpu_power_state_t state = s_state;
+    portEXIT_CRITICAL(&s_state_lock);
+    return state;
+}
+
+
+uint32_t cpu_power_get_ai_min_interval_ms(void)
+{
+    switch (current_scan_state()) {
+    case CPU_POWER_STATE_ECO_SCAN_8: return APP_AI_ECO1_MIN_INTERVAL_MS;
+    case CPU_POWER_STATE_ECO_SCAN_16: return APP_AI_ECO2_MIN_INTERVAL_MS;
+    default: return APP_AI_ACTIVE_MIN_INTERVAL_MS;
+    }
+}
+
+
+uint32_t cpu_power_get_preview_min_interval_ms(void)
+{
+    switch (current_scan_state()) {
+    case CPU_POWER_STATE_ECO_SCAN_8: return APP_PREVIEW_ECO1_MIN_INTERVAL_MS;
+    case CPU_POWER_STATE_ECO_SCAN_16: return APP_PREVIEW_ECO2_MIN_INTERVAL_MS;
+    default: return APP_PREVIEW_ACTIVE_MIN_INTERVAL_MS;
+    }
+}
+
+
+int cpu_power_get_backlight_percent(void)
+{
+    switch (current_scan_state()) {
+    case CPU_POWER_STATE_ECO_SCAN_8: return APP_BACKLIGHT_ECO1_PERCENT;
+    case CPU_POWER_STATE_ECO_SCAN_16: return APP_BACKLIGHT_ECO2_PERCENT;
+    default: return APP_BACKLIGHT_ACTIVE_PERCENT;
+    }
 }

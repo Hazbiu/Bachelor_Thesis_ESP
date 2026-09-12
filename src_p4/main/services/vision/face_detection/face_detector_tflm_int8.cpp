@@ -2,6 +2,7 @@
 
 #if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
 
+#include "config/app_config.h"
 #include "services/vision/backends/face_detector_backend.h"
 
 #include <algorithm>
@@ -748,11 +749,11 @@ static int run_common(
         filtered, width, height, transform, boxes, max_boxes);
 
     /*
-     * The normal ESP_LOG tag can be filtered by runtime logging settings.
-     * For live RGB565 frames, print one compact line every eighth invocation
-     * (and every positive detection) so detector behavior is always observable.
+     * Raw printf bypasses ESP_LOG tag filtering. Make this repeated audit
+     * opt-in for power measurements; model decoding and thresholds above
+     * remain identical. The one-time initialization marker remains visible.
      */
-    if (rgb565) {
+    if (APP_POWER_VERBOSE_AI_TRACE && rgb565) {
         s_live_detector_diag_calls++;
         if (count > 0 || (s_live_detector_diag_calls % 8U) == 1U) {
             printf(

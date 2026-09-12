@@ -27,6 +27,8 @@ void display_platform_disable_lvgl_overlays(
  */
 void display_platform_backlight_on(void);
 void display_platform_backlight_off(void);
+/* Caller serializes display ownership as for on/off. Writes only on change. */
+esp_err_t display_platform_backlight_set_percent(int percent);
 
 /*
  * BSP display lifecycle adapter.

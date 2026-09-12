@@ -1,7 +1,5 @@
 #pragma once
 
-#include "config/app_config.h"
-
 /*
  * Central application log switches.
  *
@@ -17,9 +15,7 @@
 #define APP_LOG_ENABLE_APPLICATION           1
 #define APP_LOG_ENABLE_CAMERA                0
 #define APP_LOG_ENABLE_DISPLAY               0
-/* Repeated model benchmark/core traces are optional during power tests.
- * APP_LOG_KEEP_UNSELECTED_ERRORS below keeps backend errors visible. */
-#define APP_LOG_ENABLE_AI                    APP_POWER_VERBOSE_AI_TRACE
+#define APP_LOG_ENABLE_AI                    1
 #define APP_LOG_ENABLE_UI                    0
 
 /*

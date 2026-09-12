@@ -1,3 +1,4 @@
+
 #include "app/authentication/authentication_flow.h"
 
 #include "app/controller/app_controller.h"
@@ -313,9 +314,6 @@ static void pin_screen_transition_task(void *arg)
     }
 
     authentication_session_mark_pin_active();
-    /* Camera rendering is paused in PIN mode. Restore the active brightness
-     * here even if the last camera frame used a dimmed inactivity setting. */
-    system_display_backlight_on();
 
     /*
      * presentation_pin_show() succeeded and completed its synchronous first

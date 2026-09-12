@@ -49,61 +49,38 @@
 #define APP_AI_WORKER_DRAIN_TIMEOUT_MS              18000U
 
 /*
- * PWR-OPT-3 active-power policy. Profile 1=balanced, 2=eco.
- * Clock limits remain 180/360 MHz; every inference may use the maximum.
- * A temporary inference boost does not cancel the no-face scan stage.
- * Real face/user activity restores the active stage through notify_activity.
+ * Adaptive active-power policy.
  *
- * Frame strides remain 2/8/16. Wall-clock limits additionally cap how often
- * a new AI job and preview render can start. They never queue old frames.
+ * ACTIVE (0..5 seconds without a face):
+ *   - camera and MIPI-DSI display are active;
+ *   - CPU normally runs at the 180 MHz baseline;
+ *   - a positive face detection requests the 360 MHz maximum;
+ *   - the 360 MHz request is held through recognition and the PIN transition;
+ *   - once the PIN screen is visible, the request is released and the CPU
+ *     returns to the 180 MHz baseline;
+ *   - detection runs every 2 camera frames.
  *
- * Profile 2 deliberately keeps preview rendering responsive in both ECO stages:
- * 100 ms ACTIVE, 125 ms ECO-SCAN-8, 125 ms ECO-SCAN-16. AI scheduling and
- * backlight dimming still become progressively more aggressive, so the main
- * active-power savings are retained without degrading the live LCD to 4/2 FPS.
- * The camera/ISP/DSI stay initialized; model inputs, thresholds and
- * authentication decisions are unchanged.
+ * ECO-SCAN-8 (5..10 seconds without a face):
+ *   - camera, ISP, LVGL and MIPI-DSI remain initialized;
+ *   - the unlocked CPU baseline remains 180 MHz;
+ *   - detection runs every 8 camera frames;
+ *   - no shared camera/display hardware is deleted while CSI is active.
+ *
+ * ECO-SCAN-16 (10..15 seconds without a face):
+ *   - camera, ISP and display remain initialized;
+ *   - the unlocked CPU baseline remains 180 MHz;
+ *   - detection runs every 16 camera frames;
+ *   - the CPU is not reduced to 90 MHz while the CSI/ISP pipeline is active.
+ *
+ * A face detected during either ECO-SCAN stage requests 360 MHz and restores
+ * the normal detection interval. With both saved Power Modes enabled, the
+ * coordinated Light-sleep path starts at 15 seconds and Deep-sleep follows
+ * 10 seconds later unless touch/GPIO3 restores Active mode.
  */
-#ifndef APP_POWER_OPTIMIZATION_PROFILE
-#define APP_POWER_OPTIMIZATION_PROFILE             2
-#endif
-#define APP_POWER_VERBOSE_AI_TRACE                 0
 #define APP_CPU_MAX_FREQ_MHZ                        360
 #define APP_CPU_ACTIVE_FREQ_MHZ                     180
-
-#if APP_POWER_OPTIMIZATION_PROFILE == 1
-#define APP_CPU_IDLE_180_AFTER_MS                   3000U
-#define APP_CPU_IDLE_90_AFTER_MS                    7000U
-#define APP_AI_ACTIVE_MIN_INTERVAL_MS              200U
-#define APP_AI_ECO1_MIN_INTERVAL_MS                 500U
-#define APP_AI_ECO2_MIN_INTERVAL_MS                 1000U
-#define APP_PREVIEW_ACTIVE_MIN_INTERVAL_MS         67U
-#define APP_PREVIEW_ECO1_MIN_INTERVAL_MS            125U
-#define APP_PREVIEW_ECO2_MIN_INTERVAL_MS            250U
-#define APP_BACKLIGHT_ACTIVE_PERCENT               70
-#define APP_BACKLIGHT_ECO1_PERCENT                 40
-#define APP_BACKLIGHT_ECO2_PERCENT                 20
-#elif APP_POWER_OPTIMIZATION_PROFILE == 2
-#define APP_CPU_IDLE_180_AFTER_MS                   2000U
-#define APP_CPU_IDLE_90_AFTER_MS                    5000U
-#define APP_AI_ACTIVE_MIN_INTERVAL_MS              350U
-#define APP_AI_ECO1_MIN_INTERVAL_MS                 1000U
-#define APP_AI_ECO2_MIN_INTERVAL_MS                 1500U
-#define APP_PREVIEW_ACTIVE_MIN_INTERVAL_MS         100U
-#define APP_PREVIEW_ECO1_MIN_INTERVAL_MS            125U
-#define APP_PREVIEW_ECO2_MIN_INTERVAL_MS            125U
-#define APP_BACKLIGHT_ACTIVE_PERCENT               50
-#define APP_BACKLIGHT_ECO1_PERCENT                 25
-#define APP_BACKLIGHT_ECO2_PERCENT                 10
-#else
-#error "APP_POWER_OPTIMIZATION_PROFILE must be 1 (balanced) or 2 (eco)"
-#endif
-
-/* JD9365DA-H3 datasheet section 10.2.15: Sleep-In takes 120 ms.
- * Keep the live DPI/DSI path until this interval has passed after SLPIN.
- * This adds entry time; it is not a claim about the measured sleep current. */
-#define APP_LCD_SLEEP_IN_SETTLE_MS                 120U
-#define APP_LCD_DISPLAY_OFF_SETTLE_MS              50U
+#define APP_CPU_IDLE_180_AFTER_MS                   5000U
+#define APP_CPU_IDLE_90_AFTER_MS                    10000U
 
 /*
  * Runtime inactivity sleep policy.

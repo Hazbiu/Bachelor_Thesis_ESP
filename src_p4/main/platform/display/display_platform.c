@@ -5,6 +5,7 @@
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
 #include "driver/i2c_master.h"
+#include "config/app_config.h"
 #include "esp_err.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
@@ -12,6 +13,9 @@
 #include "freertos/task.h"
 
 static const char *TAG = "display_platform";
+/* All writes use the application's existing display ownership/barrier.
+ * Invalidate at lifecycle boundaries because the BSP also writes brightness. */
+static int s_last_backlight_percent = -1;
 
 /*
  * External display-controller Deep-sleep recovery
@@ -35,9 +39,9 @@ static const char *TAG = "display_platform";
  *     0x96 <- 0x00
  *
  * It MUST run while the panel/DPI path is still alive and before the normal
- * DISPLAY_OFF / SLEEP_IN / MIPI teardown.  The 2 s settle interval deliberately
- * matches the successful Test13 experiment.  Shorten it only after the full
- * application has been re-measured.
+ * DISPLAY_OFF / SLEEP_IN / MIPI teardown. This update preserves the supplied
+ * recovery bytes and its zero extra settling delay. The panel command waits
+ * are handled separately in display_platform_panel_enter_full_sleep().
  */
 #define DISPLAY_CTRL_I2C_ADDRESS              0x45U
 #define DISPLAY_CTRL_STATE_REGISTER           0x95U
@@ -175,20 +179,46 @@ void display_platform_disable_lvgl_overlays(
 }
 
 
+esp_err_t display_platform_backlight_set_percent(int percent)
+{
+    if (percent < 0 || percent > 100) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (percent == s_last_backlight_percent) {
+        return ESP_OK;
+    }
+    const esp_err_t ret = bsp_display_brightness_set(percent);
+    if (ret == ESP_OK) {
+        s_last_backlight_percent = percent;
+        ESP_LOGI("PWR_STATE", "PWR-OPT-3: backlight request=%d%% accepted", percent);
+    } else {
+        /* Do not cache a failed write: the next frame must be able to retry. */
+        s_last_backlight_percent = -1;
+        ESP_LOGW("PWR_STATE", "PWR-OPT-3: backlight request=%d%% failed: %s",
+                 percent, esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+
 void display_platform_backlight_on(void)
 {
-    (void)bsp_display_backlight_on();
+    (void)display_platform_backlight_set_percent(APP_BACKLIGHT_ACTIVE_PERCENT);
 }
 
 
 void display_platform_backlight_off(void)
 {
-    (void)bsp_display_backlight_off();
+    /* OFF is never suppressed by the cache: external/BSP code may have
+     * changed the controller since the last application brightness request. */
+    s_last_backlight_percent = -1;
+    (void)display_platform_backlight_set_percent(0);
 }
 
 
 lv_display_t *display_platform_start(void)
 {
+    s_last_backlight_percent = -1;
     lv_display_t *display = bsp_display_start();
 
     if (display != NULL) {
@@ -227,7 +257,8 @@ esp_err_t display_platform_panel_enter_full_sleep(void)
 
     esp_err_t first_error = ESP_OK;
 
-    esp_err_t ret = bsp_display_backlight_off();
+    s_last_backlight_percent = -1;
+    esp_err_t ret = display_platform_backlight_set_percent(0);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "LCD FULL SLEEP: backlight OFF requested");
     } else {
@@ -279,15 +310,23 @@ esp_err_t display_platform_panel_enter_full_sleep(void)
         }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(20));
+    /* Datasheet section 9.5.3: tDISOFF >= 50 ms when DISPLAY_OFF is used. */
+    vTaskDelay(pdMS_TO_TICKS(APP_LCD_DISPLAY_OFF_SETTLE_MS) + 1);
 
     ret = esp_lcd_panel_disp_sleep(panel, true);
     if (ret == ESP_OK) {
+        /* JD9365DA-H3 datasheet section 10.2.15 (p.144): Sleep-In takes
+         * 120 ms, and DPI timing continues for two frames after SLPIN.
+         * Keep the transport alive here. The extra tick prevents tick-phase
+         * rounding from making a nominal 120 ms delay shorter than 120 ms.
+         * This wait also applies when the installed panel driver waits too. */
+        vTaskDelay(pdMS_TO_TICKS(APP_LCD_SLEEP_IN_SETTLE_MS) + 1);
         s_panel_sleep_committed = true;
         ESP_LOGI(
-            TAG,
-            "LCD FULL SLEEP accepted: SLEEP_IN (DCS 0x10); "
-            "panel scan/oscillator shutdown committed before transport teardown");
+            "PWR_STATE",
+            "PWR-OPT-3: LCD SLEEP_IN accepted; >=%u ms settling complete "
+            "before transport teardown; panel current not measured here",
+            (unsigned)APP_LCD_SLEEP_IN_SETTLE_MS);
     } else {
         ESP_LOGW(
             TAG,
@@ -333,12 +372,14 @@ esp_err_t display_platform_suspend_for_light_sleep(
         }
     }
 
+    s_last_backlight_percent = -1;
     return bsp_display_suspend_for_light_sleep();
 }
 
 
 lv_display_t *display_platform_resume_from_light_sleep(void)
 {
+    s_last_backlight_percent = -1;
     lv_display_t *display = bsp_display_resume_from_light_sleep();
 
     if (display != NULL) {

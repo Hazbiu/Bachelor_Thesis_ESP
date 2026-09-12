@@ -1,3 +1,5 @@
+
+
 #include "services/power/sleep/app_sleep.h"
 
 #include <inttypes.h>
@@ -177,8 +179,7 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
 #endif
         const char *sdcard_state = "PRESERVED";
 #if APP_LIGHT_SLEEP_ETHERNET_REDUCED_10M
-        const char *ethernet_state = component_ethernet_is_enabled()
-            ? "POWERED_10M" : "OFF_BY_POLICY";
+        const char *ethernet_state = "POWERED_10M";
 #else
         const char *ethernet_state = "UNCHANGED";
 #endif
@@ -232,8 +233,7 @@ static esp_err_t restore_aux_peripherals_after_light_sleep(void)
 #endif
         const char *sdcard_state = "PRESERVED";
 #if APP_LIGHT_SLEEP_ETHERNET_REDUCED_10M
-        const char *ethernet_state = component_ethernet_is_enabled()
-            ? "ACTIVE" : "OFF_BY_POLICY";
+        const char *ethernet_state = "ACTIVE";
 #else
         const char *ethernet_state = "UNCHANGED";
 #endif
@@ -1080,26 +1080,24 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
 
     ESP_LOGI(
         TAG,
-        "STEP 7: applying and verifying IP101GRI Deep-sleep policy");
+        "STEP 7: keeping IP101GRI in hardware RESET LOW for Deep-sleep");
 
-    sleep_power_profile_before("IP101GRI Ethernet sleep policy");
+    sleep_power_profile_before("IP101GRI Ethernet RESET LOW");
     esp_err_t ethernet_ret = component_ethernet_disable_for_deep_sleep();
 
     if (ethernet_ret == ESP_OK) {
         ESP_LOGI(
             TAG,
-            "Ethernet PHY pre-entry state verified: %s",
-            component_ethernet_deep_sleep_state());
+            "Ethernet PHY Deep-sleep continuity verified: RESET LOW held");
     } else {
         ESP_LOGW(
             TAG,
-            "Ethernet PHY preferred shutdown failed: %s; resulting state=%s",
-            esp_err_to_name(ethernet_ret),
-            component_ethernet_deep_sleep_state());
+            "Ethernet PHY hardware-reset shutdown failed: %s",
+            esp_err_to_name(ethernet_ret));
     }
 
     sleep_power_profile_after(
-        "IP101GRI Ethernet sleep policy",
+        "IP101GRI Ethernet RESET LOW",
         esp_err_to_name(ethernet_ret));
 
     ESP_LOGI(TAG, "STEP 8: preparing final ESP32-P4 deep-sleep boundary");
@@ -1278,7 +1276,7 @@ static void inactivity_power_policy_task(void *arg)
             POWER_TAG,
             "event=LIGHT_SLEEP_STATE_POLICY version=15 "
             "mode=UNIFIED_FULL_PANEL_SLEEP sdcard=PRESERVED gt911=POLLING "
-            "touch_poll_ms=%u backlight=" APP_LIGHT_SLEEP_BACKLIGHT_STATE " ethernet=FOLLOWS_SAVED_POLICY "
+            "touch_poll_ms=%u backlight=" APP_LIGHT_SLEEP_BACKLIGHT_STATE " ethernet=POWERED_10M "
             "deep_stage_delay_ms=%u light_to_deep_residency_ms=10000",
             (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
             (unsigned)APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS);
@@ -1430,10 +1428,8 @@ static void inactivity_power_policy_task(void *arg)
             POWER_TAG,
             "event=LIGHT_SLEEP_HARDWARE_SUSPENDED "
             "camera=OFF display=OFF backlight=" APP_LIGHT_SLEEP_BACKLIGHT_STATE " audio=OFF sdcard=PRESERVED "
-            "ethernet=%s c6=%s "
-            "gt911=POLLING ram=PRESERVED",
-            component_ethernet_is_enabled() ? "POWERED_10M" : "OFF_BY_POLICY",
-            component_wifi_is_enabled() ? "RETAINED_80MHZ" : "OFF_BY_POLICY");
+            "ethernet=POWERED_10M c6=RETAINED_80MHZ "
+            "gt911=POLLING ram=PRESERVED");
 
         /*
         * PRE-SLEEP CHECK

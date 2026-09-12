@@ -16,7 +16,6 @@
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
-#include "esp_rom_uart.h"
 #include "platform/power/component_audio.h"
 #include "platform/power/component_display.h"
 #include "platform/power/component_ethernet.h"
@@ -127,7 +126,7 @@ static const deep_sleep_rail_t s_audited_rails[] = {
         .gpio_num = APP_PWR_ETHERNET_PHY_RESET_GPIO,
         .description = "IP101GRI PHY RESET",
         .expected_level = APP_PWR_ETHERNET_RESET_ACTIVE_LEVEL,
-        .consequence_if_wrong = "PHY RESET differs from selected sleep policy",
+        .consequence_if_wrong = "PHY reset released; Ethernet can draw active current",
     },
     {
         .gpio_num = APP_PWR_AUDIO_AMP_GPIO,
@@ -185,16 +184,19 @@ static void audit_rails_before_deep_sleep(void)
 
     ESP_LOGI(AUDIT_TAG, "---- Pre-Deep-sleep rail audit ----------------------");
 
-    /* This may fall back to RESET LOW; obtain the expected level afterwards. */
+    /*
+    * Hybrid continuity policy: keep the PHY in the same electrical state that
+    * produced the lower Light-sleep plateau. GPIO51 must remain LOW/held all
+    * the way into P4 Deep-sleep; do not release RESET to program BMCR.
+    */
     esp_err_t ethernet_ret = component_ethernet_verify_power_down();
     if (ethernet_ret == ESP_OK) {
-        ESP_LOGI(AUDIT_TAG, "IP101GRI selected state=%s OK",
-                 component_ethernet_deep_sleep_state());
+        ESP_LOGI(AUDIT_TAG, "IP101GRI hardware RESET LOW/held          OK");
     } else {
         mismatches++;
         ESP_LOGE(
             AUDIT_TAG,
-            "IP101GRI selected-state verification FAILED (%s)",
+            "IP101GRI hardware RESET LOW/held          FAILED (%s)",
             esp_err_to_name(ethernet_ret));
     }
 
@@ -241,16 +243,14 @@ static void audit_rails_before_deep_sleep(void)
     for (size_t i = 0; i < sizeof(s_audited_rails) / sizeof(s_audited_rails[0]); i++) {
         const deep_sleep_rail_t *rail = &s_audited_rails[i];
         const int level = gpio_get_level((gpio_num_t)rail->gpio_num);
-        const int expected_level = rail->gpio_num == APP_PWR_ETHERNET_PHY_RESET_GPIO
-            ? component_ethernet_deep_sleep_reset_level() : rail->expected_level;
-        const bool matches = (level == expected_level);
+        const bool matches = (level == rail->expected_level);
 
         if (matches) {
             ESP_LOGI(AUDIT_TAG, "GPIO%-2d %-22s level=%d expected=%d  OK",
                     rail->gpio_num,
                     rail->description,
                     level,
-                    expected_level);
+                    rail->expected_level);
         } else {
             mismatches++;
             ESP_LOGE(AUDIT_TAG,
@@ -258,7 +258,7 @@ static void audit_rails_before_deep_sleep(void)
                     rail->gpio_num,
                     rail->description,
                     level,
-                    expected_level,
+                    rail->expected_level,
                     rail->consequence_if_wrong);
         }
     }
@@ -267,7 +267,7 @@ static void audit_rails_before_deep_sleep(void)
         ESP_LOGI(
             AUDIT_TAG,
             "Pre-entry checks passed; post-entry rail levels are NOT measured here: "
-            "C6 mode GPIO LOW + CHIP_PU LOW, selected IP101GRI policy, "
+            "C6 mode GPIO LOW + CHIP_PU LOW, IP101GRI RESET LOW held, "
             "ES8311 suspend, NS4150B off, GT911 FULL SLEEP, microSD rail off "
             "and shared I2C high. Display shutdown requested "
             "LCD SLEEP_IN before the Light-sleep transport is destroyed.");
@@ -397,9 +397,9 @@ static esp_err_t float_digital_pin_for_deep_sleep(gpio_num_t gpio_num)
 {
     /*
     * Release any stale application hold, then stop driving the pin and remove
-    * internal pulls. Disable the input buffer too: floating input buffers
-    * can draw current. Global PMU pad retention is armed separately after
-    * all peripheral signals and control levels have their final settings.
+    * internal pulls. Do not create a new HP-GPIO hold here: bench testing on
+    * this board's ESP32-P4 rev-v1.3 showed that arbitrary HP pad holds cannot
+    * be treated as persistent once the HP domain powers down.
     */
     esp_err_t ret = gpio_hold_dis(gpio_num);
     if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
@@ -408,7 +408,7 @@ static esp_err_t float_digital_pin_for_deep_sleep(gpio_num_t gpio_num)
 
     gpio_config_t io_config = {
         .pin_bit_mask = 1ULL << gpio_num,
-        .mode = GPIO_MODE_DISABLE,
+        .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
@@ -449,7 +449,7 @@ static esp_err_t float_sdmmc_pins_for_deep_sleep(void)
     if (failed == 0) {
         ESP_LOGI(
             TAG,
-            "SDMMC GPIO39..44 buffers DISABLED/no-pull after SD1_VDD off; "
+            "SDMMC GPIO39..44 floated INPUT/no-pull after SD1_VDD off; "
             "card signal back-power path minimized");
     } else {
         ESP_LOGW(
@@ -474,8 +474,8 @@ static unsigned peripheral_signal_group(gpio_num_t pin)
         return 1; /* C6 SDIO / sideband; GPIO6 is a retained mode-control pin */
     case 20: case 21:
         return 2; /* C6 programming UART */
-    case 28: case 29: case 30: case 34: case 35: case 49: case 50: case 52:
-        return 3; /* Ethernet RMII / released MDIO */
+    case 28: case 29: case 30: case 34: case 35: case 49: case 50:
+        return 3; /* Ethernet RMII */
     case 46: case 47:
         return 4; /* Camera CSI sideband */
     default:
@@ -487,12 +487,12 @@ static void quiesce_peripheral_signal_pins_for_deep_sleep(void)
 {
     static const int signal_pins[] = APP_PWR_PERIPHERAL_SIGNAL_PIN_LIST;
     static const char *const group_names[] = {
-        "Audio I2S GPIOs DISABLED/no-pull",
-        "C6 SDIO / sideband GPIOs DISABLED/no-pull",
-        "C6 programming UART GPIOs DISABLED/no-pull",
-        "Ethernet RMII GPIOs DISABLED/no-pull",
-        "Camera CSI sideband GPIOs DISABLED/no-pull",
-        "Additional configured signal GPIOs DISABLED/no-pull",
+        "Audio I2S GPIOs INPUT/no-pull",
+        "C6 SDIO / sideband GPIOs INPUT/no-pull",
+        "C6 programming UART GPIOs INPUT/no-pull",
+        "Ethernet RMII GPIOs INPUT/no-pull",
+        "Camera CSI sideband GPIOs INPUT/no-pull",
+        "Additional configured signal GPIOs INPUT/no-pull",
     };
     unsigned total_failed = 0U;
 
@@ -514,8 +514,7 @@ static void quiesce_peripheral_signal_pins_for_deep_sleep(void)
                 gpio_num == APP_PWR_AUDIO_AMP_GPIO ||
                 gpio_num == APP_PWR_WIFI_C6_MODE_GPIO ||
                 gpio_num == APP_PWR_WIFI_C6_CHIP_PU_GPIO ||
-                gpio_num == APP_PWR_ETHERNET_PHY_RESET_GPIO ||
-                gpio_num == APP_PWR_ETHERNET_MDC_GPIO) {
+                gpio_num == APP_PWR_ETHERNET_PHY_RESET_GPIO) {
                 failed++;
                 ESP_LOGE(TAG, "Refusing to float protected control/wake GPIO%d",
                          (int)gpio_num);
@@ -830,9 +829,9 @@ void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
                                   "SEE_PWR_AUDIT_LOG");
 
 #if APP_PWR_ISOLATE_SDMMC_PINS
-        sleep_power_profile_before("SDMMC GPIO39..44 DISABLED/no-pull");
+        sleep_power_profile_before("SDMMC GPIO39..44 INPUT/no-pull");
         const esp_err_t sd_pins_ret = float_sdmmc_pins_for_deep_sleep();
-        sleep_power_profile_after("SDMMC GPIO39..44 DISABLED/no-pull",
+        sleep_power_profile_after("SDMMC GPIO39..44 INPUT/no-pull",
                                   esp_err_to_name(sd_pins_ret));
 #endif
 
@@ -943,11 +942,6 @@ void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
                  esp_err_to_name(retention_ret));
     }
 
-    ESP_LOGI(TAG, "PWR-OPT-3: final PHY policy=%s RESET_expected=%d "
-             "signal_buffers=DISABLED retention=DS-RETENTION-1",
-             component_ethernet_deep_sleep_state(),
-             component_ethernet_deep_sleep_reset_level());
-
     ESP_LOGI(
         TAG,
         "Entering Deep-sleep. Press the GPIO%d button to wake up.",
@@ -961,15 +955,6 @@ void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
      * work afterwards is a silent FreeRTOS delay; no application log is issued.
      * The P4 then really enters Deep-sleep, so no post-entry pause is possible. */
     fflush(stdout);
-    fflush(stderr);
-    /* fflush() drains the C stream, not the hardware shift register.
-     * IDF also flushes UARTs inside esp_deep_sleep_start(), but that is too
-     * late once the TX pin has already been disconnected below. */
-#if defined(CONFIG_ESP_CONSOLE_UART) && CONFIG_ESP_CONSOLE_UART
-    if (uart_ll_is_enabled(CONFIG_ESP_CONSOLE_UART_NUM)) {
-        esp_rom_output_tx_wait_idle(CONFIG_ESP_CONSOLE_UART_NUM);
-    }
-#endif
 
 #if APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY
     if (profile == DEEP_SLEEP_PROFILE_AGGRESSIVE) {

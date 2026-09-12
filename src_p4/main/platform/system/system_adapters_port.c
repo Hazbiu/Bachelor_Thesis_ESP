@@ -43,6 +43,21 @@ uint32_t system_cpu_face_detect_interval_frames(void)
     return cpu_power_get_face_detect_interval_frames();
 }
 
+uint32_t system_cpu_ai_min_interval_ms(void)
+{
+    return cpu_power_get_ai_min_interval_ms();
+}
+
+uint32_t system_cpu_preview_min_interval_ms(void)
+{
+    return cpu_power_get_preview_min_interval_ms();
+}
+
+int system_cpu_backlight_percent(void)
+{
+    return cpu_power_get_backlight_percent();
+}
+
 lv_display_t *system_display_start(void)
 {
     return display_platform_start();
@@ -61,6 +76,11 @@ void system_display_backlight_on(void)
 void system_display_backlight_off(void)
 {
     display_platform_backlight_off();
+}
+
+esp_err_t system_display_backlight_set_percent(int percent)
+{
+    return display_platform_backlight_set_percent(percent);
 }
 
 esp_err_t system_display_suspend_for_light_sleep(bool prepare_panel_for_deep)

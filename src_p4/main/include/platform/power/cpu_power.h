@@ -39,6 +39,11 @@ void cpu_power_notify_activity(void);
 
 /* Return 2, 8 or 16 frames for ACTIVE, ECO-SCAN-8 or ECO-SCAN-16. */
 uint32_t cpu_power_get_face_detect_interval_frames(void);
+/* Additional work-rate/brightness budgets for the current no-face stage.
+ * These do not change CPU frequency, capture timing or model parameters. */
+uint32_t cpu_power_get_ai_min_interval_ms(void);
+uint32_t cpu_power_get_preview_min_interval_ms(void);
+int cpu_power_get_backlight_percent(void);
 
 /* Physical display-off idle scan is disabled while the camera is running. */
 bool cpu_power_is_idle_scan_active(void);
