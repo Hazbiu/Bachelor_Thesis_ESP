@@ -20,11 +20,12 @@ typedef enum {
     SETTINGS_TOGGLE_ETHERNET,
     SETTINGS_TOGGLE_WIFI,
     SETTINGS_TOGGLE_AUDIO,
+    SETTINGS_TOGGLE_ACTIVE_OPTIMIZATION,
     SETTINGS_TOGGLE_LIGHT_SLEEP,
     SETTINGS_TOGGLE_DEEP_SLEEP,
 } settings_toggle_kind_t;
 
-#define SETTINGS_TOGGLE_CAPACITY       6U
+#define SETTINGS_TOGGLE_CAPACITY       7U
 #define SETTINGS_TOGGLE_DEBOUNCE_US    250000LL
 
 typedef struct {
@@ -245,6 +246,8 @@ static bool setting_value_for_kind(
         return settings->wifi_enabled;
     case SETTINGS_TOGGLE_AUDIO:
         return settings->audio_enabled;
+    case SETTINGS_TOGGLE_ACTIVE_OPTIMIZATION:
+        return settings->active_optimization_enabled;
     case SETTINGS_TOGGLE_LIGHT_SLEEP:
         return settings->light_sleep_enabled;
     case SETTINGS_TOGGLE_DEEP_SLEEP:
@@ -267,6 +270,8 @@ static esp_err_t apply_toggle_setting(
         return app_configuration_set_wifi_enabled(enabled);
     case SETTINGS_TOGGLE_AUDIO:
         return app_configuration_set_audio_enabled(enabled);
+    case SETTINGS_TOGGLE_ACTIVE_OPTIMIZATION:
+        return app_configuration_set_active_optimization_enabled(enabled);
     case SETTINGS_TOGGLE_LIGHT_SLEEP:
         return app_configuration_set_light_sleep_enabled(enabled);
     case SETTINGS_TOGGLE_DEEP_SLEEP:
@@ -295,6 +300,10 @@ static const char *toggle_success_message(
         return enabled
             ? "Audio codec and amplifier enabled and saved."
             : "Audio codec and amplifier powered down and saved.";
+    case SETTINGS_TOGGLE_ACTIVE_OPTIMIZATION:
+        return enabled
+            ? "Active Mode Optimization enabled and saved."
+            : "Full-power active mode enabled and saved.";
     case SETTINGS_TOGGLE_LIGHT_SLEEP:
         return enabled
             ? "Light-sleep mode enabled and saved."
@@ -473,7 +482,8 @@ static lv_obj_t *create_toggle_row(
     lv_obj_set_style_bg_color(toggle, lv_color_hex(palette->border), LV_PART_MAIN);
     lv_obj_set_style_bg_color(
         toggle,
-        lv_color_hex(palette->accent),
+        lv_color_hex(kind == SETTINGS_TOGGLE_ACTIVE_OPTIMIZATION
+            ? 0x16A34A : palette->accent),
         LV_PART_INDICATOR | LV_STATE_CHECKED);
     lv_obj_set_style_bg_color(toggle, lv_color_white(), LV_PART_KNOB);
 
@@ -642,6 +652,14 @@ void settings_screen_create(
 
     create_section_label(content, "POWER MODES", &palette);
     lv_obj_t *power_modes_card = create_card(content, &palette);
+    create_toggle_row(
+        power_modes_card,
+        "Active Mode Optimization",
+        "Green: optimized. Off: full power.",
+        settings.active_optimization_enabled,
+        SETTINGS_TOGGLE_ACTIVE_OPTIMIZATION,
+        &palette);
+    create_divider(power_modes_card, &palette);
     create_toggle_row(
         power_modes_card,
         "Light Sleep",

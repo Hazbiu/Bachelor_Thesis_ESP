@@ -6,6 +6,7 @@
 #include "bsp/esp-bsp.h"
 #include "driver/i2c_master.h"
 #include "config/app_config.h"
+#include "platform/power/cpu_power.h"
 #include "esp_err.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
@@ -203,7 +204,9 @@ esp_err_t display_platform_backlight_set_percent(int percent)
 
 void display_platform_backlight_on(void)
 {
-    (void)display_platform_backlight_set_percent(APP_BACKLIGHT_ACTIVE_PERCENT);
+    (void)display_platform_backlight_set_percent(
+        cpu_power_active_optimization_is_enabled()
+            ? APP_BACKLIGHT_ACTIVE_PERCENT : 100);
 }
 
 

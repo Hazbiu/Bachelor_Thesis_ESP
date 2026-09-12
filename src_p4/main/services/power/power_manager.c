@@ -146,6 +146,16 @@ esp_err_t power_manager_set_sdcard_enabled(bool enabled)
     return component_runtime_set_sdcard_enabled(enabled);
 }
 
+esp_err_t power_manager_set_active_optimization_enabled(bool enabled)
+{
+    return cpu_power_set_active_optimization_enabled(enabled);
+}
+
+bool power_manager_active_optimization_is_enabled(void)
+{
+    return cpu_power_active_optimization_is_enabled();
+}
+
 bool power_manager_audio_policy_ready(void)
 {
     return component_runtime_audio_policy_ready();
@@ -209,9 +219,22 @@ esp_err_t power_manager_apply_configuration(
 
     esp_err_t first_error = ESP_OK;
 
-    esp_err_t ret = power_manager_set_wifi_enabled(configuration->wifi_enabled);
+    /* The first call precedes CPU initialization and selects its boot policy.
+     * Later applications are idempotent, including after Light-sleep resume.
+     * Brightness on resume remains owned by the existing first-frame path. */
+    esp_err_t ret = power_manager_set_active_optimization_enabled(
+        configuration->active_optimization_enabled);
     if (ret != ESP_OK) {
         first_error = ret;
+        ESP_LOGE(TAG, "Could not apply Active Mode Optimization: %s",
+                 esp_err_to_name(ret));
+    }
+
+    ret = power_manager_set_wifi_enabled(configuration->wifi_enabled);
+    if (ret != ESP_OK) {
+        if (first_error == ESP_OK) {
+            first_error = ret;
+        }
         ESP_LOGE(TAG, "Could not apply saved Wi-Fi policy: %s", esp_err_to_name(ret));
     }
 

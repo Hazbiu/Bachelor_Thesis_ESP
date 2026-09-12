@@ -20,11 +20,13 @@ typedef enum {
     CPU_POWER_STATE_ACTIVE = 0,
     CPU_POWER_STATE_ECO_SCAN_8,
     CPU_POWER_STATE_ECO_SCAN_16,
+    CPU_POWER_STATE_FULL_POWER,
 } cpu_power_state_t;
 
 static esp_pm_lock_handle_t s_ai_cpu_lock;
 static SemaphoreHandle_t s_policy_mutex;
 static bool s_initialized;
+static bool s_init_attempted;
 static bool s_face_boost_active;
 static cpu_power_state_t s_state = CPU_POWER_STATE_ACTIVE;
 
@@ -32,6 +34,9 @@ static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static const char *state_name(cpu_power_state_t state)
 {
+    if (state == CPU_POWER_STATE_FULL_POWER) {
+        return "FULL-POWER";
+    }
     if (state == CPU_POWER_STATE_ECO_SCAN_8) {
         return "ECO-SCAN-8";
     }
@@ -43,6 +48,9 @@ static const char *state_name(cpu_power_state_t state)
 
 static uint32_t detection_interval_for_state(cpu_power_state_t state)
 {
+    if (state == CPU_POWER_STATE_FULL_POWER) {
+        return 1U;
+    }
     if (state == CPU_POWER_STATE_ECO_SCAN_16) {
         return APP_FACE_DETECT_IDLE_90_INTERVAL_FRAMES;
     }
@@ -123,6 +131,8 @@ esp_err_t cpu_power_init(void)
         return ESP_OK;
     }
 
+    s_init_attempted = true;
+
     if (CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ != APP_CPU_MAX_FREQ_MHZ) {
         ESP_LOGE(
             TAG,
@@ -143,9 +153,14 @@ esp_err_t cpu_power_init(void)
         return ESP_FAIL;
     }
 
+    portENTER_CRITICAL(&s_state_lock);
+    const cpu_power_state_t boot_state = s_state;
+    portEXIT_CRITICAL(&s_state_lock);
+
     esp_err_t ret = apply_frequency_policy_locked(
-        APP_CPU_ACTIVE_FREQ_MHZ,
-        CPU_POWER_STATE_ACTIVE,
+        boot_state == CPU_POWER_STATE_FULL_POWER
+            ? APP_CPU_MAX_FREQ_MHZ : APP_CPU_ACTIVE_FREQ_MHZ,
+        boot_state,
         0U);
 
     xSemaphoreGive(s_policy_mutex);
@@ -169,22 +184,24 @@ esp_err_t cpu_power_init(void)
     }
 
     portENTER_CRITICAL(&s_state_lock);
-    s_state = CPU_POWER_STATE_ACTIVE;
+    s_state = boot_state;
     s_face_boost_active = false;
     s_initialized = true;
     portEXIT_CRITICAL(&s_state_lock);
 
     ESP_LOGI(
         TAG,
-        "PWR-OPT-3 event=CPU_POLICY active_baseline_mhz=%d max_mhz=%d "
+        "PWR-OPT-3 event=CPU_POLICY active_optimization=%s active_baseline_mhz=%d max_mhz=%d "
         "eco_scan_8_after_ms=%u eco_scan_16_after_ms=%u "
         "camera_display_teardown=disabled",
-        APP_CPU_ACTIVE_FREQ_MHZ,
+        boot_state == CPU_POWER_STATE_FULL_POWER ? "off" : "on",
+        boot_state == CPU_POWER_STATE_FULL_POWER
+            ? APP_CPU_MAX_FREQ_MHZ : APP_CPU_ACTIVE_FREQ_MHZ,
         APP_CPU_MAX_FREQ_MHZ,
         (unsigned)APP_CPU_IDLE_180_AFTER_MS,
         (unsigned)APP_CPU_IDLE_90_AFTER_MS);
 
-    ESP_LOGI(TAG, "PWR-OPT-3: profile=%d backlight_pct=%d/%d/%d "
+    ESP_LOGI(TAG, "PWR-OPT-3 optimized profile=%d backlight_pct=%d/%d/%d "
              "ai_min_ms=%u/%u/%u preview_min_ms=%u/%u/%u",
              APP_POWER_OPTIMIZATION_PROFILE,
              APP_BACKLIGHT_ACTIVE_PERCENT, APP_BACKLIGHT_ECO1_PERCENT,
@@ -197,6 +214,72 @@ esp_err_t cpu_power_init(void)
              (unsigned)APP_PREVIEW_ECO2_MIN_INTERVAL_MS);
 
     return ESP_OK;
+}
+
+bool cpu_power_active_optimization_is_enabled(void)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    const bool enabled = s_state != CPU_POWER_STATE_FULL_POWER;
+    portEXIT_CRITICAL(&s_state_lock);
+    return enabled;
+}
+
+esp_err_t cpu_power_set_active_optimization_enabled(bool enabled)
+{
+    const cpu_power_state_t target = enabled
+        ? CPU_POWER_STATE_ACTIVE : CPU_POWER_STATE_FULL_POWER;
+
+    /* app_runtime loads saved settings before cpu_power_init(), and before
+     * any policy/AI tasks exist. Do not change that boot ordering. */
+    if (!s_initialized) {
+        if (s_init_attempted) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        portENTER_CRITICAL(&s_state_lock);
+        s_state = target;
+        portEXIT_CRITICAL(&s_state_lock);
+        return ESP_OK;
+    }
+
+    if (s_policy_mutex == NULL ||
+        xSemaphoreTake(s_policy_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    portENTER_CRITICAL(&s_state_lock);
+    const cpu_power_state_t previous = s_state;
+    portEXIT_CRITICAL(&s_state_lock);
+
+    if ((previous != CPU_POWER_STATE_FULL_POWER) == enabled) {
+        xSemaphoreGive(s_policy_mutex);
+        return ESP_OK;
+    }
+
+    const esp_err_t ret = apply_frequency_policy_locked(
+        enabled ? APP_CPU_ACTIVE_FREQ_MHZ : APP_CPU_MAX_FREQ_MHZ,
+        target,
+        0U);
+    if (ret == ESP_OK) {
+        portENTER_CRITICAL(&s_state_lock);
+        s_state = target;
+        portEXIT_CRITICAL(&s_state_lock);
+    } else {
+        /* A verification error can occur after esp_pm_configure succeeded.
+         * Restore hardware as well as keeping the previous published state. */
+        const esp_err_t restore_ret = apply_frequency_policy_locked(
+            previous == CPU_POWER_STATE_FULL_POWER
+                ? APP_CPU_MAX_FREQ_MHZ : APP_CPU_ACTIVE_FREQ_MHZ,
+            previous,
+            0U);
+        if (restore_ret != ESP_OK) {
+            ESP_LOGE(TAG, "event=CPU_POLICY_ROLLBACK_FAILED error=%s",
+                     esp_err_to_name(restore_ret));
+        }
+    }
+
+    /* The inference lock keeps its existing ownership across mode changes. */
+    xSemaphoreGive(s_policy_mutex);
+    return ret;
 }
 
 esp_err_t cpu_power_register_idle_scan_callbacks(
@@ -307,7 +390,8 @@ esp_err_t cpu_power_face_boost_end(void)
     }
 
     ESP_LOGD(TAG, "event=FACE_BOOST_RELEASED active_baseline_mhz=%d",
-             APP_CPU_ACTIVE_FREQ_MHZ);
+             cpu_power_active_optimization_is_enabled()
+                 ? APP_CPU_ACTIVE_FREQ_MHZ : APP_CPU_MAX_FREQ_MHZ);
     return ret;
 }
 
@@ -330,11 +414,12 @@ static void select_scan_state(
 
     /* A no-face detector also uses the boost. Frequency-lock ownership is
      * separate from inactivity; only actual activity restores the fast scan. */
-    const cpu_power_state_t target_state = requested_state;
-
     cpu_power_state_t previous_state;
     portENTER_CRITICAL(&s_state_lock);
     previous_state = s_state;
+    /* Activity and inactivity must never re-enable optimization implicitly. */
+    const cpu_power_state_t target_state = previous_state == CPU_POWER_STATE_FULL_POWER
+        ? CPU_POWER_STATE_FULL_POWER : requested_state;
     s_state = target_state;
     portEXIT_CRITICAL(&s_state_lock);
 
@@ -408,6 +493,7 @@ static cpu_power_state_t current_scan_state(void)
 uint32_t cpu_power_get_ai_min_interval_ms(void)
 {
     switch (current_scan_state()) {
+    case CPU_POWER_STATE_FULL_POWER: return 0U;
     case CPU_POWER_STATE_ECO_SCAN_8: return APP_AI_ECO1_MIN_INTERVAL_MS;
     case CPU_POWER_STATE_ECO_SCAN_16: return APP_AI_ECO2_MIN_INTERVAL_MS;
     default: return APP_AI_ACTIVE_MIN_INTERVAL_MS;
@@ -418,6 +504,7 @@ uint32_t cpu_power_get_ai_min_interval_ms(void)
 uint32_t cpu_power_get_preview_min_interval_ms(void)
 {
     switch (current_scan_state()) {
+    case CPU_POWER_STATE_FULL_POWER: return 0U;
     case CPU_POWER_STATE_ECO_SCAN_8: return APP_PREVIEW_ECO1_MIN_INTERVAL_MS;
     case CPU_POWER_STATE_ECO_SCAN_16: return APP_PREVIEW_ECO2_MIN_INTERVAL_MS;
     default: return APP_PREVIEW_ACTIVE_MIN_INTERVAL_MS;
@@ -428,6 +515,7 @@ uint32_t cpu_power_get_preview_min_interval_ms(void)
 int cpu_power_get_backlight_percent(void)
 {
     switch (current_scan_state()) {
+    case CPU_POWER_STATE_FULL_POWER: return 100;
     case CPU_POWER_STATE_ECO_SCAN_8: return APP_BACKLIGHT_ECO1_PERCENT;
     case CPU_POWER_STATE_ECO_SCAN_16: return APP_BACKLIGHT_ECO2_PERCENT;
     default: return APP_BACKLIGHT_ACTIVE_PERCENT;

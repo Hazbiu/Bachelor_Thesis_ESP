@@ -21,6 +21,7 @@
 #define KEY_CAMERA          "camera"
 #define KEY_AUDIO           "audio"
 #define KEY_SDCARD          "sdcard"
+#define KEY_ACTIVE_OPT      "active_opt"
 #define KEY_LIGHT_SLEEP     "light_sleep"
 #define KEY_DEEP_SLEEP      "deep_sleep"
 #define ENROLLMENT_ROOT     "/sdcard/enroll"
@@ -34,6 +35,8 @@ static app_settings_snapshot_t s_settings = {
     .camera_enabled = true,
     .audio_enabled = true,
     .sdcard_enabled = true,
+    /* Missing key on an existing device preserves PWR-OPT-3 behavior. */
+    .active_optimization_enabled = true,
     .light_sleep_enabled = true,
     .deep_sleep_enabled = true,
 };
@@ -142,6 +145,14 @@ esp_err_t app_settings_init(void)
 
     item_ret = read_bool(
         handle,
+        KEY_ACTIVE_OPT,
+        &s_settings.active_optimization_enabled);
+    if (item_ret != ESP_OK && first_error == ESP_OK) {
+        first_error = item_ret;
+    }
+
+    item_ret = read_bool(
+        handle,
         KEY_LIGHT_SLEEP,
         &s_settings.light_sleep_enabled);
     if (item_ret != ESP_OK && first_error == ESP_OK) {
@@ -168,13 +179,14 @@ esp_err_t app_settings_init(void)
     ESP_LOGI(
         TAG,
         "Loaded settings: theme=%s ethernet=%s wifi=%s camera=%s audio=%s "
-        "sdcard=%s light_sleep=%s deep_sleep=%s",
+        "sdcard=%s active_optimization=%s light_sleep=%s deep_sleep=%s",
         s_settings.dark_mode ? "dark" : "light",
         s_settings.ethernet_enabled ? "on" : "off",
         s_settings.wifi_enabled ? "on" : "off",
         s_settings.camera_enabled ? "on" : "off",
         s_settings.audio_enabled ? "on" : "off",
         s_settings.sdcard_enabled ? "on" : "off",
+        s_settings.active_optimization_enabled ? "on" : "off",
         s_settings.light_sleep_enabled ? "on" : "off",
         s_settings.deep_sleep_enabled ? "on" : "off");
     return ESP_OK;
@@ -292,6 +304,25 @@ esp_err_t app_settings_set_sdcard_enabled(bool enabled)
 
     s_settings.sdcard_enabled = enabled;
     ESP_LOGI(TAG, "microSD saved: %s", enabled ? "on" : "off");
+    return ESP_OK;
+}
+
+esp_err_t app_settings_set_active_optimization_enabled(bool enabled)
+{
+    if (s_settings.active_optimization_enabled == enabled) {
+        return ESP_OK;
+    }
+
+    const esp_err_t ret = save_bool(KEY_ACTIVE_OPT, enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not save Active Mode Optimization: %s",
+                 esp_err_to_name(ret));
+        return ret;
+    }
+
+    s_settings.active_optimization_enabled = enabled;
+    ESP_LOGI(TAG, "Active Mode Optimization saved: %s",
+             enabled ? "enabled" : "disabled");
     return ESP_OK;
 }
 

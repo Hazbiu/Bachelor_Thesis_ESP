@@ -39,6 +39,7 @@ typedef struct {
     bool wifi_enabled;
     bool audio_enabled;
     bool sdcard_enabled;
+    bool active_optimization_enabled;
     bool light_sleep_enabled;
     bool deep_sleep_enabled;
 } power_manager_configuration_t;
@@ -53,6 +54,8 @@ esp_err_t power_manager_set_ethernet_enabled(bool enabled);
 esp_err_t power_manager_set_wifi_enabled(bool enabled);
 esp_err_t power_manager_set_audio_enabled(bool enabled);
 esp_err_t power_manager_set_sdcard_enabled(bool enabled);
+esp_err_t power_manager_set_active_optimization_enabled(bool enabled);
+bool power_manager_active_optimization_is_enabled(void);
 bool power_manager_audio_policy_ready(void);
 void power_manager_set_sleep_modes(bool light_enabled, bool deep_enabled);
 bool power_manager_pause_inactivity_policy(void);

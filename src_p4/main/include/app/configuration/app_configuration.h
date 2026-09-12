@@ -27,6 +27,7 @@ typedef struct {
     bool camera_enabled;
     bool audio_enabled;
     bool sdcard_enabled;
+    bool active_optimization_enabled;
     bool light_sleep_enabled;
     bool deep_sleep_enabled;
 } app_configuration_snapshot_t;
@@ -47,6 +48,7 @@ esp_err_t app_configuration_set_wifi_enabled(bool enabled);
 esp_err_t app_configuration_set_camera_enabled(bool enabled);
 esp_err_t app_configuration_set_audio_enabled(bool enabled);
 esp_err_t app_configuration_set_sdcard_enabled(bool enabled);
+esp_err_t app_configuration_set_active_optimization_enabled(bool enabled);
 esp_err_t app_configuration_set_light_sleep_enabled(bool enabled);
 esp_err_t app_configuration_set_deep_sleep_enabled(bool enabled);
 

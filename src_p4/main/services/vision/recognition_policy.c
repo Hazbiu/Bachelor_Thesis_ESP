@@ -1,6 +1,7 @@
 #include "services/vision/recognition_policy.h"
 
 #include "config/app_features.h"
+#include "services/power/power_manager.h"
 
 
 bool vision_recognition_policy_allows(
@@ -32,6 +33,11 @@ bool vision_recognition_policy_should_run_frame(
     uint32_t frame_id,
     uint32_t interval_frames)
 {
+    if (!power_manager_active_optimization_is_enabled()) {
+        return true;
+    }
+
+    /* Enabled: retain every existing backend-specific gate below. */
 #if APP_FACE_DETECT_BACKEND == APP_AI_BACKEND_TFLM_INT8
     /*
      * Preserve the existing INT8 positive path:

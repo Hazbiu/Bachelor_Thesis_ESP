@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "domain/ports/system_adapters_port.h"
 #include "services/power/power_manager.h"
 #include "services/settings/app_settings.h"
 
@@ -25,6 +26,7 @@ static app_configuration_snapshot_t from_service(
         .camera_enabled = settings.camera_enabled,
         .audio_enabled = settings.audio_enabled,
         .sdcard_enabled = settings.sdcard_enabled,
+        .active_optimization_enabled = settings.active_optimization_enabled,
         .light_sleep_enabled = settings.light_sleep_enabled,
         .deep_sleep_enabled = settings.deep_sleep_enabled,
     };
@@ -39,6 +41,7 @@ static power_manager_configuration_t to_power_configuration(
         .wifi_enabled = settings.wifi_enabled,
         .audio_enabled = settings.audio_enabled,
         .sdcard_enabled = settings.sdcard_enabled,
+        .active_optimization_enabled = settings.active_optimization_enabled,
         .light_sleep_enabled = settings.light_sleep_enabled,
         .deep_sleep_enabled = settings.deep_sleep_enabled,
     };
@@ -160,6 +163,39 @@ esp_err_t app_configuration_set_sdcard_enabled(bool enabled)
     ret = app_settings_set_sdcard_enabled(enabled);
     if (ret != ESP_OK) {
         (void)power_manager_set_sdcard_enabled(previous.sdcard_enabled);
+    }
+    return ret;
+}
+
+esp_err_t app_configuration_set_active_optimization_enabled(bool enabled)
+{
+    const app_settings_snapshot_t previous = app_settings_get();
+    if (previous.active_optimization_enabled == enabled) {
+        return ESP_OK;
+    }
+
+    /* This UI action runs from Settings on the launcher, before camera startup.
+     * Apply hardware first; the existing UI worker saves and confirms the switch
+     * only after both the CPU policy and the physical brightness succeed. */
+    esp_err_t ret = power_manager_set_active_optimization_enabled(enabled);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = system_display_backlight_set_percent(system_cpu_backlight_percent());
+    if (ret == ESP_OK) {
+        ret = app_settings_set_active_optimization_enabled(enabled);
+    }
+
+    if (ret != ESP_OK) {
+        const esp_err_t cpu_restore = power_manager_set_active_optimization_enabled(
+            previous.active_optimization_enabled);
+        const esp_err_t display_restore = system_display_backlight_set_percent(
+            system_cpu_backlight_percent());
+        if (cpu_restore != ESP_OK || display_restore != ESP_OK) {
+            ESP_LOGE(TAG, "Active optimization rollback failed: CPU=%s display=%s",
+                     esp_err_to_name(cpu_restore), esp_err_to_name(display_restore));
+        }
     }
     return ret;
 }
