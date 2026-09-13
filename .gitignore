@@ -17,3 +17,4 @@ tools/.venv-tflite-int8/
 # Temporary backup files
 *.bak
 *.backup_*
+/results/.venv-graphs
