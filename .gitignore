@@ -18,3 +18,4 @@ tools/.venv-tflite-int8/
 *.bak
 *.backup_*
 /results/.venv-graphs
+/results

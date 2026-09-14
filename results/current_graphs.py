@@ -222,7 +222,7 @@ def plot_test(test, args):
         for index, run in enumerate(test.runs):
             ax.plot(test.time, test.values[index], color=COLORS[(run.number - 1) % len(COLORS)], alpha=0.74, linewidth=0.9, label=f"Test {run.number}", zorder=2)
     ax.plot(test.time, test.mean, color=MEAN_COLOR, linewidth=1.9, label="Mean", zorder=4)
-    ax.axhline(test.average, color=AVERAGE_COLOR, linewidth=1.1, linestyle=(0, (5, 4)), label="Overall Average", zorder=3)
+    ax.axhline(test.average, color=AVERAGE_COLOR, linewidth=1.8, linestyle=(0, (5, 4)), label="Overall Average", zorder=5)
     ax.set_xlabel("Time (s)", labelpad=12)
     ax.set_ylabel("Current (A)", labelpad=14)
     ax.set_xlim(float(test.time[0]), float(test.time[-1]))
