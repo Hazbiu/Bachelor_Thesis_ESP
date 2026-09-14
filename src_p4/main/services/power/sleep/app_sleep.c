@@ -1,3 +1,4 @@
+
 #include "services/power/sleep/app_sleep.h"
 
 #include <inttypes.h>
@@ -129,9 +130,10 @@ static void configure_runtime_power_modes(void)
 
 /*
 * External board peripherals are not controlled by the ESP32-P4's internal
-* Light-sleep power-domain state machine. Quiesce only peripherals that can be
+* Light-sleep power-domain state machine. Quiesce peripherals that can be
 * restored in place without rebuilding application state. GT911 and the shared
-* I2C bus remain active for touchscreen polling, and microSD remains powered and
+* I2C bus remain active for touchscreen polling, which also allows the ES8311
+* register snapshot to be restored exactly on wake. microSD remains powered and
 * mounted so FATFS/VFS state and open application data survive Light-sleep.
 */
 static void record_first_light_sleep_error(
@@ -171,7 +173,7 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
 
     if (first_error == ESP_OK) {
 #if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
-        const char *audio_state = "OFF";
+        const char *audio_state = "CODEC_SUSPEND+AMP_OFF";
 #else
         const char *audio_state = "UNCHANGED";
 #endif
@@ -226,7 +228,7 @@ static esp_err_t restore_aux_peripherals_after_light_sleep(void)
 
     if (first_error == ESP_OK) {
 #if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
-        const char *audio_state = "ON";
+        const char *audio_state = "RESTORED_OR_POLICY_OFF";
 #else
         const char *audio_state = "UNCHANGED";
 #endif
@@ -736,7 +738,7 @@ static void run_light_compatible_deep_sleep_sequence(const char *reason)
     if (audio_ret != ESP_OK) {
         ESP_LOGW(
             TAG,
-            "Could not re-assert amplifier OFF before RETENTIVE_DEEP: %s",
+            "Could not re-assert audio low-power state before RETENTIVE_DEEP: %s",
             esp_err_to_name(audio_ret));
     }
 #endif

@@ -7,10 +7,14 @@ extern "C" {
 #endif
 
 /**
- * Reversible Light-sleep path: disable only the external NS4150B amplifier.
+ * Reversible Light-sleep path:
+ *   1. disable and hold the external NS4150B amplifier OFF;
+ *   2. suspend the ES8311 ADC/DAC/analog/reference/clock blocks with the same
+ *      register sequence used by Espressif's ES8311 driver;
+ *   3. verify the programmed codec registers by I2C read-back.
  *
- * The ES8311 codec is deliberately left unchanged in Light-sleep so the
- * existing wake/resume path does not have to reconstruct codec clock/state.
+ * The exact pre-sleep ES8311 register state is snapshotted and restored on
+ * wake. If Audio was already OFF before Light-sleep, wake keeps it OFF.
  */
 esp_err_t component_audio_disable_for_light_sleep(void);
 esp_err_t component_audio_restore_after_light_sleep(void);
@@ -18,8 +22,8 @@ esp_err_t component_audio_restore_after_light_sleep(void);
 /**
  * Deep-sleep path:
  *   1. disable the external NS4150B amplifier (GPIO53 LOW);
- *   2. put the onboard ES8311 codec into the same suspend register state used
- *      by Espressif's esp_codec_dev ES8311 driver.
+ *   2. suspend the onboard ES8311 codec with Espressif's ES8311 sequence;
+ *   3. verify the final codec state by I2C read-back.
  *
  * The ES8311 is accessed through the board's shared BSP I2C bus.
  */
@@ -27,14 +31,14 @@ esp_err_t component_audio_disable_for_deep_sleep(void);
 
 /**
  * Re-read the ES8311 registers used by the suspend sequence and confirm that
- * the codec still matches the expected Deep-sleep state.
+ * the codec still matches the expected low-power state.
  */
 esp_err_t component_audio_verify_power_down(void);
 
 /**
- * Recovery hook used only if esp_deep_sleep_start() unexpectedly returns.
- * Restores the ES8311 register snapshot captured before suspend, then releases
- * the NS4150B amplifier shutdown.
+ * Restore the last ES8311 register snapshot and release the NS4150B shutdown.
+ * This is used by the existing runtime Audio=ON policy and as recovery if a
+ * Deep-sleep transition unexpectedly returns.
  */
 esp_err_t component_audio_restore_after_failed_sleep(void);
 

@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include "driver/gpio.h"
@@ -179,6 +180,14 @@
  *
  * The ESP32-C6 follows the persistent Wi-Fi setting during Active mode. The
  * ordered Deep-sleep path still forces CHIP_PU LOW at the sleep boundary.
+ */
+/*
+ * Audio Light-sleep policy.
+ *
+ * Legacy macro name retained for installer/configuration compatibility.
+ * When enabled, component_audio.c turns OFF the NS4150B amplifier AND applies
+ * the complete verified ES8311 suspend register sequence. The shared I2C bus
+ * remains alive for GT911 polling so the codec can be restored exactly on wake.
  */
 #define APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP            1
 /*

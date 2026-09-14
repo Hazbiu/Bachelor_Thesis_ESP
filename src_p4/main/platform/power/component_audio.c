@@ -1,3 +1,4 @@
+
 #include "diagnostics/sleep_power_profile.h"
 
 #include "platform/power/component_audio.h"
@@ -131,6 +132,18 @@ typedef struct {
 static bool s_audio_amp_disabled;
 static bool s_codec_powered_down;
 static es8311_snapshot_t s_codec_snapshot;
+
+/*
+ * Light-sleep must be electrically aggressive without changing the user's
+ * persistent Audio policy. Record which blocks were ACTIVE immediately before
+ * the Light-sleep transition and restore only those blocks on wake.
+ *
+ * If Audio was already OFF in Settings, the codec/amplifier are already down
+ * before Light-sleep and must stay down after wake.
+ */
+static bool s_light_sleep_state_captured;
+static bool s_light_sleep_restore_amp;
+static bool s_light_sleep_restore_codec;
 
 /* A held pad may need a short settle window before its read-back is stable. */
 static int wait_for_pad_level(
@@ -497,6 +510,49 @@ static esp_err_t es8311_verify_suspend(
     return ESP_OK;
 }
 
+static esp_err_t es8311_suspend_codec(const char *context)
+{
+    if (s_codec_powered_down) {
+        ESP_LOGI(
+            TAG,
+            "ES8311 already suspended (%s)",
+            context != NULL ? context : "unspecified");
+        return ESP_OK;
+    }
+
+    i2c_master_dev_handle_t device = NULL;
+    esp_err_t ret = es8311_open(&device);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = es8311_take_snapshot(device);
+    if (ret == ESP_OK) {
+        ret = es8311_apply_suspend(device);
+    }
+    if (ret == ESP_OK) {
+        ret = es8311_verify_suspend(device);
+    }
+
+    if (ret == ESP_OK) {
+        s_codec_powered_down = true;
+        ESP_LOGI(
+            TAG,
+            "ES8311 suspended and read-back verified (%s)",
+            context != NULL ? context : "unspecified");
+    } else {
+        ESP_LOGE(
+            TAG,
+            "ES8311 suspend failed (%s): %s",
+            context != NULL ? context : "unspecified",
+            esp_err_to_name(ret));
+    }
+
+    es8311_close(device);
+    return ret;
+}
+
 static int snapshot_index_for_reg(uint8_t reg)
 {
     for (size_t i = 0; i < sizeof(s_es8311_snapshot_registers); ++i) {
@@ -570,18 +626,133 @@ static esp_err_t es8311_restore_snapshot(
     return ESP_OK;
 }
 
+static esp_err_t es8311_restore_codec_snapshot(const char *context)
+{
+    if (!s_codec_powered_down && !s_codec_snapshot.valid) {
+        return ESP_OK;
+    }
+
+    if (!s_codec_snapshot.valid) {
+        ESP_LOGE(
+            TAG,
+            "Cannot restore ES8311 (%s): no pre-suspend register snapshot",
+            context != NULL ? context : "unspecified");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    i2c_master_dev_handle_t device = NULL;
+    esp_err_t ret = es8311_open(&device);
+
+    if (ret == ESP_OK) {
+        ret = es8311_restore_snapshot(device);
+    }
+
+    es8311_close(device);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "ES8311 pre-suspend state restored (%s)",
+            context != NULL ? context : "unspecified");
+    }
+
+    return ret;
+}
+
 esp_err_t component_audio_disable_for_light_sleep(void)
 {
     /*
-     * Preserve the existing proven Light-sleep policy: only gate the external
-     * speaker amplifier. Full ES8311 suspend is reserved for Deep-sleep.
+     * GT911 polling keeps the shared BSP I2C bus alive in Light-sleep. Use that
+     * opportunity to put ES8311 into the same complete suspend state used by
+     * Espressif, rather than shutting down only the speaker amplifier.
+     *
+     * Capture the pre-Light-sleep state once. If Audio was already OFF by
+     * runtime policy, wake must not re-enable it.
      */
-    return audio_amp_disable();
+    if (!s_light_sleep_state_captured) {
+        s_light_sleep_restore_amp = !s_audio_amp_disabled;
+        s_light_sleep_restore_codec = !s_codec_powered_down;
+        s_light_sleep_state_captured = true;
+
+        ESP_LOGI(
+            TAG,
+            "Light-sleep audio snapshot: restore_codec=%s restore_amp=%s",
+            s_light_sleep_restore_codec ? "yes" : "no",
+            s_light_sleep_restore_amp ? "yes" : "no");
+    }
+
+    esp_err_t first_error = audio_amp_disable();
+
+    if (s_light_sleep_restore_codec) {
+        const esp_err_t codec_ret =
+            es8311_suspend_codec("Light-sleep");
+
+        if (codec_ret != ESP_OK && first_error == ESP_OK) {
+            first_error = codec_ret;
+        }
+    }
+
+    if (first_error == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "Light-sleep audio state: NS4150B=OFF ES8311=%s",
+            s_codec_powered_down ? "SUSPEND" : "POLICY_OFF");
+    }
+
+    return first_error;
 }
 
 esp_err_t component_audio_restore_after_light_sleep(void)
 {
-    return audio_amp_restore();
+    if (!s_light_sleep_state_captured) {
+        return ESP_OK;
+    }
+
+    esp_err_t first_error = ESP_OK;
+
+    /*
+     * Restore the codec first. Enable the amplifier last so it never sees a
+     * partially restored codec/clock state.
+     */
+    if (s_light_sleep_restore_codec) {
+        const esp_err_t codec_ret =
+            es8311_restore_codec_snapshot("Light-sleep wake");
+
+        if (codec_ret != ESP_OK) {
+            first_error = codec_ret;
+        }
+    }
+
+    if (s_light_sleep_restore_amp) {
+        const esp_err_t amp_ret = audio_amp_restore();
+
+        if (amp_ret != ESP_OK && first_error == ESP_OK) {
+            first_error = amp_ret;
+        }
+    }
+
+    if (first_error == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "Light-sleep audio restore complete: codec=%s amplifier=%s",
+            s_light_sleep_restore_codec ? "RESTORED" : "KEPT_OFF",
+            s_light_sleep_restore_amp ? "RESTORED" : "KEPT_OFF");
+
+        s_light_sleep_state_captured = false;
+        s_light_sleep_restore_amp = false;
+        s_light_sleep_restore_codec = false;
+    } else {
+        /*
+         * Retain the bookkeeping after a failed restoration so a later
+         * recovery attempt still knows the actual pre-sleep state.
+         */
+        ESP_LOGE(
+            TAG,
+            "Light-sleep audio restore incomplete: %s",
+            esp_err_to_name(first_error));
+    }
+
+    return first_error;
 }
 
 esp_err_t component_audio_disable_for_deep_sleep(void)
@@ -592,48 +763,27 @@ esp_err_t component_audio_disable_for_deep_sleep(void)
                               esp_err_to_name(first_error));
 
     sleep_power_profile_before("ES8311 codec suspend");
-    if (s_codec_powered_down) {
-        sleep_power_profile_after("ES8311 codec suspend", "ALREADY_SUSPENDED");
-        return first_error;
+    const esp_err_t codec_ret =
+        es8311_suspend_codec("Deep-sleep");
+    sleep_power_profile_after(
+        "ES8311 codec suspend",
+        esp_err_to_name(codec_ret));
+
+    if (codec_ret != ESP_OK && first_error == ESP_OK) {
+        first_error = codec_ret;
     }
 
-    i2c_master_dev_handle_t device = NULL;
-    esp_err_t ret = es8311_open(&device);
-
-    if (ret != ESP_OK) {
-        if (first_error == ESP_OK) {
-            first_error = ret;
-        }
-        sleep_power_profile_after("ES8311 codec suspend", esp_err_to_name(ret));
-        return first_error;
-    }
-
-    ret = es8311_take_snapshot(device);
-    if (ret == ESP_OK) {
-        ret = es8311_apply_suspend(device);
-    }
-    if (ret == ESP_OK) {
-        ret = es8311_verify_suspend(device);
-    }
-
-    if (ret == ESP_OK) {
-        s_codec_powered_down = true;
+    if (first_error == ESP_OK) {
         ESP_LOGI(
             TAG,
             "Audio Deep-sleep state complete: NS4150B=OFF ES8311=SUSPEND");
     } else {
         ESP_LOGE(
             TAG,
-            "ES8311 Deep-sleep power-down failed: %s",
-            esp_err_to_name(ret));
-
-        if (first_error == ESP_OK) {
-            first_error = ret;
-        }
+            "Audio Deep-sleep shutdown completed with errors: %s",
+            esp_err_to_name(first_error));
     }
 
-    es8311_close(device);
-    sleep_power_profile_after("ES8311 codec suspend", esp_err_to_name(ret));
     return first_error;
 }
 
@@ -668,31 +818,25 @@ esp_err_t component_audio_verify_power_down(void)
 
 esp_err_t component_audio_restore_after_failed_sleep(void)
 {
-    esp_err_t first_error = ESP_OK;
-
-    if (s_codec_powered_down || s_codec_snapshot.valid) {
-        i2c_master_dev_handle_t device = NULL;
-        esp_err_t ret = es8311_open(&device);
-
-        if (ret == ESP_OK && s_codec_snapshot.valid) {
-            ret = es8311_restore_snapshot(device);
-        }
-
-        if (ret != ESP_OK) {
-            ESP_LOGE(
-                TAG,
-                "Could not restore ES8311 after failed Deep-sleep: %s",
-                esp_err_to_name(ret));
-            first_error = ret;
-        }
-
-        es8311_close(device);
-    }
+    esp_err_t first_error =
+        es8311_restore_codec_snapshot("runtime/deep-sleep recovery");
 
     const esp_err_t amp_ret = audio_amp_restore();
     if (amp_ret != ESP_OK && first_error == ESP_OK) {
         first_error = amp_ret;
     }
 
+    /*
+     * This function is also the existing runtime Audio=ON path. A successful
+     * explicit restore establishes a new active baseline, so discard stale
+     * Light-sleep bookkeeping.
+     */
+    if (first_error == ESP_OK) {
+        s_light_sleep_state_captured = false;
+        s_light_sleep_restore_amp = false;
+        s_light_sleep_restore_codec = false;
+    }
+
     return first_error;
 }
+
