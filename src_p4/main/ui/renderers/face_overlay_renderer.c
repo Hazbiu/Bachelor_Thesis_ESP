@@ -1,3 +1,4 @@
+
 #include "face_overlay_renderer.h"
 
 #include <inttypes.h>
@@ -94,6 +95,89 @@ static void draw_filled_rect_rgb565(
         for (int x = x1; x <= x2; x++) {
             row[x] = color;
         }
+    }
+}
+
+static int rounded_rect_inset_for_row(int edge_row, int radius)
+{
+    if (radius <= 1 || edge_row >= radius) {
+        return 0;
+    }
+
+    const int circle_radius = radius - 1;
+    const int dy = circle_radius - edge_row;
+    const int radius_squared = circle_radius * circle_radius;
+    int dx = 0;
+
+    while (dx < circle_radius) {
+        const int next_dx = dx + 1;
+        if (next_dx * next_dx + dy * dy > radius_squared) {
+            break;
+        }
+        dx = next_dx;
+    }
+
+    return circle_radius - dx;
+}
+
+static void draw_filled_rounded_rect_rgb565(
+    uint16_t *fb,
+    uint32_t fb_w,
+    uint32_t fb_h,
+    int x1,
+    int y1,
+    int x2,
+    int y2,
+    int radius,
+    uint16_t color)
+{
+    if (!fb || fb_w == 0U || fb_h == 0U) {
+        return;
+    }
+
+    if (x1 > x2) {
+        const int temp = x1;
+        x1 = x2;
+        x2 = temp;
+    }
+
+    if (y1 > y2) {
+        const int temp = y1;
+        y1 = y2;
+        y2 = temp;
+    }
+
+    const int width = x2 - x1 + 1;
+    const int height = y2 - y1 + 1;
+    const int maximum_radius = (width < height ? width : height) / 2;
+
+    if (radius > maximum_radius) {
+        radius = maximum_radius;
+    }
+
+    if (radius <= 1) {
+        draw_filled_rect_rgb565(
+            fb, fb_w, fb_h, x1, y1, x2, y2, color);
+        return;
+    }
+
+    for (int y = y1; y <= y2; y++) {
+        int edge_row = y - y1;
+        const int bottom_edge_row = y2 - y;
+        if (bottom_edge_row < edge_row) {
+            edge_row = bottom_edge_row;
+        }
+
+        const int inset = rounded_rect_inset_for_row(edge_row, radius);
+        draw_filled_rect_rgb565(
+            fb,
+            fb_w,
+            fb_h,
+            x1 + inset,
+            y,
+            x2 - inset,
+            y,
+            color);
     }
 }
 
@@ -247,6 +331,22 @@ static void draw_text_rgb565(
     }
 }
 
+static void draw_text_emphasized_rgb565(
+    uint16_t *fb,
+    uint32_t fb_w,
+    uint32_t fb_h,
+    int start_x,
+    int start_y,
+    const char *text,
+    int scale,
+    uint16_t color)
+{
+    draw_text_rgb565(
+        fb, fb_w, fb_h, start_x, start_y, text, scale, color);
+    draw_text_rgb565(
+        fb, fb_w, fb_h, start_x + 1, start_y, text, scale, color);
+}
+
 static int text_width_pixels(const char *text, int scale)
 {
     const size_t length = text ? strlen(text) : 0U;
@@ -313,19 +413,18 @@ void face_overlay_renderer_draw_label_rgb565(
     );
 }
 
-static void format_inference_line(
+static void format_inference_value(
     char *buffer,
     size_t buffer_size,
-    const char *prefix,
     bool valid,
     uint32_t inference_us)
 {
-    if (!buffer || buffer_size == 0U || !prefix) {
+    if (!buffer || buffer_size == 0U) {
         return;
     }
 
     if (!valid) {
-        snprintf(buffer, buffer_size, "%s: -- MS", prefix);
+        snprintf(buffer, buffer_size, "--.- MS");
         return;
     }
 
@@ -335,29 +434,23 @@ static void format_inference_line(
     snprintf(
         buffer,
         buffer_size,
-        "%s: %" PRIu32 ".%" PRIu32 " MS",
-        prefix,
+        "%" PRIu32 ".%" PRIu32 " MS",
         whole_ms,
         tenths_ms);
 }
 
-static void format_cpu_usage_line(
+static void format_cpu_usage_value(
     char *buffer,
     size_t buffer_size,
-    const char *prefix,
     bool valid,
     uint32_t usage_x10)
 {
-    if (!buffer || buffer_size == 0U || !prefix) {
+    if (!buffer || buffer_size == 0U) {
         return;
     }
 
     if (!valid) {
-        snprintf(
-            buffer,
-            buffer_size,
-            "%s: --.-%%",
-            prefix);
+        snprintf(buffer, buffer_size, "--.-%%");
         return;
     }
 
@@ -368,8 +461,7 @@ static void format_cpu_usage_line(
     snprintf(
         buffer,
         buffer_size,
-        "%s: %" PRIu32 ".%" PRIu32 "%%",
-        prefix,
+        "%" PRIu32 ".%" PRIu32 "%%",
         usage_x10 / 10U,
         usage_x10 % 10U);
 }
@@ -391,144 +483,286 @@ void face_overlay_renderer_draw_metrics_rgb565(
         return;
     }
 
-    /*
-     * Camera overlay intentionally contains only:
-     *   1. face-recognition model inference time,
-     *   2. face-detection model inference time,
-     *   3. live preview FPS,
-     *   4. total HP Core 0 utilization,
-     *   5. total HP Core 1 utilization.
-     *
-     * Only HP Core 0 and HP Core 1 CPU-utilization rows are rendered.
-     */
-    char lines[5][64] = {{0}};
+    /* Camera FPS is intentionally not shown because preview pacing changes
+     * between active and power-optimized states. Keep the public renderer
+     * signature stable for existing callers. */
+    (void)fps_x10;
 
-    format_inference_line(
-        lines[0],
-        sizeof(lines[0]),
-        "AI-FACE REC MODEL INFERENCE",
-        recognizer_valid,
+    static const char *labels[4] = {
+        "FACE RECOGNITION",
+        "FACE DETECTION",
+        "HP CORE 0 USAGE",
+        "HP CORE 1 USAGE",
+    };
+
+    char values[4][24] = {{0}};
+    format_inference_value(
+        values[0], sizeof(values[0]), recognizer_valid,
         recognizer_inference_us);
-
-    format_inference_line(
-        lines[1],
-        sizeof(lines[1]),
-        "AI-FACE DEC MODEL INFERENCE",
-        detector_valid,
+    format_inference_value(
+        values[1], sizeof(values[1]), detector_valid,
         detector_inference_us);
-
-    snprintf(
-        lines[2],
-        sizeof(lines[2]),
-        "FPS: %" PRIu32 ".%" PRIu32,
-        fps_x10 / 10U,
-        fps_x10 % 10U);
-
-    format_cpu_usage_line(
-        lines[3],
-        sizeof(lines[3]),
-        "CPU HP CORE 0 USAGE",
-        hp_cpu_usage_valid,
+    format_cpu_usage_value(
+        values[2], sizeof(values[2]), hp_cpu_usage_valid,
         hp_core0_usage_x10);
-
-    format_cpu_usage_line(
-        lines[4],
-        sizeof(lines[4]),
-        "CPU HP CORE 1 USAGE",
-        hp_cpu_usage_valid,
+    format_cpu_usage_value(
+        values[3], sizeof(values[3]), hp_cpu_usage_valid,
         hp_core1_usage_x10);
 
     int scale = 2;
-    int max_text_width = 0;
+    int margin = 0;
+    int outer_padding = 0;
+    int left_content_padding = 0;
+    int right_content_padding = 0;
+    int column_gap = 0;
+    int header_height = 0;
+    int row_height = 0;
+    int group_padding = 0;
+    int group_gap = 0;
+    int panel_width = 0;
+    int panel_height = 0;
 
-    for (size_t i = 0; i < 5U; i++) {
-        const int width =
-            text_width_pixels(lines[i], scale);
+    for (;;) {
+        int maximum_label_width = 0;
+        int maximum_value_width = 0;
 
-        if (width > max_text_width) {
-            max_text_width = width;
-        }
-    }
+        for (size_t i = 0; i < 4U; i++) {
+            const int label_width = text_width_pixels(labels[i], scale);
+            const int value_width = text_width_pixels(values[i], scale);
 
-    const int margin = 8;
-    const int padding = 4 * scale;
-
-    if (max_text_width + 2 * padding + 2 * margin > (int)fb_w) {
-        scale = 1;
-        max_text_width = 0;
-
-        for (size_t i = 0; i < 5U; i++) {
-            const int width =
-                text_width_pixels(lines[i], scale);
-
-            if (width > max_text_width) {
-                max_text_width = width;
+            if (label_width > maximum_label_width) {
+                maximum_label_width = label_width;
+            }
+            if (value_width > maximum_value_width) {
+                maximum_value_width = value_width;
             }
         }
+
+        margin = 4 * scale;
+        outer_padding = 4 * scale;
+        left_content_padding = 6 * scale;
+        right_content_padding = 4 * scale;
+        column_gap = 6 * scale;
+        header_height = 14 * scale;
+        row_height = 10 * scale;
+        group_padding = 2 * scale;
+        group_gap = 3 * scale;
+
+        const int rows_width =
+            maximum_label_width + column_gap + maximum_value_width;
+        const int content_width =
+            left_content_padding + rows_width + right_content_padding;
+
+        const int title_width = text_width_pixels("SYSTEM PERFORMANCE", scale);
+        const int live_width = text_width_pixels("LIVE", scale) + 4 * scale;
+        const int header_width = title_width + 5 * scale + live_width;
+
+        panel_width = 2 * outer_padding +
+            (content_width > header_width ? content_width : header_width);
+
+        const int ai_group_height = 2 * group_padding + 2 * row_height;
+        const int cpu_group_height = 2 * group_padding + 2 * row_height;
+        panel_height =
+            2 * outer_padding + header_height + 2 * group_gap +
+            ai_group_height + cpu_group_height;
+
+        if (scale == 1 ||
+            (panel_width + 2 * margin <= (int)fb_w &&
+             panel_height + 2 * margin <= (int)fb_h)) {
+            break;
+        }
+
+        scale = 1;
     }
-
-    const int actual_padding = 4 * scale;
-    const int line_height = 8 * scale;
-    const int panel_width =
-        max_text_width + 2 * actual_padding;
-
-    const int panel_height =
-        5 * line_height - scale + 2 * actual_padding;
 
     int panel_x2 = (int)fb_w - margin - 1;
     int panel_x1 = panel_x2 - panel_width + 1;
-    int panel_y1 = margin;
+    const int panel_y1 = margin;
     int panel_y2 = panel_y1 + panel_height - 1;
 
     if (panel_x1 < 0) {
         panel_x1 = 0;
     }
-
     if (panel_y2 >= (int)fb_h) {
         panel_y2 = (int)fb_h - 1;
     }
 
-    /*
-     * Opaque black keeps diagnostics readable over any camera scene and avoids
-     * per-pixel alpha blending in the live preview path.
-     */
+    const uint16_t panel_background = 0x0864;
+    const uint16_t group_background = 0x10E6;
+    const uint16_t divider_color = 0x2A2B;
+    const uint16_t primary_text = 0xFFDF;
+    const uint16_t secondary_text = 0xBDF7;
+    const uint16_t ai_accent = 0x2EB7;
+    const uint16_t live_accent = 0x2E6E;
+    const uint16_t cpu_accent = 0x3DFF;
+
+    /* Opaque RGB565 surfaces keep the panel readable without alpha blending. */
+    const int panel_radius = 6 * scale;
+    draw_filled_rounded_rect_rgb565(
+        fb,
+        fb_w,
+        fb_h,
+        panel_x1,
+        panel_y1,
+        panel_x2,
+        panel_y2,
+        panel_radius,
+        panel_background);
+
     draw_filled_rect_rgb565(
         fb,
         fb_w,
         fb_h,
-        panel_x1,
+        panel_x1 + panel_radius,
         panel_y1,
-        panel_x2,
-        panel_y2,
-        0x0000);
+        panel_x2 - panel_radius,
+        panel_y1 + scale - 1,
+        ai_accent);
 
-    draw_rect_rgb565(
+    const int header_y1 = panel_y1 + outer_padding;
+    const int header_text_y =
+        header_y1 + (header_height - 7 * scale) / 2;
+
+    draw_text_emphasized_rgb565(
         fb,
         fb_w,
         fb_h,
-        panel_x1,
-        panel_y1,
-        panel_x2,
-        panel_y2,
-        0x8410);
+        panel_x1 + outer_padding,
+        header_text_y,
+        "SYSTEM PERFORMANCE",
+        scale,
+        primary_text);
 
-    int text_y = panel_y1 + actual_padding;
+    const int live_text_width = text_width_pixels("LIVE", scale);
+    const int live_badge_width = live_text_width + 4 * scale;
+    const int live_badge_height = 10 * scale;
+    const int live_badge_x2 = panel_x2 - outer_padding;
+    const int live_badge_x1 = live_badge_x2 - live_badge_width + 1;
+    const int live_badge_y1 =
+        header_y1 + (header_height - live_badge_height) / 2;
+    const int live_badge_y2 = live_badge_y1 + live_badge_height - 1;
 
-    for (size_t i = 0; i < 5U; i++) {
+    draw_filled_rounded_rect_rgb565(
+        fb,
+        fb_w,
+        fb_h,
+        live_badge_x1,
+        live_badge_y1,
+        live_badge_x2,
+        live_badge_y2,
+        3 * scale,
+        live_accent);
+    draw_text_emphasized_rgb565(
+        fb,
+        fb_w,
+        fb_h,
+        live_badge_x1 + 2 * scale,
+        live_badge_y1 + (live_badge_height - 7 * scale) / 2,
+        "LIVE",
+        scale,
+        panel_background);
+
+    const int group_x1 = panel_x1 + outer_padding;
+    const int group_x2 = panel_x2 - outer_padding;
+    const int ai_group_y1 = header_y1 + header_height + group_gap;
+    const int ai_group_height = 2 * group_padding + 2 * row_height;
+    const int ai_group_y2 = ai_group_y1 + ai_group_height - 1;
+    const int cpu_group_y1 = ai_group_y2 + 1 + group_gap;
+    const int cpu_group_height = 2 * group_padding + 2 * row_height;
+    const int cpu_group_y2 = cpu_group_y1 + cpu_group_height - 1;
+    const int group_radius = 3 * scale;
+
+    draw_filled_rounded_rect_rgb565(
+        fb,
+        fb_w,
+        fb_h,
+        group_x1,
+        ai_group_y1,
+        group_x2,
+        ai_group_y2,
+        group_radius,
+        group_background);
+    draw_filled_rounded_rect_rgb565(
+        fb,
+        fb_w,
+        fb_h,
+        group_x1,
+        cpu_group_y1,
+        group_x2,
+        cpu_group_y2,
+        group_radius,
+        group_background);
+
+    draw_filled_rounded_rect_rgb565(
+        fb,
+        fb_w,
+        fb_h,
+        group_x1 + 2 * scale,
+        ai_group_y1 + 2 * scale,
+        group_x1 + 3 * scale - 1,
+        ai_group_y2 - 2 * scale,
+        scale,
+        ai_accent);
+    draw_filled_rounded_rect_rgb565(
+        fb,
+        fb_w,
+        fb_h,
+        group_x1 + 2 * scale,
+        cpu_group_y1 + 2 * scale,
+        group_x1 + 3 * scale - 1,
+        cpu_group_y2 - 2 * scale,
+        scale,
+        cpu_accent);
+
+    const uint16_t value_colors[4] = {
+        ai_accent,
+        ai_accent,
+        cpu_accent,
+        cpu_accent,
+    };
+
+    for (size_t i = 0; i < 4U; i++) {
+        const bool ai_row = i < 2U;
+        const int local_row = ai_row ? (int)i : (int)i - 2;
+        const int group_y1 = ai_row ? ai_group_y1 : cpu_group_y1;
+        const int row_y1 =
+            group_y1 + group_padding + local_row * row_height;
+
+        if (local_row > 0) {
+            const int divider_y = row_y1 - 1;
+            draw_filled_rect_rgb565(
+                fb,
+                fb_w,
+                fb_h,
+                group_x1 + left_content_padding,
+                divider_y,
+                group_x2 - right_content_padding,
+                divider_y,
+                divider_color);
+        }
+
+        const int text_y = row_y1 + (row_height - 7 * scale) / 2;
         draw_text_rgb565(
             fb,
             fb_w,
             fb_h,
-            panel_x1 + actual_padding,
+            group_x1 + left_content_padding,
             text_y,
-            lines[i],
+            labels[i],
             scale,
-            0xFFFF);
+            secondary_text);
 
-        text_y += line_height;
-
-        if (text_y >= panel_y2) {
-            break;
-        }
+        const int value_width = text_width_pixels(values[i], scale);
+        const int value_x =
+            group_x2 - right_content_padding - value_width;
+        draw_text_emphasized_rgb565(
+            fb,
+            fb_w,
+            fb_h,
+            value_x,
+            text_y,
+            values[i],
+            scale,
+            value_colors[i]);
     }
 }
