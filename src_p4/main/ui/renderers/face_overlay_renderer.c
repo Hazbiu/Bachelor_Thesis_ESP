@@ -1,4 +1,3 @@
-
 #include "face_overlay_renderer.h"
 
 #include <inttypes.h>
@@ -553,9 +552,8 @@ void face_overlay_renderer_draw_metrics_rgb565(
         const int content_width =
             left_content_padding + rows_width + right_content_padding;
 
-        const int title_width = text_width_pixels("SYSTEM PERFORMANCE", scale);
-        const int live_width = text_width_pixels("LIVE", scale) + 4 * scale;
-        const int header_width = title_width + 5 * scale + live_width;
+        const int header_width =
+            text_width_pixels("SYSTEM PERFORMANCE", scale);
 
         panel_width = 2 * outer_padding +
             (content_width > header_width ? content_width : header_width);
@@ -593,7 +591,6 @@ void face_overlay_renderer_draw_metrics_rgb565(
     const uint16_t primary_text = 0xFFDF;
     const uint16_t secondary_text = 0xBDF7;
     const uint16_t ai_accent = 0x2EB7;
-    const uint16_t live_accent = 0x2E6E;
     const uint16_t cpu_accent = 0x3DFF;
 
     /* Opaque RGB565 surfaces keep the panel readable without alpha blending. */
@@ -632,35 +629,6 @@ void face_overlay_renderer_draw_metrics_rgb565(
         "SYSTEM PERFORMANCE",
         scale,
         primary_text);
-
-    const int live_text_width = text_width_pixels("LIVE", scale);
-    const int live_badge_width = live_text_width + 4 * scale;
-    const int live_badge_height = 10 * scale;
-    const int live_badge_x2 = panel_x2 - outer_padding;
-    const int live_badge_x1 = live_badge_x2 - live_badge_width + 1;
-    const int live_badge_y1 =
-        header_y1 + (header_height - live_badge_height) / 2;
-    const int live_badge_y2 = live_badge_y1 + live_badge_height - 1;
-
-    draw_filled_rounded_rect_rgb565(
-        fb,
-        fb_w,
-        fb_h,
-        live_badge_x1,
-        live_badge_y1,
-        live_badge_x2,
-        live_badge_y2,
-        3 * scale,
-        live_accent);
-    draw_text_emphasized_rgb565(
-        fb,
-        fb_w,
-        fb_h,
-        live_badge_x1 + 2 * scale,
-        live_badge_y1 + (live_badge_height - 7 * scale) / 2,
-        "LIVE",
-        scale,
-        panel_background);
 
     const int group_x1 = panel_x1 + outer_padding;
     const int group_x2 = panel_x2 - outer_padding;
