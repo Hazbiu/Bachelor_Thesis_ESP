@@ -1,9 +1,10 @@
+
+
 #include "settings_screen.h"
 
 #include <ctype.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
@@ -17,15 +18,12 @@
 
 typedef enum {
     SETTINGS_TOGGLE_THEME,
-    SETTINGS_TOGGLE_ETHERNET,
-    SETTINGS_TOGGLE_WIFI,
-    SETTINGS_TOGGLE_AUDIO,
     SETTINGS_TOGGLE_ACTIVE_OPTIMIZATION,
     SETTINGS_TOGGLE_LIGHT_SLEEP,
     SETTINGS_TOGGLE_DEEP_SLEEP,
 } settings_toggle_kind_t;
 
-#define SETTINGS_TOGGLE_CAPACITY       7U
+#define SETTINGS_TOGGLE_CAPACITY       4U
 #define SETTINGS_TOGGLE_DEBOUNCE_US    250000LL
 
 typedef struct {
@@ -103,6 +101,7 @@ static void set_status(const char *text, bool is_error)
         s_status_label,
         lv_color_hex(is_error ? 0xDC2626 : 0x16A34A),
         0);
+    lv_obj_remove_flag(s_status_label, LV_OBJ_FLAG_HIDDEN);
 }
 
 static lv_obj_t *create_section_label(
@@ -240,12 +239,6 @@ static bool setting_value_for_kind(
     switch (kind) {
     case SETTINGS_TOGGLE_THEME:
         return settings->dark_mode;
-    case SETTINGS_TOGGLE_ETHERNET:
-        return settings->ethernet_enabled;
-    case SETTINGS_TOGGLE_WIFI:
-        return settings->wifi_enabled;
-    case SETTINGS_TOGGLE_AUDIO:
-        return settings->audio_enabled;
     case SETTINGS_TOGGLE_ACTIVE_OPTIMIZATION:
         return settings->active_optimization_enabled;
     case SETTINGS_TOGGLE_LIGHT_SLEEP:
@@ -264,12 +257,6 @@ static esp_err_t apply_toggle_setting(
     switch (kind) {
     case SETTINGS_TOGGLE_THEME:
         return app_configuration_set_dark_mode(enabled);
-    case SETTINGS_TOGGLE_ETHERNET:
-        return app_configuration_set_ethernet_enabled(enabled);
-    case SETTINGS_TOGGLE_WIFI:
-        return app_configuration_set_wifi_enabled(enabled);
-    case SETTINGS_TOGGLE_AUDIO:
-        return app_configuration_set_audio_enabled(enabled);
     case SETTINGS_TOGGLE_ACTIVE_OPTIMIZATION:
         return app_configuration_set_active_optimization_enabled(enabled);
     case SETTINGS_TOGGLE_LIGHT_SLEEP:
@@ -288,18 +275,6 @@ static const char *toggle_success_message(
     switch (kind) {
     case SETTINGS_TOGGLE_THEME:
         return enabled ? "Dark mode saved." : "Light mode saved.";
-    case SETTINGS_TOGGLE_ETHERNET:
-        return enabled
-            ? "Ethernet enabled and saved."
-            : "Ethernet powered down and saved.";
-    case SETTINGS_TOGGLE_WIFI:
-        return enabled
-            ? "Wi-Fi coprocessor enabled and saved."
-            : "Wi-Fi coprocessor disabled and saved.";
-    case SETTINGS_TOGGLE_AUDIO:
-        return enabled
-            ? "Audio codec and amplifier enabled and saved."
-            : "Audio codec and amplifier powered down and saved.";
     case SETTINGS_TOGGLE_ACTIVE_OPTIMIZATION:
         return enabled
             ? "Active Mode Optimization enabled and saved."
@@ -587,12 +562,7 @@ void settings_screen_create(
     lv_obj_t *title = lv_label_create(header);
     lv_label_set_text(title, "Settings");
     lv_obj_set_style_text_color(title, lv_color_hex(palette.primary_text), 0);
-    lv_obj_align(title, LV_ALIGN_CENTER, 0, -10);
-
-    lv_obj_t *subtitle = lv_label_create(header);
-    lv_label_set_text(subtitle, "Device preferences and power policy");
-    lv_obj_set_style_text_color(subtitle, lv_color_hex(palette.secondary_text), 0);
-    lv_obj_align(subtitle, LV_ALIGN_CENTER, 0, 20);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
 
     lv_obj_t *content = lv_obj_create(screen);
     lv_obj_set_size(content, LV_PCT(100), LV_PCT(91));
@@ -624,38 +594,12 @@ void settings_screen_create(
         SETTINGS_TOGGLE_THEME,
         &palette);
 
-    create_section_label(content, "POWER MANAGEMENT", &palette);
-    lv_obj_t *power_card = create_card(content, &palette);
-    create_toggle_row(
-        power_card,
-        "Ethernet",
-        "IP101GRI PHY",
-        settings.ethernet_enabled,
-        SETTINGS_TOGGLE_ETHERNET,
-        &palette);
-    create_divider(power_card, &palette);
-    create_toggle_row(
-        power_card,
-        "Wi-Fi",
-        "ESP32-C6 coprocessor",
-        settings.wifi_enabled,
-        SETTINGS_TOGGLE_WIFI,
-        &palette);
-    create_divider(power_card, &palette);
-    create_toggle_row(
-        power_card,
-        "Audio",
-        "ES8311 codec and NS4150B amplifier",
-        settings.audio_enabled,
-        SETTINGS_TOGGLE_AUDIO,
-        &palette);
-
     create_section_label(content, "POWER MODES", &palette);
     lv_obj_t *power_modes_card = create_card(content, &palette);
     create_toggle_row(
         power_modes_card,
         "Active Mode Optimization",
-        "Green: optimized. Off: full power.",
+        NULL,
         settings.active_optimization_enabled,
         SETTINGS_TOGGLE_ACTIVE_OPTIMIZATION,
         &palette);
@@ -681,20 +625,10 @@ void settings_screen_create(
     lv_obj_set_width(s_status_label, LV_PCT(86));
     lv_obj_set_style_text_align(s_status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_pad_top(s_status_label, 8, 0);
+    lv_obj_add_flag(s_status_label, LV_OBJ_FLAG_HIDDEN);
 
-    if (users_ret == ESP_OK) {
-        char refresh_status[128];
-        snprintf(
-            refresh_status,
-            sizeof(refresh_status),
-            settings.sdcard_enabled
-                ? "%u authorized user%s refreshed from microSD."
-                : "%u authorized user%s refreshed; microSD returned to OFF.",
-            (unsigned)users.count,
-            users.count == 1 ? "" : "s");
-        set_status(refresh_status, false);
-    } else {
-        set_status("Authorized-user refresh failed. Power settings remain available.", true);
+    if (users_ret != ESP_OK) {
+        set_status("Authorized-user refresh failed. Settings remain available.", true);
     }
 
     bsp_display_unlock();
@@ -718,3 +652,4 @@ void settings_screen_destroy(void)
 
     bsp_display_unlock();
 }
+
