@@ -166,6 +166,14 @@ void power_manager_set_sleep_modes(bool light_enabled, bool deep_enabled)
     app_sleep_set_mode_policy(light_enabled, deep_enabled);
 }
 
+void power_manager_set_sleep_policy(
+    bool light_enabled, bool deep_enabled,
+    uint32_t light_delay_seconds, uint32_t deep_delay_seconds)
+{
+    app_sleep_set_policy(light_enabled, deep_enabled,
+                         light_delay_seconds, deep_delay_seconds);
+}
+
 bool power_manager_pause_inactivity_policy(void)
 {
     return app_sleep_pause_inactivity_policy();
@@ -213,9 +221,11 @@ esp_err_t power_manager_apply_configuration(
         return ESP_ERR_INVALID_ARG;
     }
 
-    power_manager_set_sleep_modes(
+    power_manager_set_sleep_policy(
         configuration->light_sleep_enabled,
-        configuration->deep_sleep_enabled);
+        configuration->deep_sleep_enabled,
+        configuration->light_sleep_delay_seconds,
+        configuration->deep_sleep_delay_seconds);
 
     esp_err_t first_error = ESP_OK;
 

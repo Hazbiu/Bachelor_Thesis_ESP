@@ -1,4 +1,3 @@
-
 #include "services/settings/app_settings.h"
 
 #include <dirent.h>
@@ -11,6 +10,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "config/sleep_timing.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -24,6 +24,8 @@
 #define KEY_ACTIVE_OPT      "active_opt"
 #define KEY_LIGHT_SLEEP     "light_sleep"
 #define KEY_DEEP_SLEEP      "deep_sleep"
+#define KEY_LIGHT_DELAY     "light_delay_s"
+#define KEY_DEEP_DELAY      "deep_delay_s"
 #define ENROLLMENT_ROOT     "/sdcard/enroll"
 
 static const char *TAG = "app_settings";
@@ -39,6 +41,8 @@ static app_settings_snapshot_t s_settings = {
     .active_optimization_enabled = true,
     .light_sleep_enabled = true,
     .deep_sleep_enabled = true,
+    .light_sleep_delay_seconds = APP_SLEEP_DEFAULT_LIGHT_SECONDS,
+    .deep_sleep_delay_seconds = APP_SLEEP_DEFAULT_DEEP_SECONDS,
 };
 
 static bool s_initialized;
@@ -81,6 +85,62 @@ static esp_err_t save_bool(const char *key, bool value)
     return ret;
 }
 
+static bool valid_sleep_delay(uint32_t seconds)
+{
+    return seconds >= APP_SLEEP_DELAY_MIN_SECONDS &&
+           seconds <= APP_SLEEP_DELAY_MAX_SECONDS;
+}
+
+static esp_err_t read_sleep_delay(
+    nvs_handle_t handle, const char *key, uint32_t *seconds)
+{
+    uint32_t stored = 0;
+    esp_err_t ret = nvs_get_u32(handle, key, &stored);
+    if (ret == ESP_OK && valid_sleep_delay(stored)) {
+        *seconds = stored;
+        return ESP_OK;
+    }
+    if (ret != ESP_OK && ret != ESP_ERR_NVS_NOT_FOUND &&
+        ret != ESP_ERR_NVS_TYPE_MISMATCH) {
+        return ret;
+    }
+
+    /* Seed once on upgrade, or repair an invalid duration without erasing NVS.
+     * Saving both defaults also keeps future mode toggles from changing them. */
+    ESP_LOGI(TAG, "Initializing %s to %u seconds", key, (unsigned)*seconds);
+    ret = nvs_set_u32(handle, key, *seconds);
+    return ret == ESP_OK ? nvs_commit(handle) : ret;
+}
+
+static esp_err_t save_sleep_delay(
+    const char *key, uint32_t seconds, uint32_t *current)
+{
+    if (!valid_sleep_delay(seconds)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_nvs_available) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    ret = nvs_set_u32(handle, key, seconds);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (ret == ESP_OK) {
+        *current = seconds;
+        ESP_LOGI(TAG, "Saved %s=%u seconds", key, (unsigned)seconds);
+    } else {
+        ESP_LOGE(TAG, "Could not save %s: %s", key, esp_err_to_name(ret));
+    }
+    return ret;
+}
+
 esp_err_t app_settings_init(void)
 {
     if (s_initialized) {
@@ -100,13 +160,7 @@ esp_err_t app_settings_init(void)
     }
 
     nvs_handle_t handle;
-    ret = nvs_open(SETTINGS_NAMESPACE, NVS_READONLY, &handle);
-    if (ret == ESP_ERR_NVS_NOT_FOUND) {
-        /* Namespace is created on the first user change. */
-        s_nvs_available = true;
-        ESP_LOGI(TAG, "No saved settings; using light mode with all components enabled");
-        return ESP_OK;
-    }
+    ret = nvs_open(SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Could not open settings namespace: %s", esp_err_to_name(ret));
         return ret;
@@ -167,6 +221,22 @@ esp_err_t app_settings_init(void)
         first_error = item_ret;
     }
 
+    /* An existing Deep-only device keeps its former 7-second delay on upgrade.
+     * Hybrid/fresh devices keep 15 seconds to Light, then 10 seconds to Deep. */
+    s_settings.deep_sleep_delay_seconds =
+        !s_settings.light_sleep_enabled && s_settings.deep_sleep_enabled
+            ? APP_SLEEP_LEGACY_DEEP_ONLY_SECONDS : APP_SLEEP_DEFAULT_DEEP_SECONDS;
+    item_ret = read_sleep_delay(handle, KEY_LIGHT_DELAY,
+                               &s_settings.light_sleep_delay_seconds);
+    if (item_ret != ESP_OK && first_error == ESP_OK) {
+        first_error = item_ret;
+    }
+    item_ret = read_sleep_delay(handle, KEY_DEEP_DELAY,
+                               &s_settings.deep_sleep_delay_seconds);
+    if (item_ret != ESP_OK && first_error == ESP_OK) {
+        first_error = item_ret;
+    }
+
     nvs_close(handle);
     s_nvs_available = first_error == ESP_OK;
 
@@ -179,7 +249,8 @@ esp_err_t app_settings_init(void)
     ESP_LOGI(
         TAG,
         "Loaded settings: theme=%s ethernet=%s wifi=%s camera=%s audio=%s "
-        "sdcard=%s active_optimization=%s light_sleep=%s deep_sleep=%s",
+        "sdcard=%s active_optimization=%s light_sleep=%s deep_sleep=%s "
+        "light_delay_s=%u deep_delay_s=%u",
         s_settings.dark_mode ? "dark" : "light",
         s_settings.ethernet_enabled ? "on" : "off",
         s_settings.wifi_enabled ? "on" : "off",
@@ -188,7 +259,9 @@ esp_err_t app_settings_init(void)
         s_settings.sdcard_enabled ? "on" : "off",
         s_settings.active_optimization_enabled ? "on" : "off",
         s_settings.light_sleep_enabled ? "on" : "off",
-        s_settings.deep_sleep_enabled ? "on" : "off");
+        s_settings.deep_sleep_enabled ? "on" : "off",
+        (unsigned)s_settings.light_sleep_delay_seconds,
+        (unsigned)s_settings.deep_sleep_delay_seconds);
     return ESP_OK;
 }
 
@@ -360,6 +433,18 @@ esp_err_t app_settings_set_deep_sleep_enabled(bool enabled)
     s_settings.deep_sleep_enabled = enabled;
     ESP_LOGI(TAG, "Deep-sleep mode saved: %s", enabled ? "enabled" : "disabled");
     return ESP_OK;
+}
+
+esp_err_t app_settings_set_light_sleep_delay_seconds(uint32_t seconds)
+{
+    return save_sleep_delay(KEY_LIGHT_DELAY, seconds,
+                            &s_settings.light_sleep_delay_seconds);
+}
+
+esp_err_t app_settings_set_deep_sleep_delay_seconds(uint32_t seconds)
+{
+    return save_sleep_delay(KEY_DEEP_DELAY, seconds,
+                            &s_settings.deep_sleep_delay_seconds);
 }
 
 static bool is_directory_entry(const struct dirent *entry)

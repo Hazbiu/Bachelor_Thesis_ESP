@@ -29,6 +29,8 @@ static app_configuration_snapshot_t from_service(
         .active_optimization_enabled = settings.active_optimization_enabled,
         .light_sleep_enabled = settings.light_sleep_enabled,
         .deep_sleep_enabled = settings.deep_sleep_enabled,
+        .light_sleep_delay_seconds = settings.light_sleep_delay_seconds,
+        .deep_sleep_delay_seconds = settings.deep_sleep_delay_seconds,
     };
     return configuration;
 }
@@ -44,6 +46,8 @@ static power_manager_configuration_t to_power_configuration(
         .active_optimization_enabled = settings.active_optimization_enabled,
         .light_sleep_enabled = settings.light_sleep_enabled,
         .deep_sleep_enabled = settings.deep_sleep_enabled,
+        .light_sleep_delay_seconds = settings.light_sleep_delay_seconds,
+        .deep_sleep_delay_seconds = settings.deep_sleep_delay_seconds,
     };
     return configuration;
 }
@@ -55,9 +59,11 @@ esp_err_t app_configuration_init(void)
     /* Keep Power Management synchronized even when NVS is unavailable and
      * Configuration Service falls back to its in-memory defaults. */
     const app_settings_snapshot_t settings = app_settings_get();
-    power_manager_set_sleep_modes(
+    power_manager_set_sleep_policy(
         settings.light_sleep_enabled,
-        settings.deep_sleep_enabled);
+        settings.deep_sleep_enabled,
+        settings.light_sleep_delay_seconds,
+        settings.deep_sleep_delay_seconds);
 
     return ret;
 }
@@ -203,9 +209,11 @@ esp_err_t app_configuration_set_active_optimization_enabled(bool enabled)
 static void synchronize_sleep_policy(void)
 {
     const app_settings_snapshot_t settings = app_settings_get();
-    power_manager_set_sleep_modes(
+    power_manager_set_sleep_policy(
         settings.light_sleep_enabled,
-        settings.deep_sleep_enabled);
+        settings.deep_sleep_enabled,
+        settings.light_sleep_delay_seconds,
+        settings.deep_sleep_delay_seconds);
 }
 
 esp_err_t app_configuration_set_light_sleep_enabled(bool enabled)
@@ -220,6 +228,24 @@ esp_err_t app_configuration_set_light_sleep_enabled(bool enabled)
 esp_err_t app_configuration_set_deep_sleep_enabled(bool enabled)
 {
     const esp_err_t ret = app_settings_set_deep_sleep_enabled(enabled);
+    if (ret == ESP_OK) {
+        synchronize_sleep_policy();
+    }
+    return ret;
+}
+
+esp_err_t app_configuration_set_light_sleep_delay_seconds(uint32_t seconds)
+{
+    const esp_err_t ret = app_settings_set_light_sleep_delay_seconds(seconds);
+    if (ret == ESP_OK) {
+        synchronize_sleep_policy();
+    }
+    return ret;
+}
+
+esp_err_t app_configuration_set_deep_sleep_delay_seconds(uint32_t seconds)
+{
+    const esp_err_t ret = app_settings_set_deep_sleep_delay_seconds(seconds);
     if (ret == ESP_OK) {
         synchronize_sleep_policy();
     }

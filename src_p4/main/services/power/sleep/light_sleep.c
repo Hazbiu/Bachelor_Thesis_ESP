@@ -284,10 +284,17 @@ static esp_err_t enter_light_sleep_internal(
         }
     } else {
         s_last_wakeup_cause = ESP_SLEEP_WAKEUP_UNDEFINED;
-        ESP_LOGE(
-            TAG,
-            "Light-sleep failed: %s",
-            esp_err_to_name(ret));
+        if (!verbose && ret == ESP_ERR_INVALID_ARG) {
+            ESP_LOGW(
+                TAG,
+                "Timer-sliced Light-sleep entry was rejected: %s",
+                esp_err_to_name(ret));
+        } else {
+            ESP_LOGE(
+                TAG,
+                "Light-sleep failed: %s",
+                esp_err_to_name(ret));
+        }
     }
 
     /*

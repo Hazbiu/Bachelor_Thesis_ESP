@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include "driver/gpio.h"
@@ -114,14 +113,14 @@
  * the existing flashing helper and build layout stay compatible; app_sleep.c
  * does not use it to select behavior.
  *
- *   Light ON  + Deep ON : full Light-sleep at 15 s, then true Deep 10 s later.
- *   Light ON  + Deep OFF: the SAME full Light-sleep state at 15 s, indefinitely.
- *   Light OFF + Deep ON : Deep only at 7 s.
+ *   Light ON  + Deep ON : saved Light delay from Active; saved Deep delay
+ *                        from completed Light-sleep initialization.
+ *   Light ON  + Deep OFF: saved Light delay, then Light-sleep until activity.
+ *   Light OFF + Deep ON : saved Deep delay directly from Active.
  *   Light OFF + Deep OFF: automatic sleep disabled.
  *
- * V15 deliberately makes every Light-sleep selection use the same trigger and
- * the same external-peripheral state. APP_SINGLE_SLEEP_TIMEOUT_MS is therefore
- * retained only for Deep-only mode.
+ * Runtime durations are persisted by app_settings.c. The historical timing
+ * macros below remain for build/flashing compatibility, not runtime deadlines.
  */
 #define APP_SINGLE_SLEEP_TIMEOUT_MS                 7000U
 
@@ -226,27 +225,35 @@
  *   3. After arming, accept the next fresh PRESSED sample and restore
  *      camera/display.
  *
- * With the 250 ms poll interval below, wake qualification is intentionally
- * responsive while still rejecting the stale transition sample that motivated
- * the original filter:
+ * With the 250 ms poll interval below, wake qualification rejects both the
+ * stale transition packet and the one-sample false presses observed after the
+ * LCD/DSI suspend sequence:
  *
- *   startup quarantine : 250 ms
- *   post-sleep release : 250 ms
- *   fresh press        : one qualified 250 ms polling sample
+ *   startup quarantine : 500 ms
+ *   post-sleep release : three consecutive samples / 750 ms
+ *   fresh press        : two consecutive samples / 500 ms
  *
- * The pre-sleep release streak above is retained. After the first clean
- * post-sleep RELEASED sample arms touch wake, the next fresh GT911 PRESSED
- * sample restores Active mode. This avoids requiring the controller to report
- * the same physical press in two consecutive 250 ms polls.
+ * The pre-sleep release streak above is retained, but it does not arm wake.
+ * Wake is armed only after a new stable RELEASED window while the display is
+ * already suspended. The user then holds a press for 500 ms to wake. GPIO3
+ * remains the immediate alternative.
  *
  * GPIO3 remains available as an immediate Light-sleep wake source.
  */
 #define APP_LIGHT_SLEEP_TOUCH_PRE_RELEASE_SAMPLES    3U
 #define APP_LIGHT_SLEEP_TOUCH_PRECHECK_MAX_SAMPLES   12U
 #define APP_LIGHT_SLEEP_TOUCH_SAMPLE_DELAY_MS        15U
-#define APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS      250U
-#define APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS      250U
-#define APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS        250U
+#define APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS      500U
+#define APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS      750U
+#define APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS        500U
+
+/*
+ * ESP32-P4 can occasionally reject one otherwise valid timer-sliced entry
+ * with ESP_ERR_INVALID_ARG after wake-source teardown/reconfiguration. Retry
+ * only that rejected-entry case while application hardware remains suspended.
+ */
+#define APP_LIGHT_SLEEP_ENTRY_RETRY_COUNT               3U
+#define APP_LIGHT_SLEEP_ENTRY_RETRY_DELAY_MS            10U
 
 /*
  * esp_light_sleep_start() may return a few hundred microseconds before the

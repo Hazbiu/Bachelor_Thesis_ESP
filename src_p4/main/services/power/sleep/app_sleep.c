@@ -1,4 +1,3 @@
-
 #include "services/power/sleep/app_sleep.h"
 
 #include <inttypes.h>
@@ -10,6 +9,7 @@
 #include "bsp/esp-bsp.h"
 #include "bsp/esp32_p4_platform.h"
 #include "config/app_config.h"
+#include "config/sleep_timing.h"
 #include "diagnostics/sleep_power_profile.h"
 #include "services/power/sleep/deep_sleep.h"
 #include "driver/gpio.h"
@@ -66,6 +66,10 @@ static bool s_light_mode_enabled;
 static bool s_deep_mode_enabled;
 static bool s_requested_light_mode_enabled = true;
 static bool s_requested_deep_mode_enabled = true;
+static uint32_t s_requested_light_delay_ms = APP_SLEEP_DEFAULT_LIGHT_SECONDS * 1000U;
+static uint32_t s_requested_deep_delay_ms = APP_SLEEP_DEFAULT_DEEP_SECONDS * 1000U;
+static uint32_t s_light_sleep_delay_ms;
+static uint32_t s_deep_sleep_delay_ms;
 static uint32_t s_light_sleep_threshold_ms;
 static uint32_t s_deep_sleep_threshold_ms;
 
@@ -83,49 +87,195 @@ void app_sleep_set_mode_policy(bool light_enabled, bool deep_enabled)
     portEXIT_CRITICAL(&s_sleep_request_lock);
 }
 
-static void configure_runtime_power_modes(void)
+void app_sleep_set_policy(
+    bool light_enabled, bool deep_enabled,
+    uint32_t light_delay_seconds, uint32_t deep_delay_seconds)
 {
-    bool light_enabled;
-    bool deep_enabled;
-
-    portENTER_CRITICAL(&s_sleep_request_lock);
-    light_enabled = s_requested_light_mode_enabled;
-    deep_enabled = s_requested_deep_mode_enabled;
-    portEXIT_CRITICAL(&s_sleep_request_lock);
-
-    uint32_t light_threshold_ms = 0;
-    uint32_t deep_threshold_ms = 0;
-
-    if (light_enabled && deep_enabled) {
-        light_threshold_ms = APP_LIGHT_SLEEP_TIMEOUT_MS;
-        deep_threshold_ms =
-            APP_LIGHT_SLEEP_TIMEOUT_MS +
-            APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS;
-    } else if (light_enabled) {
-        /* V15: Light-only uses the same trigger as Hybrid Light-sleep. */
-        light_threshold_ms = APP_LIGHT_SLEEP_TIMEOUT_MS;
-    } else if (deep_enabled) {
-        deep_threshold_ms = APP_SINGLE_SLEEP_TIMEOUT_MS;
+    if (light_delay_seconds < APP_SLEEP_DELAY_MIN_SECONDS ||
+        light_delay_seconds > APP_SLEEP_DELAY_MAX_SECONDS ||
+        deep_delay_seconds < APP_SLEEP_DELAY_MIN_SECONDS ||
+        deep_delay_seconds > APP_SLEEP_DELAY_MAX_SECONDS) {
+        ESP_LOGE(TAG, "Ignoring out-of-range sleep duration");
+        return;
     }
 
     portENTER_CRITICAL(&s_sleep_request_lock);
+    s_requested_light_mode_enabled = light_enabled;
+    s_requested_deep_mode_enabled = deep_enabled;
+    s_requested_light_delay_ms = light_delay_seconds * 1000U;
+    s_requested_deep_delay_ms = deep_delay_seconds * 1000U;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+}
+
+static void configure_runtime_power_modes(void)
+{
+    const int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    if (s_light_sleep_in_progress || s_sleep_requested ||
+        (s_light_mode_enabled == s_requested_light_mode_enabled &&
+         s_deep_mode_enabled == s_requested_deep_mode_enabled &&
+         s_light_sleep_delay_ms == s_requested_light_delay_ms &&
+         s_deep_sleep_delay_ms == s_requested_deep_delay_ms)) {
+        portEXIT_CRITICAL(&s_sleep_request_lock);
+        return;
+    }
+
+    const bool light_enabled = s_requested_light_mode_enabled;
+    const bool deep_enabled = s_requested_deep_mode_enabled;
+    const uint32_t light_delay_ms = s_requested_light_delay_ms;
+    const uint32_t deep_delay_ms = s_requested_deep_delay_ms;
     s_light_mode_enabled = light_enabled;
     s_deep_mode_enabled = deep_enabled;
-    s_light_sleep_threshold_ms = light_threshold_ms;
-    s_deep_sleep_threshold_ms = deep_threshold_ms;
+    s_light_sleep_delay_ms = light_delay_ms;
+    s_deep_sleep_delay_ms = deep_delay_ms;
+    s_light_sleep_threshold_ms = light_enabled ? light_delay_ms : 0U;
+    /* Hybrid Deep has no Active deadline: its clock starts inside Light. */
+    s_deep_sleep_threshold_ms = deep_enabled && !light_enabled ? deep_delay_ms : 0U;
+    if (s_inactivity_monitor_started) {
+        s_last_face_detected_us = now_us;
+        s_light_sleep_failed_until_activity = false;
+    }
     portEXIT_CRITICAL(&s_sleep_request_lock);
 
     ESP_LOGI(
         POWER_TAG,
-        "event=POWER_MODES_CONFIGURED light=%s deep=%s light_after_ms=%u "
-        "deep_after_ms=%u light_to_deep_gap_ms=%u",
+        "event=POWER_MODES_CONFIGURED light=%s deep=%s light_delay_ms=%u "
+        "deep_delay_ms=%u deep_countdown_from=%s",
         light_enabled ? "ENABLED" : "DISABLED",
         deep_enabled ? "ENABLED" : "DISABLED",
-        (unsigned)light_threshold_ms,
-        (unsigned)deep_threshold_ms,
-        (unsigned)(light_enabled && deep_enabled
-            ? APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS
-            : 0U));
+        (unsigned)light_delay_ms,
+        (unsigned)deep_delay_ms,
+        !deep_enabled ? "DISABLED" : light_enabled ? "LIGHT_SLEEP" : "ACTIVE");
+}
+
+/* Rounded up so a sub-millisecond remainder cannot call Deep early. */
+static uint32_t light_residency_remaining_ms(int64_t deadline_us, int64_t now_us)
+{
+    return now_us >= deadline_us
+        ? 0U : (uint32_t)((deadline_us - now_us + 999LL) / 1000LL);
+}
+
+typedef enum {
+    APP_TOUCH_GATE_NO_EVENT = 0,
+    APP_TOUCH_GATE_STARTUP_PRESS_SUPPRESSED,
+    APP_TOUCH_GATE_RELEASE_WINDOW_STARTED,
+    APP_TOUCH_GATE_ARMED,
+    APP_TOUCH_GATE_PRESS_CANDIDATE,
+    APP_TOUCH_GATE_CONFIRMED,
+} app_touch_gate_event_t;
+
+typedef struct {
+    bool armed;
+    bool startup_press_logged;
+    bool release_window_logged;
+    bool press_candidate_logged;
+    uint32_t release_stable_ms;
+    uint32_t press_stable_ms;
+} app_touch_gate_t;
+
+static uint32_t saturating_add_u32(uint32_t value, uint32_t increment)
+{
+    return UINT32_MAX - value < increment ? UINT32_MAX : value + increment;
+}
+
+static app_touch_gate_event_t update_touch_gate(
+    app_touch_gate_t *gate,
+    bool touched,
+    uint32_t elapsed_ms,
+    uint32_t sample_ms)
+{
+    if (gate == NULL || sample_ms == 0U) {
+        return APP_TOUCH_GATE_NO_EVENT;
+    }
+
+    /* Include the boundary sample: the first 250 ms sample must still be
+     * quarantined when the configured window is 250/500 ms. */
+    if (elapsed_ms <= APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS) {
+        gate->release_stable_ms = 0U;
+        gate->press_stable_ms = 0U;
+        gate->release_window_logged = false;
+        gate->press_candidate_logged = false;
+        if (touched && !gate->startup_press_logged) {
+            gate->startup_press_logged = true;
+            return APP_TOUCH_GATE_STARTUP_PRESS_SUPPRESSED;
+        }
+        return APP_TOUCH_GATE_NO_EVENT;
+    }
+
+    if (!gate->armed) {
+        gate->press_stable_ms = 0U;
+        gate->press_candidate_logged = false;
+        if (touched) {
+            gate->release_stable_ms = 0U;
+            gate->release_window_logged = false;
+            return APP_TOUCH_GATE_NO_EVENT;
+        }
+
+        app_touch_gate_event_t event = APP_TOUCH_GATE_NO_EVENT;
+        if (!gate->release_window_logged) {
+            gate->release_window_logged = true;
+            event = APP_TOUCH_GATE_RELEASE_WINDOW_STARTED;
+        }
+        gate->release_stable_ms = saturating_add_u32(
+            gate->release_stable_ms, sample_ms);
+        if (gate->release_stable_ms >=
+            APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS) {
+            gate->armed = true;
+            return APP_TOUCH_GATE_ARMED;
+        }
+        return event;
+    }
+
+    if (!touched) {
+        gate->press_stable_ms = 0U;
+        gate->press_candidate_logged = false;
+        return APP_TOUCH_GATE_NO_EVENT;
+    }
+
+    app_touch_gate_event_t event = APP_TOUCH_GATE_NO_EVENT;
+    if (!gate->press_candidate_logged) {
+        gate->press_candidate_logged = true;
+        event = APP_TOUCH_GATE_PRESS_CANDIDATE;
+    }
+    gate->press_stable_ms = saturating_add_u32(
+        gate->press_stable_ms, sample_ms);
+    if (gate->press_stable_ms >= APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS) {
+        return APP_TOUCH_GATE_CONFIRMED;
+    }
+    return event;
+}
+
+static esp_err_t enter_light_sleep_poll_slice_resilient(
+    uint32_t timeout_ms,
+    bool enable_gpio_wakeup)
+{
+    esp_err_t ret = ESP_FAIL;
+
+    for (uint32_t attempt = 1U;
+         attempt <= APP_LIGHT_SLEEP_ENTRY_RETRY_COUNT;
+         ++attempt) {
+        ret = enter_light_sleep_poll_slice(timeout_ms, enable_gpio_wakeup);
+        const bool rejected_before_sleep =
+            ret == ESP_ERR_INVALID_ARG &&
+            light_sleep_get_last_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED;
+
+        if (!rejected_before_sleep ||
+            attempt == APP_LIGHT_SLEEP_ENTRY_RETRY_COUNT) {
+            return ret;
+        }
+
+        ESP_LOGW(
+            POWER_TAG,
+            "event=LIGHT_SLEEP_ENTRY_RETRY attempt=%" PRIu32
+            " max_attempts=%u error=%s delay_ms=%u",
+            attempt,
+            (unsigned)APP_LIGHT_SLEEP_ENTRY_RETRY_COUNT,
+            esp_err_to_name(ret),
+            (unsigned)APP_LIGHT_SLEEP_ENTRY_RETRY_DELAY_MS);
+        vTaskDelay(pdMS_TO_TICKS(APP_LIGHT_SLEEP_ENTRY_RETRY_DELAY_MS));
+    }
+
+    return ret;
 }
 
 /*
@@ -295,7 +445,7 @@ static bool claim_inactivity_sleep_request(void)
     const int64_t timeout_us =
         (int64_t)s_deep_sleep_threshold_ms * 1000LL;
 
-    if (s_deep_mode_enabled &&
+    if (s_deep_mode_enabled && !s_light_mode_enabled &&
         s_deep_sleep_threshold_ms > 0 &&
         s_inactivity_monitor_started &&
         !s_inactivity_policy_paused &&
@@ -418,8 +568,6 @@ bool app_sleep_light_sleep_is_due(void)
     const int64_t inactive_us = now_us - s_last_face_detected_us;
     const int64_t light_timeout_us =
         (int64_t)s_light_sleep_threshold_ms * 1000LL;
-    const int64_t deep_timeout_us =
-        (int64_t)s_deep_sleep_threshold_ms * 1000LL;
 
     due = s_light_mode_enabled &&
         s_light_sleep_threshold_ms > 0 &&
@@ -429,10 +577,6 @@ bool app_sleep_light_sleep_is_due(void)
         s_light_sleep_in_progress &&
         !s_light_sleep_failed_until_activity &&
         inactive_us >= light_timeout_us;
-
-    if (s_deep_mode_enabled && s_deep_sleep_threshold_ms > 0) {
-        due = due && inactive_us < deep_timeout_us;
-    }
 
     portEXIT_CRITICAL(&s_sleep_request_lock);
 
@@ -567,10 +711,12 @@ static void restart_inactivity_epoch_after_light_sleep_recovery(
     ESP_LOGI(
         POWER_TAG,
         "event=LIGHT_SLEEP_RECOVERY_EPOCH_RESET phase=%s "
-        "inactive_ms=0 next_light_after_ms=%u next_deep_after_ms=%u",
+        "inactive_ms=0 next_light_delay_ms=%u next_deep_delay_ms=%u "
+        "deep_countdown_from=%s",
         phase != NULL ? phase : "UNKNOWN",
-        (unsigned)s_light_sleep_threshold_ms,
-        (unsigned)s_deep_sleep_threshold_ms);
+        (unsigned)s_light_sleep_delay_ms,
+        (unsigned)s_deep_sleep_delay_ms,
+        s_light_mode_enabled ? "LIGHT_SLEEP" : "ACTIVE");
 }
 
 static void recover_light_sleep_without_reset(
@@ -642,8 +788,6 @@ static bool claim_light_sleep_window(uint32_t *remaining_ms)
     const int64_t inactive_us = now_us - s_last_face_detected_us;
     const int64_t light_timeout_us =
         (int64_t)s_light_sleep_threshold_ms * 1000LL;
-    const int64_t deep_timeout_us =
-        (int64_t)s_deep_sleep_threshold_ms * 1000LL;
 
     if (remaining_ms != NULL &&
         s_light_mode_enabled &&
@@ -653,22 +797,9 @@ static bool claim_light_sleep_window(uint32_t *remaining_ms)
         !s_sleep_requested &&
         !s_light_sleep_in_progress &&
         !s_light_sleep_failed_until_activity &&
-        inactive_us >= light_timeout_us &&
-        (!s_deep_mode_enabled || inactive_us < deep_timeout_us)) {
-        if (s_deep_mode_enabled && s_deep_sleep_threshold_ms > 0) {
-            /*
-             * V15 CONSISTENT RESIDENCY:
-             * Once the full hardware Light-sleep state has been prepared, give
-             * it a complete 10-second residency window. Do not shorten that
-             * window because the inactivity task claimed it a few milliseconds
-             * after the 15-second threshold or because hardware preparation
-             * itself consumed wall time.
-             */
-            *remaining_ms = APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS;
-        } else {
-            /* Light-only mode stays in the identical Light-sleep state. */
-            *remaining_ms = 0;
-        }
+        inactive_us >= light_timeout_us) {
+        /* Capture a full Deep delay. Preparation time cannot shorten it. */
+        *remaining_ms = s_deep_mode_enabled ? s_deep_sleep_delay_ms : 0U;
         s_light_sleep_in_progress = true;
         claimed = true;
     }
@@ -1281,9 +1412,10 @@ static void inactivity_power_policy_task(void *arg)
             "event=LIGHT_SLEEP_STATE_POLICY version=15 "
             "mode=UNIFIED_FULL_PANEL_SLEEP sdcard=PRESERVED gt911=POLLING "
             "touch_poll_ms=%u backlight=" APP_LIGHT_SLEEP_BACKLIGHT_STATE " ethernet=FOLLOWS_SAVED_POLICY "
-            "deep_stage_delay_ms=%u light_to_deep_residency_ms=10000",
+            "deep_stage_delay_ms=%u light_to_deep_residency_ms=%u",
             (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
-            (unsigned)APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS);
+            (unsigned)APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS,
+            (unsigned)(s_deep_mode_enabled ? s_deep_sleep_delay_ms : 0U));
     }
 
     const char *policy_name = s_light_mode_enabled
@@ -1294,22 +1426,28 @@ static void inactivity_power_policy_task(void *arg)
         POWER_TAG,
         "event=INACTIVITY_POLICY_STARTED policy=%s "
         "idle_180_after_ms=%u idle_90_after_ms=%u "
-        "light_sleep_after_ms=%u deep_sleep_after_ms=%u",
+        "light_delay_ms=%u deep_delay_ms=%u deep_countdown_from=%s",
         policy_name,
         (unsigned)APP_CPU_IDLE_180_AFTER_MS,
         (unsigned)APP_CPU_IDLE_90_AFTER_MS,
-        (unsigned)s_light_sleep_threshold_ms,
-        (unsigned)s_deep_sleep_threshold_ms);
+        (unsigned)s_light_sleep_delay_ms,
+        (unsigned)s_deep_sleep_delay_ms,
+        !s_deep_mode_enabled ? "DISABLED" :
+            s_light_mode_enabled ? "LIGHT_SLEEP" : "ACTIVE");
 
     ESP_LOGI(
         TAG,
-        "Runtime Power Modes armed: policy=%s light=%u ms deep=%u ms",
+        "Runtime Power Modes armed: policy=%s light_delay=%u ms "
+        "deep_delay=%u ms deep_countdown_from=%s",
         policy_name,
-        (unsigned)s_light_sleep_threshold_ms,
-        (unsigned)s_deep_sleep_threshold_ms);
+        (unsigned)s_light_sleep_delay_ms,
+        (unsigned)s_deep_sleep_delay_ms,
+        !s_deep_mode_enabled ? "disabled" :
+            s_light_mode_enabled ? "Light-sleep initialization" : "Active inactivity");
 
     while (!app_sleep_is_requested()) {
         vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_INACTIVITY_POLL_MS));
+        configure_runtime_power_modes();
 
         /*
         * Apply the staged active CPU policy and reduce AI duty cycle before
@@ -1570,24 +1708,27 @@ static void inactivity_power_policy_task(void *arg)
         esp_sleep_wakeup_cause_t wake_cause =
             ESP_SLEEP_WAKEUP_UNDEFINED;
         bool touchscreen_touched = false;
-        /*
-         * The pre-sleep GT911 check above already proved a clean released state.
-         * Arm touchscreen wake immediately for the Light-sleep polling window so
-         * the first fresh post-quarantine PRESSED sample restores ACTIVE mode.
-         * This avoids requiring a second release/arming cycle after the display
-         * has already been suspended.
-         */
-        bool touch_wake_armed = true;
-        bool startup_press_logged = false;
-        bool release_window_logged = false;
-        bool press_candidate_logged = false;
+        /* Pre-sleep release is not sufficient: the attached device trace shows
+         * false GT911 presses after the display has already been suspended. */
+        app_touch_gate_t touch_gate = {0};
         uint32_t light_sleep_elapsed_ms = 0;
-        uint32_t release_stable_ms = 0;
-        uint32_t press_stable_ms = 0;
         uint32_t short_slice_count = 0;
+        const uint32_t light_to_deep_delay_ms = remaining_ms;
+        /* Both application and peripheral preparation are complete now.
+         * Use wall time so touch polling/loop overhead cannot accumulate into
+         * a longer Deep delay, especially with minute-long settings. */
+        const int64_t light_deadline_us = esp_timer_get_time() +
+            (int64_t)light_to_deep_delay_ms * 1000LL;
 
         while (!touchscreen_touched &&
                (!s_deep_mode_enabled || remaining_ms > 0)) {
+            if (s_deep_mode_enabled) {
+                remaining_ms = light_residency_remaining_ms(
+                    light_deadline_us, esp_timer_get_time());
+                if (remaining_ms == 0) {
+                    break;
+                }
+            }
             uint32_t poll_slice_ms = APP_LIGHT_SLEEP_TOUCH_POLL_MS;
             if (s_deep_mode_enabled && poll_slice_ms > remaining_ms) {
                 poll_slice_ms = remaining_ms;
@@ -1595,7 +1736,7 @@ static void inactivity_power_policy_task(void *arg)
 
             const int64_t slice_start_us = esp_timer_get_time();
 
-            light_ret = enter_light_sleep_poll_slice(
+            light_ret = enter_light_sleep_poll_slice_resilient(
                 poll_slice_ms,
                 true);
             wake_cause = light_sleep_get_last_wakeup_cause();
@@ -1661,14 +1802,12 @@ static void inactivity_power_policy_task(void *arg)
             }
 
             if (s_deep_mode_enabled) {
-                remaining_ms -= poll_slice_ms;
+                remaining_ms = light_residency_remaining_ms(
+                    light_deadline_us, esp_timer_get_time());
             }
 
-            if (UINT32_MAX - light_sleep_elapsed_ms < poll_slice_ms) {
-                light_sleep_elapsed_ms = UINT32_MAX;
-            } else {
-                light_sleep_elapsed_ms += poll_slice_ms;
-            }
+            light_sleep_elapsed_ms = saturating_add_u32(
+                light_sleep_elapsed_ms, poll_slice_ms);
 
             bool touched_now = false;
             touch_ret =
@@ -1684,113 +1823,40 @@ static void inactivity_power_policy_task(void *arg)
                 break;
             }
 
-            /*
-            * V8 TIME-QUALIFIED TOUCH GATE (PRESERVED FROM V6)
-            *
-            * V4 proved that counting a few consecutive RELEASED samples was
-            * insufficient: the GT911 could emit PRESSED -> RELEASED -> PRESSED
-            * during the display/DSI power transition and satisfy the old gate.
-            *
-            * The V6/V8 managed-driver patch fixes the GT911 stale-point cache. This elapsed-time gate remains as a secondary filter:
-            *
-            *   startup quarantine
-            *       ignore every GT911 PRESSED/RELEASED value
-            *
-            *   stable release window
-            *       require continuously RELEASED for a configured duration
-            *
-            *   qualified press
-            *       after arming, accept the next fresh PRESSED sample. With the
-            *       current 250 ms threshold this is exactly one polling sample,
-            *       avoiding a false requirement for duplicate GT911 packets.
-            *
-            * Any opposite sample resets the corresponding stability timer.
-            * GPIO3 is independent and still wakes immediately.
-            */
-            if (light_sleep_elapsed_ms <
-                APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS) {
-                release_stable_ms = 0;
-                press_stable_ms = 0;
+            const app_touch_gate_event_t touch_event = update_touch_gate(
+                &touch_gate,
+                touched_now,
+                light_sleep_elapsed_ms,
+                poll_slice_ms);
 
-                if (touched_now && !startup_press_logged) {
-                    startup_press_logged = true;
-                    ESP_LOGW(
-                        POWER_TAG,
-                        "event=LIGHT_SLEEP_TOUCH_STARTUP_PRESS_SUPPRESSED "
-                        "elapsed_ms=%" PRIu32
-                        " ignore_until_ms=%u action=CONTINUE_SLEEP",
-                        light_sleep_elapsed_ms,
-                        (unsigned)APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS);
-                }
-
-                continue;
-            }
-
-            if (!touch_wake_armed) {
-                press_stable_ms = 0;
-                press_candidate_logged = false;
-
-                if (touched_now) {
-                    release_stable_ms = 0;
-                    release_window_logged = false;
-                    continue;
-                }
-
-                if (!release_window_logged) {
-                    release_window_logged = true;
-                    ESP_LOGI(
-                        POWER_TAG,
-                        "event=LIGHT_SLEEP_TOUCH_RELEASE_WINDOW_STARTED "
-                        "required_ms=%u",
-                        (unsigned)APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS);
-                }
-
-                if (UINT32_MAX - release_stable_ms < poll_slice_ms) {
-                    release_stable_ms = UINT32_MAX;
-                } else {
-                    release_stable_ms += poll_slice_ms;
-                }
-
-                if (release_stable_ms >=
-                    APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS) {
-                    touch_wake_armed = true;
-                    press_stable_ms = 0;
-
-                    ESP_LOGI(
-                        POWER_TAG,
-                        "event=LIGHT_SLEEP_TOUCH_POST_ARMED "
-                        "stable_release_ms=%" PRIu32
-                        " elapsed_ms=%" PRIu32,
-                        release_stable_ms,
-                        light_sleep_elapsed_ms);
-                }
-
-                continue;
-            }
-
-            if (!touched_now) {
-                press_stable_ms = 0;
-                press_candidate_logged = false;
-                continue;
-            }
-
-            if (!press_candidate_logged) {
-                press_candidate_logged = true;
+            if (touch_event == APP_TOUCH_GATE_STARTUP_PRESS_SUPPRESSED) {
+                ESP_LOGW(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_TOUCH_STARTUP_PRESS_SUPPRESSED "
+                    "elapsed_ms=%" PRIu32
+                    " ignore_through_ms=%u action=CONTINUE_SLEEP",
+                    light_sleep_elapsed_ms,
+                    (unsigned)APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS);
+            } else if (touch_event == APP_TOUCH_GATE_RELEASE_WINDOW_STARTED) {
                 ESP_LOGI(
                     POWER_TAG,
-                    "event=LIGHT_SLEEP_TOUCH_PRESS_CANDIDATE "
+                    "event=LIGHT_SLEEP_TOUCH_RELEASE_WINDOW_STARTED "
                     "required_ms=%u",
+                    (unsigned)APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS);
+            } else if (touch_event == APP_TOUCH_GATE_ARMED) {
+                ESP_LOGI(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_TOUCH_POST_ARMED "
+                    "stable_release_ms=%" PRIu32
+                    " elapsed_ms=%" PRIu32,
+                    touch_gate.release_stable_ms,
+                    light_sleep_elapsed_ms);
+            } else if (touch_event == APP_TOUCH_GATE_PRESS_CANDIDATE) {
+                ESP_LOGI(
+                    POWER_TAG,
+                    "event=LIGHT_SLEEP_TOUCH_PRESS_CANDIDATE required_ms=%u",
                     (unsigned)APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS);
-            }
-
-            if (UINT32_MAX - press_stable_ms < poll_slice_ms) {
-                press_stable_ms = UINT32_MAX;
-            } else {
-                press_stable_ms += poll_slice_ms;
-            }
-
-            if (press_stable_ms >=
-                APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS) {
+            } else if (touch_event == APP_TOUCH_GATE_CONFIRMED) {
                 touchscreen_touched = true;
                 ESP_LOGI(
                     POWER_TAG,
@@ -1798,7 +1864,7 @@ static void inactivity_power_policy_task(void *arg)
                     "stable_press_ms=%" PRIu32
                     " elapsed_ms=%" PRIu32
                     " action=RESTORE_ACTIVE",
-                    press_stable_ms,
+                    touch_gate.press_stable_ms,
                     light_sleep_elapsed_ms);
             }
         }
@@ -1872,11 +1938,11 @@ static void inactivity_power_policy_task(void *arg)
                 POWER_TAG,
                 "event=LIGHT_SLEEP_RESIDENCY_COMPLETE policy=LIGHT_THEN_DEEP "
                 "residency_ms=%u action=IMMEDIATE_ORDERED_DEEP_SLEEP",
-                (unsigned)APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS);
+                (unsigned)light_to_deep_delay_ms);
             ESP_LOGI(
                 TAG,
                 "Completed %u ms full Light-sleep residency; starting ordered Deep-sleep now",
-                (unsigned)APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS);
+                (unsigned)light_to_deep_delay_ms);
 
             /*
             * Camera and display are already off. Claim the request directly

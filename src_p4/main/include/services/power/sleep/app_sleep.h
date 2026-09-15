@@ -1,7 +1,7 @@
-
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -58,18 +58,18 @@ esp_err_t app_sleep_start_button_monitor(
 * Start the NVS-selected face-inactivity power policy.
 *
 * Light ON + Deep ON:
-*   Enter Light-sleep at APP_LIGHT_SLEEP_TIMEOUT_MS, then enter Deep-sleep
-*   APP_POWER_MODES_LIGHT_TO_DEEP_GAP_MS later if no touch/GPIO3 activity wakes
+*   Enter Light-sleep after the saved Light delay, then enter Deep-sleep
+*   after the saved Deep delay from completed Light preparation if no activity wakes
 *   the application back to Active mode.
 *
 * Light ON + Deep OFF:
-*   Enter the SAME full Light-sleep hardware state at APP_LIGHT_SLEEP_TIMEOUT_MS
-*   (15 s). The timer-sliced GT911 polling loop then continues indefinitely
+*   Enter the SAME full Light-sleep hardware state after the saved Light delay.
+*   The timer-sliced GT911 polling loop then continues indefinitely
 *   until qualified touchscreen activity or GPIO3 wakes the system.
 *
 * Light OFF + Deep ON:
 *   Skip Light-sleep completely and run the existing ordered Deep-sleep
-*   shutdown directly after APP_SINGLE_SLEEP_TIMEOUT_MS (7 s) inactivity.
+*   shutdown directly after the saved Deep delay of inactivity.
 *
 * Light OFF + Deep OFF:
 *   Keep both automatic sleep transitions disabled while retaining the staged
@@ -80,6 +80,15 @@ esp_err_t app_sleep_start_button_monitor(
 */
 /** Set the saved Light/Deep policy supplied by Application Logic. */
 void app_sleep_set_mode_policy(bool light_enabled, bool deep_enabled);
+
+/**
+ * Atomically stage the saved modes and durations (1..5999 seconds each).
+ * Applied on the next Active policy tick with a fresh inactivity epoch; an
+ * already running Light-sleep window retains its captured configuration.
+ */
+void app_sleep_set_policy(
+    bool light_enabled, bool deep_enabled,
+    uint32_t light_delay_seconds, uint32_t deep_delay_seconds);
 
 esp_err_t app_sleep_start_timeout(void);
 

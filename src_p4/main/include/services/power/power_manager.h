@@ -42,6 +42,8 @@ typedef struct {
     bool active_optimization_enabled;
     bool light_sleep_enabled;
     bool deep_sleep_enabled;
+    uint32_t light_sleep_delay_seconds;
+    uint32_t deep_sleep_delay_seconds;
 } power_manager_configuration_t;
 
 esp_err_t power_manager_setup(const power_manager_hooks_t *hooks);
@@ -58,6 +60,9 @@ esp_err_t power_manager_set_active_optimization_enabled(bool enabled);
 bool power_manager_active_optimization_is_enabled(void);
 bool power_manager_audio_policy_ready(void);
 void power_manager_set_sleep_modes(bool light_enabled, bool deep_enabled);
+void power_manager_set_sleep_policy(
+    bool light_enabled, bool deep_enabled,
+    uint32_t light_delay_seconds, uint32_t deep_delay_seconds);
 bool power_manager_pause_inactivity_policy(void);
 void power_manager_resume_inactivity_policy(void);
 bool power_manager_inactivity_policy_is_paused(void);

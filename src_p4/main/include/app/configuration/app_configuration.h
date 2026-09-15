@@ -2,6 +2,9 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
+
+#include "config/sleep_timing.h"
 
 #include "esp_err.h"
 
@@ -30,6 +33,8 @@ typedef struct {
     bool active_optimization_enabled;
     bool light_sleep_enabled;
     bool deep_sleep_enabled;
+    uint32_t light_sleep_delay_seconds;
+    uint32_t deep_sleep_delay_seconds;
 } app_configuration_snapshot_t;
 
 typedef struct {
@@ -51,6 +56,10 @@ esp_err_t app_configuration_set_sdcard_enabled(bool enabled);
 esp_err_t app_configuration_set_active_optimization_enabled(bool enabled);
 esp_err_t app_configuration_set_light_sleep_enabled(bool enabled);
 esp_err_t app_configuration_set_deep_sleep_enabled(bool enabled);
+
+/** Light: Active inactivity. Deep: Light residency, or Active if Light is OFF. */
+esp_err_t app_configuration_set_light_sleep_delay_seconds(uint32_t seconds);
+esp_err_t app_configuration_set_deep_sleep_delay_seconds(uint32_t seconds);
 
 esp_err_t app_configuration_load_authorized_users(
     app_configuration_authorized_users_t *users_out);

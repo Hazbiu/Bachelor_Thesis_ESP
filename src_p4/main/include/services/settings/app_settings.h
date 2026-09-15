@@ -1,8 +1,8 @@
-
 #pragma once
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -23,6 +23,8 @@ typedef struct {
     bool active_optimization_enabled;
     bool light_sleep_enabled;
     bool deep_sleep_enabled;
+    uint32_t light_sleep_delay_seconds;
+    uint32_t deep_sleep_delay_seconds;
 } app_settings_snapshot_t;
 
 typedef struct {
@@ -50,6 +52,10 @@ esp_err_t app_settings_set_sdcard_enabled(bool enabled);
 esp_err_t app_settings_set_active_optimization_enabled(bool enabled);
 esp_err_t app_settings_set_light_sleep_enabled(bool enabled);
 esp_err_t app_settings_set_deep_sleep_enabled(bool enabled);
+
+/** Persist a duration in the inclusive range 1..5999 seconds. */
+esp_err_t app_settings_set_light_sleep_delay_seconds(uint32_t seconds);
+esp_err_t app_settings_set_deep_sleep_delay_seconds(uint32_t seconds);
 
 
 /**
