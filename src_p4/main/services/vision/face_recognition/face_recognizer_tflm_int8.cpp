@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "config/app_config.h"
+#include "diagnostics/ai_pipeline_status.h"
 #include "diagnostics/core_trace.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -1100,6 +1101,9 @@ extern "C" esp_err_t tflm_int8_face_recognition_recognize(
             esp_err_to_name(embedding_ret));
         return embedding_ret;
     }
+
+    diagnostics_ai_live_metrics_record_recognition(
+        timing.invoke_us > 0 ? (uint64_t)timing.invoke_us : 0U);
 
     ESP_LOGI(
         TAG,

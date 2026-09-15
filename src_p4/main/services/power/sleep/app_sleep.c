@@ -33,9 +33,9 @@
 #endif
 
 /*
- * Build guard for the 250 ms responsiveness experiment. This deliberately
- * makes a stale/incorrect 1000 ms configuration fail at compile time instead
- * of silently producing the wrong measurement firmware.
+ * Keep the 250 ms Light-sleep polling cadence used by the measured power
+ * profile. Wake responsiveness is fixed by qualifying one fresh post-release
+ * GT911 press rather than increasing the polling frequency.
  */
 #if APP_LIGHT_SLEEP_TOUCH_POLL_MS != 250U
 #error "GT911 Light-sleep experiment requires APP_LIGHT_SLEEP_TOUCH_POLL_MS == 250U"
@@ -1570,7 +1570,14 @@ static void inactivity_power_policy_task(void *arg)
         esp_sleep_wakeup_cause_t wake_cause =
             ESP_SLEEP_WAKEUP_UNDEFINED;
         bool touchscreen_touched = false;
-        bool touch_wake_armed = false;
+        /*
+         * The pre-sleep GT911 check above already proved a clean released state.
+         * Arm touchscreen wake immediately for the Light-sleep polling window so
+         * the first fresh post-quarantine PRESSED sample restores ACTIVE mode.
+         * This avoids requiring a second release/arming cycle after the display
+         * has already been suspended.
+         */
+        bool touch_wake_armed = true;
         bool startup_press_logged = false;
         bool release_window_logged = false;
         bool press_candidate_logged = false;
@@ -1692,9 +1699,10 @@ static void inactivity_power_policy_task(void *arg)
             *   stable release window
             *       require continuously RELEASED for a configured duration
             *
-            *   stable press window
-            *       after arming, require continuously PRESSED for a configured
-            *       duration before restoring the camera/display
+            *   qualified press
+            *       after arming, accept the next fresh PRESSED sample. With the
+            *       current 250 ms threshold this is exactly one polling sample,
+            *       avoiding a false requirement for duplicate GT911 packets.
             *
             * Any opposite sample resets the corresponding stability timer.
             * GPIO3 is independent and still wakes immediately.

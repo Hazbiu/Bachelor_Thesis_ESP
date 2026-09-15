@@ -23,6 +23,7 @@
 #include "dl_image_define.hpp"
 #include "human_face_recognition.hpp"
 
+#include "diagnostics/ai_pipeline_status.h"
 #include "diagnostics/core_trace.h"
 #include "platform/camera/video_capture.h"
 #include "services/vision/face_detector.h"
@@ -767,11 +768,15 @@ extern "C" esp_err_t espdl_face_recognition_recognize(
     std::vector<dl::recognition::result_t> results =
         s_recognizer->recognize(img, detect_res);
 
+    const int64_t inference_us = esp_timer_get_time() - start_us;
+    diagnostics_ai_live_metrics_record_recognition(
+        inference_us > 0 ? (uint64_t)inference_us : 0U);
+
     ESP_LOGI(
         TAG_RECOG,
         "[CORE-PROOF] backend=ESP-DL RECOGNITION_END cpu=%d duration_us=%lld",
         xPortGetCoreID(),
-        (long long)(esp_timer_get_time() - start_us)
+        (long long)inference_us
     );
 
     if (results.empty()) {

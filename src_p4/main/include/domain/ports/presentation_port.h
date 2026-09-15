@@ -51,6 +51,19 @@ void presentation_face_overlay_draw_label_rgb565(
     const char *name,
     uint16_t background_color);
 
+void presentation_camera_metrics_draw_rgb565(
+    uint16_t *fb,
+    uint32_t fb_w,
+    uint32_t fb_h,
+    bool detector_valid,
+    uint32_t detector_inference_us,
+    bool recognizer_valid,
+    uint32_t recognizer_inference_us,
+    uint32_t fps_x10,
+    bool hp_cpu_usage_valid,
+    uint32_t hp_core0_usage_x10,
+    uint32_t hp_core1_usage_x10);
+
 #ifdef __cplusplus
 }
 #endif

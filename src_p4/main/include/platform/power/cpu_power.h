@@ -53,6 +53,12 @@ uint32_t cpu_power_get_ai_min_interval_ms(void);
 uint32_t cpu_power_get_preview_min_interval_ms(void);
 int cpu_power_get_backlight_percent(void);
 
+/*
+ * Runtime clocks used by the camera diagnostics overlay.
+ * Both HP cores share SOC_MOD_CLK_CPU on ESP32-P4.
+ */
+uint32_t cpu_power_get_hp_frequency_hz(void);
+
 /* Physical display-off idle scan is disabled while the camera is running. */
 bool cpu_power_is_idle_scan_active(void);
 

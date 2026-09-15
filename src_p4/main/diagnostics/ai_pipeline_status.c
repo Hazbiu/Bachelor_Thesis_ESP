@@ -1,8 +1,9 @@
 #include "diagnostics/ai_pipeline_status.h"
 
+#include <inttypes.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdbool.h>
 
 #include "config/app_config.h"
 #include "freertos/FreeRTOS.h"
@@ -13,6 +14,55 @@ static bool detection_success = false;
 static bool recognition_success = false;
 static bool user_found = false;
 static float live_similarity = 0.0f;
+
+/*
+ * CPU1 publishes model timings while CPU0 renders the camera preview.
+ * Keep the pair coherent with a tiny SMP critical section.
+ */
+static portMUX_TYPE s_live_metrics_lock = portMUX_INITIALIZER_UNLOCKED;
+static diagnostics_ai_live_metrics_t s_live_metrics = {0};
+
+static uint32_t clamp_inference_us(uint64_t inference_us)
+{
+    return inference_us > UINT32_MAX
+        ? UINT32_MAX
+        : (uint32_t)inference_us;
+}
+
+void diagnostics_ai_live_metrics_reset(void)
+{
+    portENTER_CRITICAL(&s_live_metrics_lock);
+    memset(&s_live_metrics, 0, sizeof(s_live_metrics));
+    portEXIT_CRITICAL(&s_live_metrics_lock);
+}
+
+void diagnostics_ai_live_metrics_record_detection(uint64_t inference_us)
+{
+    portENTER_CRITICAL(&s_live_metrics_lock);
+    s_live_metrics.detector_inference_us = clamp_inference_us(inference_us);
+    s_live_metrics.detector_valid = true;
+    portEXIT_CRITICAL(&s_live_metrics_lock);
+}
+
+void diagnostics_ai_live_metrics_record_recognition(uint64_t inference_us)
+{
+    portENTER_CRITICAL(&s_live_metrics_lock);
+    s_live_metrics.recognizer_inference_us = clamp_inference_us(inference_us);
+    s_live_metrics.recognizer_valid = true;
+    portEXIT_CRITICAL(&s_live_metrics_lock);
+}
+
+void diagnostics_ai_live_metrics_snapshot(
+    diagnostics_ai_live_metrics_t *out_metrics)
+{
+    if (out_metrics == NULL) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_live_metrics_lock);
+    *out_metrics = s_live_metrics;
+    portEXIT_CRITICAL(&s_live_metrics_lock);
+}
 
 void diagnostics_ai_frame_sent_to_detector(void)
 {
@@ -26,18 +76,26 @@ void diagnostics_ai_detection_result(int face_count)
     }
 }
 
-void diagnostics_ai_recognition_result(esp_err_t ret, const char *name, float similarity)
+void diagnostics_ai_recognition_result(
+    esp_err_t ret,
+    const char *name,
+    float similarity)
 {
     recognition_success = (ret == ESP_OK);
     live_similarity = similarity;
 
-    if (ret == ESP_OK && name != NULL && strcmp(name, "unknown") != 0 && similarity > 0.0f) {
+    if (ret == ESP_OK &&
+        name != NULL &&
+        strcmp(name, "unknown") != 0 &&
+        similarity > 0.0f) {
         user_found = true;
     }
 }
 
 static void ai_pipeline_monitor_task(void *arg)
 {
+    (void)arg;
+
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
 

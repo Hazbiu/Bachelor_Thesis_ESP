@@ -9,6 +9,7 @@
 #include <string.h>
 #include <vector>
 
+#include "diagnostics/ai_pipeline_status.h"
 #include "diagnostics/core_trace.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -529,6 +530,10 @@ static int run_common(
     core_trace(TAG, "DETECT_BEGIN");
     int64_t invoke_us = 0;
     const esp_err_t invoke_ret = s_runner.invoke(&invoke_us);
+    if (invoke_ret == ESP_OK) {
+        diagnostics_ai_live_metrics_record_detection(
+            invoke_us > 0 ? (uint64_t)invoke_us : 0U);
+    }
     if (invoke_ret != ESP_OK) {
         ESP_LOGE(TAG, "BlazeFace Invoke failed: %s",
                  esp_err_to_name(invoke_ret));

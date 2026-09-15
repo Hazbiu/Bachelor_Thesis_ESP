@@ -4,7 +4,9 @@
 #include <algorithm>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "human_face_detect.hpp"
+#include "diagnostics/ai_pipeline_status.h"
 #include "diagnostics/core_trace.h"
 #include "dl_image_define.hpp"
 
@@ -75,10 +77,14 @@ static int face_detect_run_common(
 
     auto &results = s_face_detect->run(img);
 
+    const int64_t inference_us = esp_timer_get_time() - start_us;
+    diagnostics_ai_live_metrics_record_detection(
+        inference_us > 0 ? (uint64_t)inference_us : 0U);
+
     ESP_LOGI(TAG_FACE,
             "[CORE-PROOF] backend=ESP-DL DETECT_END cpu=%d duration_us=%lld",
             xPortGetCoreID(),
-            (long long)(esp_timer_get_time() - start_us));
+            (long long)inference_us);
 
     int count = 0;
 

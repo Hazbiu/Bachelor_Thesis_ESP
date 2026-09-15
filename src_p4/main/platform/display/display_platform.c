@@ -1,6 +1,7 @@
 #include "platform/display/display_platform.h"
 
 #include <stdio.h>
+#include <stdint.h>
 
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
@@ -48,9 +49,13 @@ static int s_last_backlight_percent = -1;
 #define DISPLAY_CTRL_STATE_REGISTER           0x95U
 #define DISPLAY_CTRL_BRIGHTNESS_REGISTER      0x96U
 #define DISPLAY_CTRL_RECOVERY_STATE           0x11U
+#define DISPLAY_CTRL_ACTIVE_STATE             0x17U
 #define DISPLAY_CTRL_I2C_CLOCK_HZ             100000U
 #define DISPLAY_CTRL_I2C_TIMEOUT_MS           100
 #define DISPLAY_CTRL_RECOVERY_SETTLE_MS       0U
+#define DISPLAY_CTRL_ACTIVE_RESUME_SETTLE_MS  100U
+#define DISPLAY_CTRL_ACTIVE_RESUME_RETRIES    3U
+#define DISPLAY_CTRL_ACTIVE_RETRY_DELAY_MS    20U
 
 static esp_err_t display_platform_apply_controller_deep_sleep_recovery(void)
 {
@@ -140,6 +145,141 @@ static esp_err_t display_platform_apply_controller_deep_sleep_recovery(void)
         printf("[DISPLAY-CTRL-RECOVERY] COMPLETE settle_ms=%u before DCS sleep\n",
                (unsigned)DISPLAY_CTRL_RECOVERY_SETTLE_MS);
         fflush(stdout);
+    }
+
+    return ret;
+}
+
+
+/*
+ * Re-arm the Waveshare display/backlight controller after reversible
+ * Light-sleep.
+ *
+ * The normal Waveshare power-on sequence for the I2C controller at address
+ * 0x45 is:
+ *
+ *     0x95 <- 0x11
+ *     0x95 <- 0x17
+ *     0x96 <- 0x00
+ *
+ * The Deep/Light suspend optimization above deliberately leaves register 0x95
+ * at 0x11 before MIPI-DSI is torn down. Recreating DSI/LVGL alone therefore
+ * does not guarantee that the external controller has returned to its Active
+ * state. Re-issue the board's normal controller sequence after BSP display
+ * recreation, keep brightness at zero during reconstruction, and let the first
+ * complete camera frame apply the configured Active brightness.
+ */
+static esp_err_t display_platform_apply_controller_light_sleep_wake_once(void)
+{
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    if (bus == NULL) {
+        ESP_LOGW(
+            TAG,
+            "[DISPLAY-CTRL-WAKE] shared BSP I2C bus unavailable");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const i2c_device_config_t device_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = DISPLAY_CTRL_I2C_ADDRESS,
+        .scl_speed_hz = DISPLAY_CTRL_I2C_CLOCK_HZ,
+    };
+
+    i2c_master_dev_handle_t device = NULL;
+    esp_err_t ret = i2c_master_bus_add_device(
+        bus,
+        &device_config,
+        &device);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "[DISPLAY-CTRL-WAKE] could not open controller 0x%02X: %s",
+            DISPLAY_CTRL_I2C_ADDRESS,
+            esp_err_to_name(ret));
+        return ret;
+    }
+
+    static const uint8_t wake_sequence[][2] = {
+        {DISPLAY_CTRL_STATE_REGISTER,      DISPLAY_CTRL_RECOVERY_STATE},
+        {DISPLAY_CTRL_STATE_REGISTER,      DISPLAY_CTRL_ACTIVE_STATE},
+        {DISPLAY_CTRL_BRIGHTNESS_REGISTER, 0x00U},
+    };
+
+    for (size_t i = 0; i < sizeof(wake_sequence) / sizeof(wake_sequence[0]); ++i) {
+        ret = i2c_master_transmit(
+            device,
+            wake_sequence[i],
+            sizeof(wake_sequence[i]),
+            DISPLAY_CTRL_I2C_TIMEOUT_MS);
+
+        if (ret != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "[DISPLAY-CTRL-WAKE] write reg=0x%02X value=0x%02X failed: %s",
+                wake_sequence[i][0],
+                wake_sequence[i][1],
+                esp_err_to_name(ret));
+            break;
+        }
+
+        ESP_LOGI(
+            TAG,
+            "[DISPLAY-CTRL-WAKE] 0x45 reg 0x%02X <- 0x%02X",
+            wake_sequence[i][0],
+            wake_sequence[i][1]);
+    }
+
+    const esp_err_t remove_ret = i2c_master_bus_rm_device(device);
+    if (ret == ESP_OK && remove_ret != ESP_OK) {
+        ret = remove_ret;
+    }
+
+    if (ret == ESP_OK) {
+        /*
+         * Match the board's normal controller initialization settling interval
+         * before allowing camera scanout/backlight brightness to resume.
+         */
+        vTaskDelay(pdMS_TO_TICKS(DISPLAY_CTRL_ACTIVE_RESUME_SETTLE_MS));
+        ESP_LOGI(
+            TAG,
+            "[DISPLAY-CTRL-WAKE] Active controller sequence restored; "
+            "backlight intentionally held at 0 until first camera frame");
+    }
+
+    return ret;
+}
+
+
+static esp_err_t display_platform_apply_controller_light_sleep_wake(void)
+{
+    esp_err_t ret = ESP_FAIL;
+
+    for (uint32_t attempt = 1;
+         attempt <= DISPLAY_CTRL_ACTIVE_RESUME_RETRIES;
+         ++attempt) {
+
+        ret = display_platform_apply_controller_light_sleep_wake_once();
+        if (ret == ESP_OK) {
+            if (attempt > 1) {
+                ESP_LOGI(
+                    TAG,
+                    "[DISPLAY-CTRL-WAKE] recovered on attempt %u",
+                    (unsigned)attempt);
+            }
+            return ESP_OK;
+        }
+
+        ESP_LOGW(
+            TAG,
+            "[DISPLAY-CTRL-WAKE] attempt %u/%u failed: %s",
+            (unsigned)attempt,
+            (unsigned)DISPLAY_CTRL_ACTIVE_RESUME_RETRIES,
+            esp_err_to_name(ret));
+
+        if (attempt < DISPLAY_CTRL_ACTIVE_RESUME_RETRIES) {
+            vTaskDelay(pdMS_TO_TICKS(DISPLAY_CTRL_ACTIVE_RETRY_DELAY_MS));
+        }
     }
 
     return ret;
@@ -383,11 +523,43 @@ esp_err_t display_platform_suspend_for_light_sleep(
 lv_display_t *display_platform_resume_from_light_sleep(void)
 {
     s_last_backlight_percent = -1;
-    lv_display_t *display = bsp_display_resume_from_light_sleep();
 
-    if (display != NULL) {
-        s_panel_sleep_committed = false;
+    /*
+     * Wake the external address-0x45 controller BEFORE recreating MIPI/panel
+     * resources. The shared BSP I2C bus is intentionally retained for GT911
+     * Light-sleep polling, so it is available at this point even though
+     * LVGL/MIPI-DSI are down.
+     *
+     * This ordering mirrors the Waveshare board initialization requirement:
+     * the external controller must be returned to its Active state before the
+     * JD9365/MIPI path is initialized.
+     */
+    const esp_err_t controller_ret =
+        display_platform_apply_controller_light_sleep_wake();
+
+    if (controller_ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Display controller wake sequence failed before MIPI restoration: %s",
+            esp_err_to_name(controller_ret));
+
+        /*
+         * Continue with BSP recreation as a best-effort fallback. The error is
+         * explicit in the serial monitor, and the normal first-frame brightness
+         * request remains able to retry register 0x96.
+         */
     }
+
+    lv_display_t *display = bsp_display_resume_from_light_sleep();
+    if (display == NULL) {
+        ESP_LOGE(
+            TAG,
+            "BSP display recreation failed during Light-sleep wake");
+        return NULL;
+    }
+
+    s_panel_sleep_committed = false;
+    s_last_backlight_percent = -1;
 
     return display;
 }

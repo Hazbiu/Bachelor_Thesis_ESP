@@ -6,9 +6,11 @@
 #include <stdint.h>
 
 #include "sdkconfig.h"
+#include "esp_clk_tree.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_pm.h"
+#include "soc/clk_tree_defs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -521,3 +523,19 @@ int cpu_power_get_backlight_percent(void)
     default: return APP_BACKLIGHT_ACTIVE_PERCENT;
     }
 }
+
+
+uint32_t cpu_power_get_hp_frequency_hz(void)
+{
+    uint32_t frequency_hz = 0;
+
+    if (esp_clk_tree_src_get_freq_hz(
+            SOC_MOD_CLK_CPU,
+            ESP_CLK_TREE_SRC_FREQ_PRECISION_CACHED,
+            &frequency_hz) != ESP_OK) {
+        return 0;
+    }
+
+    return frequency_hz;
+}
+

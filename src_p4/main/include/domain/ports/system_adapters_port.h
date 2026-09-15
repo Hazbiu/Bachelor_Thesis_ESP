@@ -38,6 +38,7 @@ uint32_t system_cpu_face_detect_interval_frames(void);
 uint32_t system_cpu_ai_min_interval_ms(void);
 uint32_t system_cpu_preview_min_interval_ms(void);
 int system_cpu_backlight_percent(void);
+uint32_t system_cpu_hp_frequency_hz(void);
 
 /* Display */
 lv_display_t *system_display_start(void);

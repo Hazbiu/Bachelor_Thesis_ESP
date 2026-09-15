@@ -58,6 +58,11 @@ int system_cpu_backlight_percent(void)
     return cpu_power_get_backlight_percent();
 }
 
+uint32_t system_cpu_hp_frequency_hz(void)
+{
+    return cpu_power_get_hp_frequency_hz();
+}
+
 lv_display_t *system_display_start(void)
 {
     return display_platform_start();

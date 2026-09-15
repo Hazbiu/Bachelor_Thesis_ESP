@@ -110,11 +110,54 @@ static uint32_t frame_count = 0;
 static int64_t s_last_preview_start_us = -1;
 static int64_t s_last_ai_submit_us = -1;
 
+/*
+ * Live-preview FPS is measured from completed LCD blits, not from camera
+ * capture callbacks or AI submissions.  This makes the on-screen value match
+ * what the user actually sees.
+ */
+static int64_t s_preview_fps_window_start_us = -1;
+static uint32_t s_preview_fps_window_frames = 0;
+static uint32_t s_preview_fps_x10 = 0;
+
 static bool work_interval_elapsed(int64_t now_us, int64_t last_us,
                                   uint32_t interval_ms)
 {
     return last_us < 0 || now_us < last_us ||
         now_us - last_us >= (int64_t)interval_ms * 1000;
+}
+
+static void reset_preview_fps(void)
+{
+    s_preview_fps_window_start_us = -1;
+    s_preview_fps_window_frames = 0;
+    s_preview_fps_x10 = 0;
+}
+
+static void note_preview_frame_presented(int64_t now_us)
+{
+    if (s_preview_fps_window_start_us < 0 ||
+        now_us < s_preview_fps_window_start_us) {
+        s_preview_fps_window_start_us = now_us;
+        s_preview_fps_window_frames = 1;
+        return;
+    }
+
+    s_preview_fps_window_frames++;
+
+    const int64_t elapsed_us =
+        now_us - s_preview_fps_window_start_us;
+
+    if (elapsed_us >= 1000000LL) {
+        const uint64_t scaled_frames =
+            (uint64_t)s_preview_fps_window_frames * 10000000ULL;
+
+        s_preview_fps_x10 =
+            (uint32_t)((scaled_frames + (uint64_t)elapsed_us / 2ULL) /
+                       (uint64_t)elapsed_us);
+
+        s_preview_fps_window_start_us = now_us;
+        s_preview_fps_window_frames = 0;
+    }
 }
 
 /*
@@ -577,6 +620,12 @@ static void resume_display_from_idle_scan_task(void *arg)
         esp_restart();
     }
 
+    diagnostics_ai_live_metrics_reset();
+    diagnostics_cpu_hp_usage_reset();
+    reset_preview_fps();
+    s_last_preview_start_us = -1;
+    s_last_ai_submit_us = -1;
+
     portENTER_CRITICAL(&idle_scan_state_lock);
     display_suspended_for_idle_scan = false;
     idle_scan_resume_task_pending = false;
@@ -868,8 +917,19 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
         return ret;
     }
 
-    /* The first complete camera frame turns the backlight on again. */
-    display_backlight_enabled = false;
+    diagnostics_ai_live_metrics_reset();
+    diagnostics_cpu_hp_usage_reset();
+    reset_preview_fps();
+    s_last_preview_start_us = -1;
+    s_last_ai_submit_us = -1;
+
+    /*
+     * The complete display stack and camera stream are live again. Restore the
+     * physical backlight here instead of depending on a later frame callback;
+     * this guarantees that a touchscreen Light-sleep wake becomes visibly ACTIVE.
+     */
+    system_display_backlight_on();
+    display_backlight_enabled = true;
     display_suspended_for_light_sleep = false;
     dummy_mode_delay_flag = false;
     vision_face_result_store_clear();
@@ -978,6 +1038,17 @@ static void camera_application_start_task(void *arg)
      * the user presses Start so the launcher GUI appears immediately at boot.
      */
     app_boot_initialize_services();
+
+    /*
+     * Start the camera-screen telemetry from a clean epoch.  Startup model
+     * loading/enrollment must never appear as live inference latency.
+     */
+    diagnostics_ai_live_metrics_reset();
+    diagnostics_cpu_hp_usage_reset();
+    reset_preview_fps();
+    frame_count = 0;
+    s_last_preview_start_us = -1;
+    s_last_ai_submit_us = -1;
 
     if (restore_sdcard_off_after_ai_init) {
         ret = power_manager_set_sdcard_enabled(false);
@@ -1128,6 +1199,21 @@ static void camera_application_start_task(void *arg)
              (unsigned)APP_AI_SNAPSHOT_MAX_EDGE,
              (unsigned)APP_AI_SNAPSHOT_MAX_EDGE,
              (unsigned)vision_ai_snapshot_buffer_capacity());
+
+    ret = diagnostics_cpu_hp_usage_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not start live HP Core 0/Core 1 usage telemetry: %s",
+            esp_err_to_name(ret));
+        presentation_launcher_show_error(
+            "CPU usage telemetry could not start. Check FreeRTOS run-time stats.");
+        application_start_requested = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    diagnostics_cpu_hp_usage_reset();
 
     display_mode_mutex = xSemaphoreCreateMutex();
     if (!display_mode_mutex) {
@@ -1380,31 +1466,44 @@ static void camera_video_frame_process(
             return;
         }
 
-if (system_camera_is_rgb565()) {
-        face_box_t overlay_boxes[APP_MAX_FACE_BOXES] = {0};
-        char overlay_names[APP_MAX_FACE_BOXES][FACE_RECOG_MAX_NAME_LEN] = {{0}};
-
-        const int overlay_count =
-            vision_face_result_store_snapshot(
-                overlay_boxes,
-                overlay_names,
-                NULL,
-                APP_MAX_FACE_BOXES);
-
-        if (overlay_count > 0) {
+        if (system_camera_is_rgb565()) {
+            /*
+             * PPA wrote target_fb through hardware. Invalidate once before all
+             * CPU-side overlays, then write back once after the face overlay
+             * and telemetry panel are complete.
+             */
 #if APP_SYNC_CACHE_AROUND_OVERLAY
-            esp_cache_msync(target_fb, lcd_fb_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+            esp_cache_msync(
+                target_fb,
+                lcd_fb_size,
+                ESP_CACHE_MSYNC_FLAG_DIR_M2C);
 #endif
+
+            face_box_t overlay_boxes[APP_MAX_FACE_BOXES] = {0};
+            char overlay_names[APP_MAX_FACE_BOXES][FACE_RECOG_MAX_NAME_LEN] = {{0}};
+
+            const int overlay_count =
+                vision_face_result_store_snapshot(
+                    overlay_boxes,
+                    overlay_names,
+                    NULL,
+                    APP_MAX_FACE_BOXES);
+
             for (int i = 0; i < overlay_count; i++) {
-                const int lcd_x1 = overlay_boxes[i].x1 * display_width / camera_buf_hes;
-                const int lcd_y1 = overlay_boxes[i].y1 * display_height / camera_buf_ves;
-                const int lcd_x2 = overlay_boxes[i].x2 * display_width / camera_buf_hes;
-                const int lcd_y2 = overlay_boxes[i].y2 * display_height / camera_buf_ves;
+                const int lcd_x1 =
+                    overlay_boxes[i].x1 * display_width / camera_buf_hes;
+                const int lcd_y1 =
+                    overlay_boxes[i].y1 * display_height / camera_buf_ves;
+                const int lcd_x2 =
+                    overlay_boxes[i].x2 * display_width / camera_buf_hes;
+                const int lcd_y2 =
+                    overlay_boxes[i].y2 * display_height / camera_buf_ves;
 
                 const bool recognized =
                     overlay_names[i][0] != '\0' &&
                     strcmp(overlay_names[i], "unknown") != 0;
-                const uint16_t overlay_color = recognized ? 0x07E0 : 0xF800;
+                const uint16_t overlay_color =
+                    recognized ? 0x07E0 : 0xF800;
 
                 presentation_face_overlay_draw_box_rgb565(
                     (uint16_t *)target_fb,
@@ -1426,11 +1525,38 @@ if (system_camera_is_rgb565()) {
                     overlay_names[i],
                     overlay_color);
             }
+
+            diagnostics_ai_live_metrics_t live_metrics = {0};
+            diagnostics_ai_live_metrics_snapshot(&live_metrics);
+
+            uint32_t hp_core0_usage_x10 = 0;
+            uint32_t hp_core1_usage_x10 = 0;
+
+            const bool hp_cpu_usage_valid =
+                diagnostics_cpu_hp_usage_snapshot(
+                    &hp_core0_usage_x10,
+                    &hp_core1_usage_x10);
+
+            presentation_camera_metrics_draw_rgb565(
+                (uint16_t *)target_fb,
+                display_width,
+                display_height,
+                live_metrics.detector_valid,
+                live_metrics.detector_inference_us,
+                live_metrics.recognizer_valid,
+                live_metrics.recognizer_inference_us,
+                s_preview_fps_x10,
+                hp_cpu_usage_valid,
+                hp_core0_usage_x10,
+                hp_core1_usage_x10);
+
 #if APP_SYNC_CACHE_AROUND_OVERLAY
-            esp_cache_msync(target_fb, lcd_fb_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+            esp_cache_msync(
+                target_fb,
+                lcd_fb_size,
+                ESP_CACHE_MSYNC_FLAG_DIR_C2M);
 #endif
         }
-}
 
         if (dummy_draw_enabled && !dummy_mode_delay_flag) {
             ret = esp_lv_adapter_dummy_draw_blit(
@@ -1450,6 +1576,7 @@ if (system_camera_is_rgb565()) {
             display_buffer_index =
                 (display_buffer_index + 1) % active_display_buffer_count;
             s_last_preview_start_us = frame_start_us;
+            note_preview_frame_presented(esp_timer_get_time());
 
             /* First frame, real activity and idle stages all use the same
              * brightness adapter. It caches successful values, so this does

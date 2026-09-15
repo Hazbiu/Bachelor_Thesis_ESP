@@ -221,24 +221,32 @@
  * invalidates cached points. The time-qualified filter below remains as a
  * secondary guard against a genuine one-frame electrical/transient touch packet:
  *
- *   1. Ignore every touch sample during the startup quarantine.
- *   2. Require a continuous RELEASED window before touch wake is armed.
- *   3. After arming, require a continuous PRESSED window before restoring
+ *   1. Ignore touch samples during the short startup quarantine.
+ *   2. Require a clean RELEASED sample before touch wake is armed.
+ *   3. After arming, accept the next fresh PRESSED sample and restore
  *      camera/display.
  *
- * With the 250 ms poll interval below, the defaults mean:
- *   startup ignored : 1000 ms
- *   stable release  : 1000 ms
- *   stable press    :  500 ms
+ * With the 250 ms poll interval below, wake qualification is intentionally
+ * responsive while still rejecting the stale transition sample that motivated
+ * the original filter:
+ *
+ *   startup quarantine : 250 ms
+ *   post-sleep release : 250 ms
+ *   fresh press        : one qualified 250 ms polling sample
+ *
+ * The pre-sleep release streak above is retained. After the first clean
+ * post-sleep RELEASED sample arms touch wake, the next fresh GT911 PRESSED
+ * sample restores Active mode. This avoids requiring the controller to report
+ * the same physical press in two consecutive 250 ms polls.
  *
  * GPIO3 remains available as an immediate Light-sleep wake source.
  */
 #define APP_LIGHT_SLEEP_TOUCH_PRE_RELEASE_SAMPLES    3U
 #define APP_LIGHT_SLEEP_TOUCH_PRECHECK_MAX_SAMPLES   12U
 #define APP_LIGHT_SLEEP_TOUCH_SAMPLE_DELAY_MS        15U
-#define APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS      1000U
-#define APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS      1000U
-#define APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS        500U
+#define APP_LIGHT_SLEEP_TOUCH_STARTUP_IGNORE_MS      250U
+#define APP_LIGHT_SLEEP_TOUCH_RELEASE_STABLE_MS      250U
+#define APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS        250U
 
 /*
  * esp_light_sleep_start() may return a few hundred microseconds before the
