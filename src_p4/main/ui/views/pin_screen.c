@@ -1,3 +1,4 @@
+
 #include "pin_screen.h"
 
 #include <stdbool.h>
@@ -428,12 +429,6 @@ esp_err_t pin_screen_show(
         s_palette.secondary_text,
         LV_TEXT_ALIGN_LEFT);
 
-    create_text_label(
-        information,
-        "The camera resumes automatically after successful verification.",
-        s_palette.muted_text,
-        LV_TEXT_ALIGN_LEFT);
-
     s_keypad = lv_obj_create(shell);
     lv_obj_set_size(s_keypad, LV_PCT(48), LV_PCT(100));
     lv_obj_remove_flag(s_keypad, LV_OBJ_FLAG_SCROLLABLE);
@@ -513,3 +508,4 @@ bool pin_screen_is_visible(void)
 {
     return s_visible;
 }
+
