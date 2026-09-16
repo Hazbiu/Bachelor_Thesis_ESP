@@ -1,11 +1,13 @@
+
 #include "platform/display/display_platform.h"
 
 #include <stdio.h>
 #include <stdint.h>
-
+#include "esp_sleep.h"
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
 #include "driver/i2c_master.h"
+#include "driver/rtc_io.h"
 #include "config/app_config.h"
 #include "platform/power/cpu_power.h"
 #include "esp_err.h"
@@ -56,6 +58,90 @@ static int s_last_backlight_percent = -1;
 #define DISPLAY_CTRL_ACTIVE_RESUME_SETTLE_MS  100U
 #define DISPLAY_CTRL_ACTIVE_RESUME_RETRIES    3U
 #define DISPLAY_CTRL_ACTIVE_RETRY_DELAY_MS    20U
+
+/*
+ * Deep-sleep entry deliberately calls rtc_gpio_isolate() on the shared I2C
+ * pins (GPIO7/GPIO8). rtc_gpio_isolate() disables the pad input/output/pulls
+ * and enables the RTC hold. A real Deep-sleep wake resets the application, but
+ * the RTC pad state can still be retained long enough to prevent the first I2C
+ * transaction from clearing the bus.
+ *
+ * Release that exact pre-sleep isolation BEFORE recreating the BSP I2C bus.
+ * Without this, the address-0x45 wake sequence can fail with
+ * ESP_ERR_INVALID_STATE even though bsp_i2c_init() itself succeeded.
+ */
+static esp_err_t display_platform_release_shared_i2c_after_deep_sleep(void)
+{
+    static const gpio_num_t i2c_pins[] = {
+        APP_PWR_SHARED_I2C_SDA_GPIO,
+        APP_PWR_SHARED_I2C_SCL_GPIO,
+    };
+
+    esp_err_t first_error = ESP_OK;
+
+    for (size_t i = 0; i < sizeof(i2c_pins) / sizeof(i2c_pins[0]); ++i) {
+        const gpio_num_t pin = i2c_pins[i];
+
+        if (!rtc_gpio_is_valid_gpio(pin)) {
+            ESP_LOGE(
+                TAG,
+                "[DISPLAY-CTRL-WAKE] GPIO%d is not RTC-capable; "
+                "cannot release Deep-sleep I2C isolation",
+                (int)pin);
+            if (first_error == ESP_OK) {
+                first_error = ESP_ERR_INVALID_ARG;
+            }
+            continue;
+        }
+
+        /*
+         * rtc_gpio_isolate() enables the RTC hold. Release the hold first,
+         * then route the pad back to the normal digital IO mux. bsp_i2c_init()
+         * will install the final SDA/SCL peripheral configuration afterwards.
+         */
+        esp_err_t ret = rtc_gpio_hold_dis(pin);
+        if (ret != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "[DISPLAY-CTRL-WAKE] rtc hold release failed on GPIO%d: %s",
+                (int)pin,
+                esp_err_to_name(ret));
+            if (first_error == ESP_OK) {
+                first_error = ret;
+            }
+        }
+
+        ret = rtc_gpio_deinit(pin);
+        if (ret != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "[DISPLAY-CTRL-WAKE] RTC mux release failed on GPIO%d: %s",
+                (int)pin,
+                esp_err_to_name(ret));
+            if (first_error == ESP_OK) {
+                first_error = ret;
+            }
+        }
+    }
+
+    /*
+     * The board has external 2.2K pull-ups on GPIO7/GPIO8. Give the released
+     * pads a short settling window before the I2C peripheral starts toggling.
+     */
+    vTaskDelay(pdMS_TO_TICKS(2));
+
+    if (first_error == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "[DISPLAY-CTRL-WAKE] released Deep-sleep RTC isolation on "
+            "GPIO%d/GPIO%d",
+            (int)APP_PWR_SHARED_I2C_SDA_GPIO,
+            (int)APP_PWR_SHARED_I2C_SCL_GPIO);
+    }
+
+    return first_error;
+}
+
 
 static esp_err_t display_platform_apply_controller_deep_sleep_recovery(void)
 {
@@ -277,6 +363,23 @@ static esp_err_t display_platform_apply_controller_light_sleep_wake(void)
             (unsigned)DISPLAY_CTRL_ACTIVE_RESUME_RETRIES,
             esp_err_to_name(ret));
 
+        /*
+         * ESP_ERR_INVALID_STATE/ESP_ERR_TIMEOUT after Deep-sleep commonly
+         * indicates that the I2C bus-clear state machine saw a stale/stuck bus.
+         * Reset the already-created BSP bus before the next retry.
+         */
+        if (attempt < DISPLAY_CTRL_ACTIVE_RESUME_RETRIES &&
+            (ret == ESP_ERR_INVALID_STATE || ret == ESP_ERR_TIMEOUT)) {
+            i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+            if (bus != NULL) {
+                const esp_err_t reset_ret = i2c_master_bus_reset(bus);
+                ESP_LOGW(
+                    TAG,
+                    "[DISPLAY-CTRL-WAKE] I2C bus reset before retry: %s",
+                    esp_err_to_name(reset_ret));
+            }
+        }
+
         if (attempt < DISPLAY_CTRL_ACTIVE_RESUME_RETRIES) {
             vTaskDelay(pdMS_TO_TICKS(DISPLAY_CTRL_ACTIVE_RETRY_DELAY_MS));
         }
@@ -362,10 +465,82 @@ void display_platform_backlight_off(void)
 lv_display_t *display_platform_start(void)
 {
     s_last_backlight_percent = -1;
+
+    const esp_sleep_wakeup_cause_t wake_cause =
+        esp_sleep_get_wakeup_cause();
+
+    /*
+     * A true Deep-sleep wake is a CPU/application reset, but the external
+     * Waveshare display controller is still powered and the pre-sleep code
+     * explicitly isolated GPIO7/GPIO8 with rtc_gpio_isolate().
+     *
+     * Correct order:
+     *   1. release GPIO7/GPIO8 RTC hold/isolation;
+     *   2. recreate the BSP I2C bus;
+     *   3. restore the address-0x45 controller to ACTIVE;
+     *   4. let bsp_display_start() rebuild JD9365/MIPI-DSI/LVGL/touch.
+     */
+    if (wake_cause == ESP_SLEEP_WAKEUP_GPIO) {
+        ESP_LOGI(
+            TAG,
+            "Deep-sleep GPIO wake: releasing I2C isolation and restoring "
+            "display controller before BSP startup");
+
+        esp_err_t ret =
+            display_platform_release_shared_i2c_after_deep_sleep();
+
+        if (ret != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "Could not fully release Deep-sleep I2C isolation: %s",
+                esp_err_to_name(ret));
+        }
+
+        ret = bsp_i2c_init();
+
+        if (ret != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "Could not initialize BSP I2C before Deep-sleep display recovery: %s",
+                esp_err_to_name(ret));
+        } else {
+            /*
+             * bsp_i2c_init() may return ESP_OK only after the driver object is
+             * installed. Prove that the handle is usable before attempting the
+             * controller sequence so failures are explicit in the serial log.
+             */
+            i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+
+            if (bus == NULL) {
+                ESP_LOGE(
+                    TAG,
+                    "BSP I2C initialized but returned a NULL bus handle");
+                ret = ESP_ERR_INVALID_STATE;
+            } else {
+                ret = display_platform_apply_controller_light_sleep_wake();
+            }
+
+            if (ret != ESP_OK) {
+                ESP_LOGE(
+                    TAG,
+                    "Deep-sleep display-controller wake failed: %s",
+                    esp_err_to_name(ret));
+            } else {
+                ESP_LOGI(
+                    TAG,
+                    "Deep-sleep display controller restored before BSP startup");
+            }
+        }
+    }
+
     lv_display_t *display = bsp_display_start();
 
     if (display != NULL) {
         s_panel_sleep_committed = false;
+    } else {
+        ESP_LOGE(
+            TAG,
+            "bsp_display_start() failed after Deep-sleep/cold-boot initialization");
     }
 
     return display;

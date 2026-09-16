@@ -13,17 +13,18 @@ extern "C" {
 /**
  * Enter ESP32-P4 Light-sleep and resume in place after wake-up.
  *
- * If enable_gpio_wakeup is true, APP_LIGHT_SLEEP_WAKE_GPIO is enabled as an
- * active-low wake source. If timeout_ms is greater than zero, the RTC timer is
- * enabled as another wake source. At least one wake source must be requested.
+ * Only the RTC timer is enabled. The application polls GT911 between
+ * finite timer slices. GPIO3 is reserved for real Deep-sleep wake-up.
+ * enable_gpio_wakeup is retained for compatibility and must be false.
+ * Passing true or a zero timeout returns ESP_ERR_INVALID_ARG.
  *
  * This low-level helper configures the documented ESP-IDF power-domain policy,
  * wake sources, enters Light-sleep, records the wake cause, and removes those
  * wake sources again after wake. The application owns reversible board-level
  * camera/display/audio/SD/Ethernet suspend-resume policy.
  *
- * @param timeout_ms Optional timer wake-up in milliseconds; 0 disables it.
- * @param enable_gpio_wakeup Enable active-low GPIO wake-up when true.
+ * @param timeout_ms Nonzero timer wake-up interval in milliseconds.
+ * @param enable_gpio_wakeup Must be false; the rocker is Deep-sleep-only.
  * @return ESP_OK after a successful sleep/wake cycle, otherwise an ESP-IDF
  *         error returned while configuring, entering, or cleaning up sleep.
  */

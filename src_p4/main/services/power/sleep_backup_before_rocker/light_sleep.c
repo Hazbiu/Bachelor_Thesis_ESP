@@ -120,7 +120,7 @@ static void log_wakeup_cause(esp_sleep_wakeup_cause_t cause)
     case ESP_SLEEP_WAKEUP_GPIO:
         ESP_LOGI(
             TAG,
-            "Unexpected Light-sleep GPIO wake: GPIO%d",
+            "Light-sleep wake-up: GPIO%d",
             APP_LIGHT_SLEEP_WAKE_GPIO);
         break;
 
@@ -141,11 +141,8 @@ static esp_err_t enter_light_sleep_internal(
 {
     const gpio_num_t wake_gpio = APP_LIGHT_SLEEP_WAKE_GPIO;
 
-    s_last_wakeup_cause = ESP_SLEEP_WAKEUP_UNDEFINED;
-    /* Keep the API parameter for caller compatibility. GPIO3 belongs only
-     * to real Deep-sleep; Light-sleep always uses a finite timer slice. */
-    if (timeout_ms == 0 || enable_gpio_wakeup) {
-        ESP_LOGE(TAG, "Light-sleep requires a timer and GPIO wake disabled");
+    if (timeout_ms == 0 && !enable_gpio_wakeup) {
+        ESP_LOGE(TAG, "Light-sleep requires at least one wake-up source");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -170,26 +167,105 @@ static esp_err_t enter_light_sleep_internal(
         return ret;
     }
 
-    /* Disable the physical pad wake bit too, including the LP GPIO path.
-     * Removing the global wake source alone does not clear per-pin state. */
-    ret = gpio_wakeup_disable(wake_gpio);
-    if (ret != ESP_OK) {
-        restore_light_sleep_domain_defaults();
-        return ret;
+    if (enable_gpio_wakeup) {
+        gpio_config_t wake_gpio_config = {
+            .pin_bit_mask = 1ULL << wake_gpio,
+            .mode = GPIO_MODE_INPUT,
+            /* GPIO3 is held HIGH by the board's external pull-up. */
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+
+        ret = gpio_config(&wake_gpio_config);
+        if (ret != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "GPIO%d configuration failed: %s",
+                wake_gpio,
+                esp_err_to_name(ret));
+            restore_light_sleep_domain_defaults();
+            return ret;
+        }
+
+        /*
+        * GPIO wake-up is level triggered. Entering sleep while the active-low
+        * button is already held would cause an immediate wake-up.
+        */
+        if (gpio_get_level(wake_gpio) == 0) {
+            if (verbose) {
+                ESP_LOGI(
+                    TAG,
+                    "GPIO%d is LOW; waiting for button release before Light-sleep",
+                    wake_gpio);
+            }
+
+            while (gpio_get_level(wake_gpio) == 0) {
+                vTaskDelay(pdMS_TO_TICKS(APP_LIGHT_SLEEP_BUTTON_POLL_MS));
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(APP_LIGHT_SLEEP_BUTTON_DEBOUNCE_MS));
+        }
+
+        ret = gpio_wakeup_enable(wake_gpio, GPIO_INTR_LOW_LEVEL);
+        if (ret != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "Could not enable GPIO%d Light-sleep wake-up: %s",
+                wake_gpio,
+                esp_err_to_name(ret));
+            restore_light_sleep_domain_defaults();
+            return ret;
+        }
+
+        ret = esp_sleep_enable_gpio_wakeup();
+        if (ret != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "Could not enable GPIO Light-sleep wake source: %s",
+                esp_err_to_name(ret));
+            (void)gpio_wakeup_disable(wake_gpio);
+            restore_light_sleep_domain_defaults();
+            return ret;
+        }
     }
 
-    ret = esp_sleep_enable_timer_wakeup((uint64_t)timeout_ms * 1000ULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Could not enable Light-sleep timer: %s",
-                 esp_err_to_name(ret));
-        restore_light_sleep_domain_defaults();
-        return ret;
-    }
-    if (verbose) {
-        ESP_LOGI(TAG,
-                 "Entering Light-sleep: timer after %" PRIu32
-                 " ms; GPIO3 rocker wake=OFF",
-                 timeout_ms);
+    if (timeout_ms > 0) {
+        const uint64_t timeout_us = (uint64_t)timeout_ms * 1000ULL;
+
+        ret = esp_sleep_enable_timer_wakeup(timeout_us);
+        if (ret != ESP_OK) {
+            ESP_LOGE(
+                TAG,
+                "Could not enable Light-sleep timer wake-up: %s",
+                esp_err_to_name(ret));
+            if (enable_gpio_wakeup) {
+                (void)disable_sleep_source_if_enabled(ESP_SLEEP_WAKEUP_GPIO);
+                (void)gpio_wakeup_disable(wake_gpio);
+            }
+            restore_light_sleep_domain_defaults();
+            return ret;
+        }
+
+        if (verbose) {
+            if (enable_gpio_wakeup) {
+                ESP_LOGI(
+                    TAG,
+                    "Entering Light-sleep: GPIO%d LOW or timer after %" PRIu32 " ms",
+                    wake_gpio,
+                    timeout_ms);
+            } else {
+                ESP_LOGI(
+                    TAG,
+                    "Entering Light-sleep: timer after %" PRIu32 " ms",
+                    timeout_ms);
+            }
+        }
+    } else if (verbose) {
+        ESP_LOGI(
+            TAG,
+            "Entering Light-sleep: GPIO%d LOW wake-up only",
+            wake_gpio);
     }
 
     fflush(stdout);
@@ -229,6 +305,29 @@ static esp_err_t enter_light_sleep_internal(
     esp_err_t cleanup_error = ESP_OK;
 
     esp_err_t cleanup_ret = ESP_OK;
+
+    if (enable_gpio_wakeup) {
+        cleanup_ret = gpio_wakeup_disable(wake_gpio);
+        if (cleanup_ret != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "Could not disable GPIO%d wake-up: %s",
+                wake_gpio,
+                esp_err_to_name(cleanup_ret));
+            cleanup_error = cleanup_ret;
+        }
+
+        cleanup_ret = disable_sleep_source_if_enabled(ESP_SLEEP_WAKEUP_GPIO);
+        if (cleanup_ret != ESP_OK) {
+            ESP_LOGW(
+                TAG,
+                "Could not clear GPIO sleep wake source: %s",
+                esp_err_to_name(cleanup_ret));
+            if (cleanup_error == ESP_OK) {
+                cleanup_error = cleanup_ret;
+            }
+        }
+    }
 
     if (timeout_ms > 0) {
         cleanup_ret = disable_sleep_source_if_enabled(ESP_SLEEP_WAKEUP_TIMER);

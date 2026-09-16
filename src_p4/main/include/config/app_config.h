@@ -235,10 +235,8 @@
  *
  * The pre-sleep release streak above is retained, but it does not arm wake.
  * Wake is armed only after a new stable RELEASED window while the display is
- * already suspended. The user then holds a press for 500 ms to wake. GPIO3
- * remains the immediate alternative.
- *
- * GPIO3 remains available as an immediate Light-sleep wake source.
+ * already suspended. The user then holds a press for 500 ms to wake.
+ * GPIO3 is reserved exclusively for real Deep-sleep wake-up.
  */
 #define APP_LIGHT_SLEEP_TOUCH_PRE_RELEASE_SAMPLES    3U
 #define APP_LIGHT_SLEEP_TOUCH_PRECHECK_MAX_SAMPLES   12U
@@ -264,7 +262,13 @@
  */
 #define APP_LIGHT_SLEEP_EARLY_RETURN_TOLERANCE_US   5000LL
 
-/* Deep-sleep configuration. The 30000 ms value is legacy compatibility only. */
+/* Deep-sleep-only rocker input: contact between GPIO3 and GND.
+ * Fixed pull-up: open=HIGH, closed=LOW. Each sleep entry arms the opposite
+ * stable level. Active and Light-sleep ignore this input.
+ * CONFIG_ESP_SLEEP_GPIO_ENABLE_INTERNAL_RESISTORS must be disabled so ESP-IDF
+ * does not replace our fixed pull-up with a pull-down for HIGH-level wake.
+ * The 30000 ms value is legacy compatibility only.
+ */
 #define APP_DEEP_SLEEP_TIMEOUT_MS                   30000U
 #define APP_DEEP_SLEEP_INACTIVITY_POLL_MS           100U
 #define APP_DEEP_SLEEP_BUTTON_GPIO                  GPIO_NUM_3

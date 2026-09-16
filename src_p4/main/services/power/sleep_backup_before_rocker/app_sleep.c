@@ -1,4 +1,3 @@
-
 #include "services/power/sleep/app_sleep.h"
 
 #include <inttypes.h>
@@ -60,6 +59,7 @@ static bool s_sleep_requested;
 static bool s_inactivity_monitor_started;
 static bool s_inactivity_policy_paused;
 static bool s_light_sleep_in_progress;
+static bool s_ignore_button_until_release;
 static bool s_light_sleep_failed_until_activity;
 static int64_t s_last_face_detected_us;
 static bool s_light_mode_enabled;
@@ -246,14 +246,15 @@ static app_touch_gate_event_t update_touch_gate(
 }
 
 static esp_err_t enter_light_sleep_poll_slice_resilient(
-    uint32_t timeout_ms)
+    uint32_t timeout_ms,
+    bool enable_gpio_wakeup)
 {
     esp_err_t ret = ESP_FAIL;
 
     for (uint32_t attempt = 1U;
          attempt <= APP_LIGHT_SLEEP_ENTRY_RETRY_COUNT;
          ++attempt) {
-        ret = enter_light_sleep_poll_slice(timeout_ms, false);
+        ret = enter_light_sleep_poll_slice(timeout_ms, enable_gpio_wakeup);
         const bool rejected_before_sleep =
             ret == ESP_ERR_INVALID_ARG &&
             light_sleep_get_last_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED;
@@ -614,8 +615,31 @@ static uint32_t get_inactivity_ms(void)
     return (uint32_t)(inactive_us / 1000LL);
 }
 
+static bool button_event_is_reserved_for_light_sleep(void)
+{
+    bool reserved;
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    reserved = s_light_sleep_in_progress || s_ignore_button_until_release;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    return reserved;
+}
+
+static void clear_button_release_guard(void)
+{
+    portENTER_CRITICAL(&s_sleep_request_lock);
+
+    if (!s_light_sleep_in_progress) {
+        s_ignore_button_until_release = false;
+    }
+
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+}
+
 static void finish_light_sleep(
     esp_err_t light_ret,
+    esp_sleep_wakeup_cause_t wake_cause,
     bool user_activity)
 {
     const int64_t now_us = esp_timer_get_time();
@@ -632,6 +656,14 @@ static void finish_light_sleep(
         */
         s_light_sleep_failed_until_activity = true;
     } else if (user_activity) {
+        if (wake_cause == ESP_SLEEP_WAKEUP_GPIO) {
+            /*
+            * Consume the GPIO3 wake press so the Deep-sleep button task does
+            * not interpret the same electrical LOW as a second request.
+            */
+            s_ignore_button_until_release = true;
+        }
+
         if (!s_sleep_requested) {
             s_last_face_detected_us = now_us;
             s_light_sleep_failed_until_activity = false;
@@ -783,6 +815,205 @@ typedef enum {
 } app_deep_sleep_strategy_t;
 
 
+/*
+ * Hybrid Light->Deep strategy.
+ *
+ * Preserve the exact external-peripheral state that already produced the
+ * measured low Light-sleep current instead of "shutting down more" at the
+ * Deep-sleep boundary.
+ *
+ * Preserved:
+ *   camera       = reversible OV5647 Light-sleep standby
+ *   display      = Light-sleep suspended
+ *   audio amp    = OFF
+ *   ES8311       = unchanged from Light-sleep
+ *   microSD      = powered + mounted, no processing
+ *   Ethernet     = RESET LOW
+ *   GT911        = Light-sleep state
+ *   shared I2C   = Light-sleep state
+ *
+ * Added:
+ *   application/FSM Deep-sleep transition
+ *   C6 Deep-sleep preparation
+ *   GPIO3 wake source
+ *   P4 esp_deep_sleep_start()
+ */
+static void run_light_compatible_deep_sleep_sequence(const char *reason)
+{
+    const char *sleep_reason =
+        reason != NULL ? reason : "unknown source";
+
+    ESP_LOGI(
+        POWER_TAG,
+        "event=RETENTIVE_DEEP_BEGIN reason=\"%s\" "
+        "strategy=PRESERVE_LIGHT_SLEEP_NO_PERIODIC_WAKE",
+        sleep_reason);
+
+    ESP_LOGW(
+        TAG,
+        "RETENTIVE_DEEP selected for Hybrid mode: "
+        "true ESP32-P4 Deep-sleep is intentionally NOT entered because the "
+        "tested board draws more current after HP GPIO/peripheral power-down");
+
+    /*
+     * The camera, display and reversible auxiliary peripherals are already in
+     * the measured low-current Light-sleep state. Do not call the destructive
+     * Deep-sleep prepare callback here. Keep the application in LIGHT_SLEEP so
+     * APP_EVENT_WAKE can restore camera/display in-place.
+     */
+
+#if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
+    esp_err_t audio_ret =
+        component_audio_disable_for_light_sleep();
+
+    if (audio_ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Could not re-assert audio low-power state before RETENTIVE_DEEP: %s",
+            esp_err_to_name(audio_ret));
+    }
+#endif
+
+#if APP_LIGHT_SLEEP_ETHERNET_REDUCED_10M
+    esp_err_t ethernet_ret =
+        component_ethernet_enter_light_sleep_reduced_mode();
+
+    if (ethernet_ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Could not re-assert Ethernet RESET before RETENTIVE_DEEP: %s",
+            esp_err_to_name(ethernet_ret));
+    }
+#endif
+
+    /*
+     * Keep C6 electrically OFF. This is lower-power than releasing CHIP_PU,
+     * booting the C6, then asking it to enter its own Deep-sleep. The verified
+     * C6 self-sleep firmware remains installed for the separate true/aggressive
+     * P4 Deep-sleep path.
+     */
+    esp_err_t wifi_ret =
+        component_wifi_disable_for_deep_sleep();
+
+    if (wifi_ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "Could not re-assert C6 OFF before RETENTIVE_DEEP: %s",
+            esp_err_to_name(wifi_ret));
+    }
+
+    /*
+     * Reserve GPIO3 for this sleep cycle so the independent Deep-sleep button
+     * task cannot consume the same active-low press after wake.
+     */
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    s_light_sleep_in_progress = true;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    ESP_LOGI(
+        POWER_TAG,
+        "event=RETENTIVE_DEEP_ENTER "
+        "p4_mode=LIGHT_SLEEP_CONTINUOUS "
+        "timer=OFF touch_polling=OFF gpio3_wake=ON "
+        "camera=LIGHT_STANDBY display=LIGHT_SUSPENDED "
+        "audio_amp=OFF codec=PRESERVED sdcard=PRESERVED "
+        "ethernet=RESET c6=HELD_OFF gt911=PRESERVED i2c=PRESERVED");
+
+    ESP_LOGI(
+        TAG,
+        "Entering continuous Light-sleep with GPIO3 as the only wake source; "
+        "no periodic timer slices and no GT911 polling");
+
+    /*
+     * timeout_ms=0 disables the timer wake source.
+     * enable_gpio_wakeup=true leaves GPIO3 LOW as the only wake source.
+     */
+    const esp_err_t sleep_ret =
+        enter_light_sleep(0, true);
+
+    const esp_sleep_wakeup_cause_t wake_cause =
+        light_sleep_get_last_wakeup_cause();
+
+    /*
+     * This path returns by design. Release the logical Deep request before
+     * finish_light_sleep() so GPIO3 activity resets the inactivity timer and
+     * restores the normal CPU policy.
+     */
+    release_sleep_request();
+
+    const bool gpio_wake =
+        sleep_ret == ESP_OK &&
+        wake_cause == ESP_SLEEP_WAKEUP_GPIO;
+
+    finish_light_sleep(
+        sleep_ret,
+        wake_cause,
+        gpio_wake);
+
+    if (sleep_ret != ESP_OK) {
+        recover_light_sleep_without_reset(
+            "RETENTIVE_DEEP_SLEEP_CALL",
+            sleep_ret,
+            true,
+            true);
+
+        ESP_LOGE(
+            POWER_TAG,
+            "event=RETENTIVE_DEEP_FAILED error=%s action=RESTORE_ACTIVE",
+            esp_err_to_name(sleep_ret));
+        return;
+    }
+
+    if (!gpio_wake) {
+        recover_light_sleep_without_reset(
+            "RETENTIVE_DEEP_UNEXPECTED_WAKE",
+            ESP_ERR_INVALID_STATE,
+            true,
+            true);
+
+        ESP_LOGE(
+            POWER_TAG,
+            "event=RETENTIVE_DEEP_FAILED wake_cause=%d "
+            "action=RESTORE_ACTIVE",
+            (int)wake_cause);
+        return;
+    }
+
+    ESP_LOGI(
+        POWER_TAG,
+        "event=RETENTIVE_DEEP_EXIT reason=GPIO3 action=RESTORE_ACTIVE");
+
+    esp_err_t aux_restore_ret =
+        restore_aux_peripherals_after_light_sleep();
+
+    if (aux_restore_ret != ESP_OK) {
+        mark_light_sleep_recovery_failure();
+        ESP_LOGE(
+            POWER_TAG,
+            "event=RETENTIVE_DEEP_RECOVERY_WARNING phase=AUX_RESTORE "
+            "error=%s",
+            esp_err_to_name(aux_restore_ret));
+    }
+
+    if (s_light_resume_callback != NULL) {
+        esp_err_t resume_ret =
+            s_light_resume_callback(s_light_transition_user_data);
+
+        if (resume_ret != ESP_OK) {
+            mark_light_sleep_recovery_failure();
+            ESP_LOGE(
+                POWER_TAG,
+                "event=RETENTIVE_DEEP_RECOVERY_WARNING phase=HARDWARE_RESUME "
+                "error=%s",
+                esp_err_to_name(resume_ret));
+        }
+    }
+
+    ESP_LOGI(
+        TAG,
+        "RETENTIVE_DEEP wake complete; application state restored without reboot");
+}
+
 static void run_aggressive_deep_sleep_sequence(const char *reason);
 
 
@@ -790,7 +1021,12 @@ static void run_sleep_sequence(
     const char *reason,
     app_deep_sleep_strategy_t strategy)
 {
-    /* Both automatic policies enter real P4 Deep-sleep. */
+    if (strategy == APP_DEEP_SLEEP_STRATEGY_PRESERVE_LIGHT_STATE &&
+        !APP_SLEEP_POWER_PROFILE_TRUE_DEEP_FROM_LIGHT) {
+        run_light_compatible_deep_sleep_sequence(reason);
+        return;
+    }
+
     sleep_power_profile_start(
         strategy == APP_DEEP_SLEEP_STRATEGY_PRESERVE_LIGHT_STATE
             ? "LIGHT_TO_TRUE_DEEP: external peripherals remain suspended"
@@ -1002,8 +1238,7 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
     ESP_LOGI(TAG, "STEP 8: preparing final ESP32-P4 deep-sleep boundary");
     ESP_LOGI(
         POWER_TAG,
-        "event=DEEP_SLEEP_BOUNDARY_PREPARE wake_gpio=%d "
-        "wake_policy=OPPOSITE_STABLE_LEVEL_GPIO3",
+        "event=DEEP_SLEEP_BOUNDARY_PREPARE wake_gpio=%d wake_level=LOW",
         APP_DEEP_SLEEP_BUTTON_GPIO);
     enter_deep_sleep_with_profile(DEEP_SLEEP_PROFILE_AGGRESSIVE);
 
@@ -1087,6 +1322,84 @@ void app_sleep_request(const char *reason)
     run_sleep_sequence(
         reason,
         APP_DEEP_SLEEP_STRATEGY_AGGRESSIVE);
+}
+
+static void deep_sleep_button_task(void *arg)
+{
+    (void)arg;
+
+    gpio_config_t button_config = {
+        .pin_bit_mask = 1ULL << APP_DEEP_SLEEP_BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        /*
+        * GPIO3 is biased by the external pull-up fitted between GPIO3 and
+        * ESP_3V3. Do not enable the internal pull-up in parallel.
+        */
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    esp_err_t ret = gpio_config(&button_config);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Failed to configure sleep button: %s",
+            esp_err_to_name(ret));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Do not reuse the wake-up press as a new request after boot. */
+    while (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
+
+    ESP_LOGI(
+        TAG,
+        "GPIO%d power-mode button armed; behavior follows saved Deep-sleep toggle",
+        APP_DEEP_SLEEP_BUTTON_GPIO);
+
+    while (true) {
+        /*
+        * GPIO3 is also the Light-sleep wake source. While Light-sleep is
+        * active, or until its wake press is released, the button belongs to
+        * the Light-sleep path and must not request Deep-sleep.
+        */
+        if (button_event_is_reserved_for_light_sleep()) {
+            if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) != 0) {
+                clear_button_release_guard();
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
+            continue;
+        }
+
+        if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS));
+
+            if (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0 &&
+                !button_event_is_reserved_for_light_sleep()) {
+                if (app_sleep_deep_mode_is_enabled()) {
+                    app_sleep_request("GPIO3 button");
+                } else {
+                    ESP_LOGI(
+                        POWER_TAG,
+                        "event=GPIO3_ACTIVITY deep_sleep=DISABLED action=KEEP_ACTIVE");
+                    app_sleep_notify_face_detected();
+                }
+
+                while (gpio_get_level(APP_DEEP_SLEEP_BUTTON_GPIO) == 0) {
+                    vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS));
+    }
 }
 
 static void inactivity_power_policy_task(void *arg)
@@ -1188,7 +1501,7 @@ static void inactivity_power_policy_task(void *arg)
             ESP_LOGI(
                 TAG,
                 "No activity for %u ms; entering Light-sleep only until "
-                "touchscreen activity",
+                "touch/GPIO3 activity",
                 (unsigned)s_light_sleep_threshold_ms);
         }
 
@@ -1328,6 +1641,7 @@ static void inactivity_power_policy_task(void *arg)
 
             finish_light_sleep(
                 ESP_OK,
+                ESP_SLEEP_WAKEUP_UNDEFINED,
                 true);
 
             esp_err_t aux_restore_ret =
@@ -1422,13 +1736,16 @@ static void inactivity_power_policy_task(void *arg)
 
             const int64_t slice_start_us = esp_timer_get_time();
 
-            light_ret = enter_light_sleep_poll_slice_resilient(poll_slice_ms);
+            light_ret = enter_light_sleep_poll_slice_resilient(
+                poll_slice_ms,
+                true);
             wake_cause = light_sleep_get_last_wakeup_cause();
 
             const int64_t slice_elapsed_us =
                 esp_timer_get_time() - slice_start_us;
 
-            if (light_ret != ESP_OK) {
+            if (light_ret != ESP_OK ||
+                wake_cause == ESP_SLEEP_WAKEUP_GPIO) {
                 break;
             }
 
@@ -1552,9 +1869,10 @@ static void inactivity_power_policy_task(void *arg)
             }
         }
 
-        const bool user_activity = touchscreen_touched;
+        const bool user_activity = touchscreen_touched ||
+            wake_cause == ESP_SLEEP_WAKEUP_GPIO;
 
-        finish_light_sleep(light_ret, user_activity);
+        finish_light_sleep(light_ret, wake_cause, user_activity);
 
         if (light_ret != ESP_OK) {
             recover_light_sleep_without_reset(
@@ -1573,7 +1891,8 @@ static void inactivity_power_policy_task(void *arg)
         if (user_activity) {
             ESP_LOGI(
                 POWER_TAG,
-                "event=LIGHT_SLEEP_EXIT reason=TOUCHSCREEN action=RESTORE_ACTIVE");
+                "event=LIGHT_SLEEP_EXIT reason=%s action=RESTORE_ACTIVE",
+                touchscreen_touched ? "TOUCHSCREEN" : "GPIO3");
 
             esp_err_t aux_restore_ret =
                 restore_aux_peripherals_after_light_sleep();
@@ -1604,9 +1923,15 @@ static void inactivity_power_policy_task(void *arg)
                     esp_err_to_name(resume_ret));
             }
 
-            ESP_LOGI(
-                TAG,
-                "Touchscreen activity restored camera/display without reboot");
+            if (touchscreen_touched) {
+                ESP_LOGI(
+                    TAG,
+                    "Touchscreen activity restored camera/display without reboot");
+            } else {
+                ESP_LOGI(
+                    TAG,
+                    "GPIO3 woke Light-sleep; camera/display restored without reboot");
+            }
         } else if (wake_cause == ESP_SLEEP_WAKEUP_TIMER &&
                 s_deep_mode_enabled && remaining_ms == 0) {
             ESP_LOGI(
@@ -1631,8 +1956,9 @@ static void inactivity_power_policy_task(void *arg)
             }
 
             /*
-             * Real Deep-sleep normally never returns. If entry fails, its
-             * existing error/recovery path has logged the failure.
+             * Normal RETENTIVE_DEEP returns after GPIO3 and restores RAM.
+             * The diagnostic true-Deep path normally never returns. If entry
+             * fails, its existing error/recovery path has logged the failure.
              */
             continue;
         }
@@ -1655,14 +1981,19 @@ esp_err_t app_sleep_start_button_monitor(
     s_prepare_callback = prepare_callback;
     s_prepare_user_data = user_data;
 
-    /* Keep the existing registration API, but do not create a polling task.
-     * The rocker is exclusively a hardware wake input in real Deep-sleep.
-     * Active-mode transitions must neither request sleep nor reset inactivity.
-     */
-    ESP_LOGI(TAG,
-             "DS-EDGE-1: GPIO%d rocker policy=DEEP_SLEEP_WAKE_ONLY "
-             "active_action=NONE light_sleep_wake=OFF",
-             APP_DEEP_SLEEP_BUTTON_GPIO);
+    BaseType_t created = xTaskCreatePinnedToCore(
+        deep_sleep_button_task,
+        "deep_sleep_button",
+        2048,
+        NULL,
+        APP_DEEP_SLEEP_BUTTON_PRIORITY,
+        NULL,
+        APP_SYSTEM_WORKER_CORE);
+
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create deep-sleep button task");
+        return ESP_ERR_NO_MEM;
+    }
 
     return ESP_OK;
 }
@@ -1683,6 +2014,7 @@ esp_err_t app_sleep_start_timeout(void)
     s_inactivity_monitor_started = true;
     s_inactivity_policy_paused = false;
     s_light_sleep_in_progress = false;
+    s_ignore_button_until_release = false;
     s_light_sleep_failed_until_activity = false;
 
     portEXIT_CRITICAL(&s_sleep_request_lock);

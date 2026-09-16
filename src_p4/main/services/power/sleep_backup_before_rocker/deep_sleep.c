@@ -1,4 +1,3 @@
-
 #include "services/power/sleep/deep_sleep.h"
 
 #include <stdbool.h>
@@ -17,8 +16,6 @@
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
-#include "esp_timer.h"
-#include "sdkconfig.h"
 #include "esp_rom_uart.h"
 #include "platform/power/component_audio.h"
 #include "platform/power/component_display.h"
@@ -66,92 +63,6 @@ static esp_err_t arm_hp_pad_retention_for_deep_sleep(void)
 }
 
 #define WAKE_BUTTON_GPIO APP_DEEP_SLEEP_BUTTON_GPIO
-
-/* IDF otherwise reverses the bias when HIGH wake is selected. With a
- * GPIO-to-GND contact, opening the switch must ALWAYS pull GPIO3 HIGH. */
-#if CONFIG_ESP_SLEEP_GPIO_ENABLE_INTERNAL_RESISTORS
-#error "DS-EDGE-1 requires CONFIG_ESP_SLEEP_GPIO_ENABLE_INTERNAL_RESISTORS=n; run the supplied installer"
-#endif
-
-#if APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS == 0 || APP_DEEP_SLEEP_BUTTON_POLL_MS == 0
-#error "DS-EDGE-1 requires nonzero button debounce and sampling intervals"
-#endif
-
-static esp_err_t configure_deep_sleep_button_input(void)
-{
-    esp_err_t ret = gpio_hold_dis(WAKE_BUTTON_GPIO);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    ret = gpio_wakeup_disable(WAKE_BUTTON_GPIO);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    const gpio_config_t config = {
-        .pin_bit_mask = 1ULL << WAKE_BUTTON_GPIO,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ret = gpio_config(&config);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    /* Keep the input and its fixed pull-up instead of a floating sleep pad.
-     * ESP-IDF holds the wake-pad configuration during actual Deep-sleep. */
-    return gpio_sleep_sel_dis(WAKE_BUTTON_GPIO);
-}
-
-static int read_stable_deep_sleep_button_level(void)
-{
-    int level = gpio_get_level(WAKE_BUTTON_GPIO);
-    int64_t stable_since_us = esp_timer_get_time();
-    const int64_t debounce_us =
-        (int64_t)APP_DEEP_SLEEP_BUTTON_DEBOUNCE_MS * 1000LL;
-    const TickType_t ticks = pdMS_TO_TICKS(APP_DEEP_SLEEP_BUTTON_POLL_MS);
-
-    while (esp_timer_get_time() - stable_since_us < debounce_us) {
-        /* Yield even if 5 ms rounds down to zero at the configured tick rate. */
-        vTaskDelay(ticks > 0 ? ticks : 1);
-        const int current = gpio_get_level(WAKE_BUTTON_GPIO);
-        if (current != level) {
-            level = current;
-            stable_since_us = esp_timer_get_time();
-        }
-    }
-    return level;
-}
-
-static esp_err_t arm_deep_sleep_button_change(int *baseline)
-{
-    for (;;) {
-        /* Clear GPIO first: in IDF 5.5.4, ALL clears the trigger bitmap but
-         * the source-specific call also clears the saved GPIO mask. */
-        esp_err_t ret = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
-        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-            return ret;
-        }
-        ret = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-        if (ret != ESP_OK) {
-            return ret;
-        }
-
-        const int level = read_stable_deep_sleep_button_level();
-        const esp_deepsleep_gpio_wake_up_mode_t mode =
-            level == 0 ? ESP_GPIO_WAKEUP_GPIO_HIGH : ESP_GPIO_WAKEUP_GPIO_LOW;
-        ret = esp_deep_sleep_enable_gpio_wakeup(1ULL << WAKE_BUTTON_GPIO, mode);
-        if (ret != ESP_OK) {
-            return ret;
-        }
-        /* No manual output/hold is applied to the input. Re-sample if the
-         * rocker moved while the wake API was being configured. */
-        if (gpio_get_level(WAKE_BUTTON_GPIO) == level) {
-            *baseline = level;
-            return ESP_OK;
-        }
-    }
-}
 
 /*
 * ESP32-P4-NANO shared I2C bus from the Waveshare schematic:
@@ -818,15 +729,75 @@ static void power_down_flash_for_deep_sleep(void)
 
 void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
 {
-    /* GPIO3-to-GND maintained contact: open=HIGH, closed=LOW.
-     * Neither position requests sleep. The saved inactivity policy does.
-     * Arming happens AFTER peripheral teardown and diagnostic delays below. */
+    /*
+    * Button wiring:
+    *
+    * ESP_3V3 ---- external 47K..100K pull-up ---- GPIO3
+    * GPIO3  ---- button ------------------------- GND
+    *
+    * Released: GPIO3 = HIGH
+    * Pressed:  GPIO3 = LOW
+    *
+    * Keep the internal pull-up enabled as a safe fallback. Disable it only
+    * after the physical external GPIO3 pull-up has been installed and
+    * verified with a meter.
+    */
+    gpio_config_t button_config = {
+        .pin_bit_mask = 1ULL << WAKE_BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    sleep_power_profile_before("GPIO3 wake source / stale timers cleared");
+    ESP_ERROR_CHECK(gpio_config(&button_config));
+
+    /* Verify that GPIO3 is supported as a Deep-sleep wake pin. */
     if (!esp_sleep_is_valid_wakeup_gpio(WAKE_BUTTON_GPIO)) {
-        ESP_LOGE(TAG, "GPIO%d cannot wake this P4 from Deep-sleep",
-                 WAKE_BUTTON_GPIO);
+        ESP_LOGE(
+            TAG,
+            "GPIO%d cannot wake this ESP32-P4 from Deep-sleep",
+            WAKE_BUTTON_GPIO);
         return;
     }
-    ESP_ERROR_CHECK(configure_deep_sleep_button_input());
+
+    /* Prevent immediate wake-up if the button is currently pressed. */
+    if (gpio_get_level(WAKE_BUTTON_GPIO) == 0) {
+        ESP_LOGW(
+            TAG,
+            "Button is currently pressed. Release it before Deep-sleep.");
+
+        while (gpio_get_level(WAKE_BUTTON_GPIO) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+
+    /*
+    * Clear every wake source that may have been left by an earlier
+    * Light-sleep cycle, then arm only GPIO3 for this Deep-sleep entry.
+    */
+    esp_err_t wake_clear_ret =
+        esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+
+    if (wake_clear_ret != ESP_OK && wake_clear_ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(
+            TAG,
+            "Could not clear all stale wake sources: %s",
+            esp_err_to_name(wake_clear_ret));
+    } else {
+        ESP_LOGI(TAG, "Deep-sleep wake audit: all stale wake sources cleared");
+    }
+
+    /* Wake when GPIO3 becomes LOW. No timer/USB/UART wake-up is enabled. */
+    ESP_ERROR_CHECK(
+        esp_deep_sleep_enable_gpio_wakeup(
+            1ULL << WAKE_BUTTON_GPIO,
+            ESP_GPIO_WAKEUP_GPIO_LOW));
+    sleep_power_profile_after(
+        "GPIO3 wake source / stale timers cleared",
+        (wake_clear_ret == ESP_OK || wake_clear_ret == ESP_ERR_INVALID_STATE)
+            ? "ESP_OK" : "WAKE_CLEAR_ERROR_SEE_LOG");
 
     ESP_LOGI(
         TAG,
@@ -921,7 +892,7 @@ void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
     * STEP 6 has already disabled the ESP32-C6. Re-apply GPIO54 LOW again now,
     * after every other application-side teardown operation, so there is no
     * stale-state shortcut. Diagnostic builds hold this state for measurement
-    * before the final button baseline is selected. The final pad readback
+    * and also pause silently after UART detach. The final pad readback below
     * occurs after the C6 measurement window. Delay=0 has no added pauses.
     */
     sleep_power_profile_before("Final ESP32-C6 GPIO54 LOW clamp");
@@ -977,45 +948,36 @@ void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
              component_ethernet_deep_sleep_state(),
              component_ethernet_deep_sleep_reset_level());
 
-    /* Finish every optional measurement pause before selecting the baseline.
-     * There must be no long shutdown work or delay after arming the input. */
-    sleep_power_profile_after("Final pre-entry measurement / before GPIO3 arm",
-                              "READY");
+    ESP_LOGI(
+        TAG,
+        "Entering Deep-sleep. Press the GPIO%d button to wake up.",
+        WAKE_BUTTON_GPIO);
 
-    int baseline;
-    for (;;) {
-        ESP_ERROR_CHECK(arm_deep_sleep_button_change(&baseline));
-        ESP_LOGI(TAG,
-                 "DS-EDGE-1: GPIO%d baseline=%s wake=%s "
-                 "pull=FIXED_UP timer=OFF other_wake_sources=OFF",
-                 WAKE_BUTTON_GPIO,
-                 baseline == 0 ? "LOW" : "HIGH",
-                 baseline == 0 ? "HIGH" : "LOW");
-        ESP_LOGI(TAG, "Entering real Deep-sleep; change the rocker position to wake");
+    const bool detach_uart = APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY &&
+        profile == DEEP_SLEEP_PROFILE_AGGRESSIVE;
+    sleep_power_profile_final_boundary(detach_uart);
 
-        fflush(stdout);
-        fflush(stderr);
+    /* Flush the final announcement before UART detach. The only diagnostic
+     * work afterwards is a silent FreeRTOS delay; no application log is issued.
+     * The P4 then really enters Deep-sleep, so no post-entry pause is possible. */
+    fflush(stdout);
+    fflush(stderr);
+    /* fflush() drains the C stream, not the hardware shift register.
+     * IDF also flushes UARTs inside esp_deep_sleep_start(), but that is too
+     * late once the TX pin has already been disconnected below. */
 #if defined(CONFIG_ESP_CONSOLE_UART) && CONFIG_ESP_CONSOLE_UART
-        if (uart_ll_is_enabled(CONFIG_ESP_CONSOLE_UART_NUM)) {
-            esp_rom_output_tx_wait_idle(CONFIG_ESP_CONSOLE_UART_NUM);
-        }
-#endif
-        /* A movement while UART drained belongs to the pre-sleep state.
-         * Adopt it as the new baseline, so a held contact cannot cause a
-         * repeated immediate wake on the next automatic sleep cycle. */
-        if (gpio_get_level(WAKE_BUTTON_GPIO) == baseline) {
-            break;
-        }
+    if (uart_ll_is_enabled(CONFIG_ESP_CONSOLE_UART_NUM)) {
+        esp_rom_output_tx_wait_idle(CONFIG_ESP_CONSOLE_UART_NUM);
     }
+#endif
 
 #if APP_PWR_FLOAT_UART0_AT_FINAL_BOUNDARY
     if (profile == DEEP_SLEEP_PROFILE_AGGRESSIVE) {
         float_uart0_at_final_boundary();
     }
 #endif
-    /* Hardware level wake catches the next maintained change. As with any
-     * level-triggered sleep entry, a change in these final instructions can
-     * cause an immediate wake. No timer or active-mode task emulates sleep. */
+
+    sleep_power_profile_quiet_wait();
     esp_deep_sleep_start();
 }
 

@@ -23,7 +23,7 @@ typedef void (*app_sleep_prepare_callback_t)(void *user_data);
 *
 * The suspend callback must stop every DMA/worker that cannot run while the
 * ESP32-P4 clocks are gated. The resume callback must rebuild those resources
-* after a touch or GPIO wake. A non-ESP_OK result is treated as unsafe and
+* after a touchscreen wake. A non-ESP_OK result is treated as unsafe and
 * causes a controlled restart instead of continuing with half-initialized
 * hardware.
 */
@@ -41,14 +41,12 @@ esp_err_t app_sleep_register_light_sleep_callbacks(
     void *user_data);
 
 /**
-* Start the physical GPIO3 sleep-button monitor.
+* Register the callback used before the ordered Deep-sleep shutdown.
 *
-* When the saved Deep-sleep toggle is ON, GPIO3 remains an active-mode
-* Deep-sleep request and the Deep-sleep wake pin. When it is OFF, GPIO3 is only
-* a Light-sleep wake/activity input.
-*
-* A GPIO3 press used to wake Light-sleep is consumed and will not be reused as
-* a second sleep request after the system resumes.
+* The function name is retained for existing callers. No button-monitor task
+* is created. GPIO3 transitions do nothing in Active mode or Light-sleep.
+* Immediately before real Deep-sleep, GPIO3 is debounced and the opposite
+* level is armed. Either maintained rocker transition can then wake the P4.
 */
 esp_err_t app_sleep_start_button_monitor(
     app_sleep_prepare_callback_t prepare_callback,
@@ -65,7 +63,7 @@ esp_err_t app_sleep_start_button_monitor(
 * Light ON + Deep OFF:
 *   Enter the SAME full Light-sleep hardware state after the saved Light delay.
 *   The timer-sliced GT911 polling loop then continues indefinitely
-*   until qualified touchscreen activity or GPIO3 wakes the system.
+*   until qualified touchscreen activity wakes the system.
 *
 * Light OFF + Deep ON:
 *   Skip Light-sleep completely and run the existing ordered Deep-sleep

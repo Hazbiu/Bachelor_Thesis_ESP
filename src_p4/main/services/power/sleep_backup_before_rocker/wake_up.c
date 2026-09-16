@@ -20,7 +20,7 @@ void report_wake_reason(void)
         );
 
         if (wake_gpio_mask & (1ULL << GPIO_NUM_3)) {
-            ESP_LOGI(TAG, "GPIO3 rocker transition woke the system");
+            ESP_LOGI(TAG, "Wake-up button on GPIO3 was pressed");
         }
 
         break;
