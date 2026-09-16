@@ -29,10 +29,14 @@ void app_runtime_start(void)
     app_controller_init(NULL, NULL);
 
     /*
-     * Light-sleep resumes in place and never comes through this boot path.
+     * Deep-sleep wake is a complete ESP32-P4 reboot.
      *
-     * Real Deep-sleep wake restarts the ESP32-P4 from app_main(), so remember
-     * whether this boot was caused by the GPIO3 LCD/power button.
+     * Capture the reason before normal application initialization so that,
+     * after the launcher/display and power manager are ready, a GPIO3 wake
+     * can return directly to the camera application.
+     *
+     * Light-sleep does NOT execute this boot path. It resumes in place through
+     * resume_application_from_light_sleep(), exactly as before.
      */
     const esp_sleep_wakeup_cause_t wake_cause =
         esp_sleep_get_wakeup_cause();
@@ -82,25 +86,28 @@ void app_runtime_start(void)
 #endif
 
     /*
-     * Rebuild the normal launcher/display after every boot.
-     * Deep-sleep destroyed the previous RAM/display/application state.
+     * Always rebuild the normal launcher/display first.
+     *
+     * This is required after real Deep-sleep because all normal application,
+     * LVGL, camera and display state was lost.
      */
     if (app_navigation_start() != ESP_OK) {
         return;
     }
 
     /*
-     * Register the existing Light/Deep sleep callbacks before automatically
-     * entering the application after a GPIO3 Deep-sleep wake.
+     * Register Light/Deep sleep callbacks before automatically starting the
+     * camera application.
      */
     (void)camera_session_setup_power_management();
 
     /*
-     * Cold boot:
-     *     remain on the launcher exactly as before.
+     * Normal cold boot:
+     *     stay on the launcher exactly as before.
      *
      * GPIO3 Deep-sleep wake:
-     *     perform the same action as pressing Start on the LCD launcher.
+     *     perform the same operation as pressing "Start Camera" on the
+     *     launcher, returning directly to the application.
      */
     if (woke_from_lcd_button) {
         ESP_LOGI(

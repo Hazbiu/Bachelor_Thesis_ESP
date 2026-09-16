@@ -27,3 +27,4 @@ tools/.venv-tflite-int8/
 /.live_metrics_backup_20260914_213042
 /.hp_core_usage_backup_20260914_224521
 /backups
+/sleep-wake-backups

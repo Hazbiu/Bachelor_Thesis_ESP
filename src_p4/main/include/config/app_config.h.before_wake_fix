@@ -405,8 +405,8 @@
  *   1. the GT911 stops ACKing on I2C after >58 ms; and
  *   2. the shared I2C bus itself is still alive through the ES8311 address.
  */
-#define APP_PWR_GT911_SLEEP_ENABLED                 0
-#define APP_PWR_GT911_ALLOW_SLEEP_WITHOUT_HOST_WAKE 0
+#define APP_PWR_GT911_SLEEP_ENABLED                 1
+#define APP_PWR_GT911_ALLOW_SLEEP_WITHOUT_HOST_WAKE 1
 #define APP_PWR_GT911_SLEEP_VERIFY_DELAY_MS         70U
 #define APP_PWR_GT911_PRIMARY_ADDRESS               0x5D
 #define APP_PWR_GT911_SECONDARY_ADDRESS             0x14
