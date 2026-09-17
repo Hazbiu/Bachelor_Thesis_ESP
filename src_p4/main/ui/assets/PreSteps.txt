@@ -1,0 +1,4 @@
+Replace: 
+	university_logo.jpg
+Run:	
+	bash utilities/prepare_university_logo.sh

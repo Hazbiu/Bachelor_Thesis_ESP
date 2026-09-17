@@ -1,0 +1,120 @@
+#include "app/app_runtime.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "app/camera/camera_session.h"
+#include "app/controller/app_controller.h"
+#include "app/navigation/app_navigation.h"
+#include "config/app_config.h"
+#include "config/log_config.h"
+#include "diagnostics/app_logging.h"
+#include "diagnostics/core_trace.h"
+#include "diagnostics/cpu_stats.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_sleep.h"
+#include "domain/ports/system_adapters_port.h"
+#include "services/power/sleep/wake_up.h"
+#include "app/configuration/app_configuration.h"
+
+
+static const char *TAG = "app_main";
+
+
+void app_runtime_start(void)
+{
+    app_logging_init();
+
+    app_controller_init(NULL, NULL);
+
+    /*
+     * Deep-sleep wake is a complete ESP32-P4 reboot.
+     *
+     * Capture the reason before normal application initialization so that,
+     * after the launcher/display and power manager are ready, a GPIO3 wake
+     * can return directly to the camera application.
+     *
+     * Light-sleep does NOT execute this boot path. It resumes in place through
+     * resume_application_from_light_sleep(), exactly as before.
+     */
+    const esp_sleep_wakeup_cause_t wake_cause =
+        esp_sleep_get_wakeup_cause();
+
+    const uint64_t wake_gpio_mask =
+        wake_cause == ESP_SLEEP_WAKEUP_GPIO
+            ? esp_sleep_get_gpio_wakeup_status()
+            : 0ULL;
+
+    const bool woke_from_lcd_button =
+        wake_cause == ESP_SLEEP_WAKEUP_GPIO &&
+        (wake_gpio_mask &
+         (1ULL << APP_DEEP_SLEEP_BUTTON_GPIO)) != 0ULL;
+
+    esp_err_t settings_ret = app_configuration_init();
+    if (settings_ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "Persistent settings unavailable; in-memory defaults are active: %s",
+                 esp_err_to_name(settings_ret));
+    }
+
+    esp_err_t power_policy_ret = app_configuration_apply_saved_policy();
+    if (power_policy_ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "Initial power policy application failed: %s",
+                 esp_err_to_name(power_policy_ret));
+    }
+
+    ESP_LOGI(TAG,
+             "[CORE-PROOF] Application split: system_cpu=%d ai_cpu=%d",
+             APP_SYSTEM_WORKER_CORE,
+             APP_AI_WORKER_CORE);
+
+    report_wake_reason();
+    core_trace(TAG, "APP_MAIN_START");
+
+    esp_err_t cpu_power_ret = system_cpu_power_init();
+    if (cpu_power_ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "CPU power management initialization failed: %s",
+            esp_err_to_name(cpu_power_ret));
+    }
+
+#if APP_DIAGNOSTICS_CPU_STATS_ENABLED
+    diagnostics_start_cpu_stats_monitor();
+#endif
+
+    /*
+     * Always rebuild the normal launcher/display first.
+     *
+     * This is required after real Deep-sleep because all normal application,
+     * LVGL, camera and display state was lost.
+     */
+    if (app_navigation_start() != ESP_OK) {
+        return;
+    }
+
+    /*
+     * Register Light/Deep sleep callbacks before automatically starting the
+     * camera application.
+     */
+    (void)camera_session_setup_power_management();
+
+    /*
+     * Normal cold boot:
+     *     stay on the launcher exactly as before.
+     *
+     * GPIO3 Deep-sleep wake:
+     *     perform the same operation as pressing "Start Camera" on the
+     *     launcher, returning directly to the application.
+     */
+    if (woke_from_lcd_button) {
+        ESP_LOGI(
+            TAG,
+            "GPIO%d Deep-sleep wake detected; returning directly to camera application",
+            (int)APP_DEEP_SLEEP_BUTTON_GPIO);
+
+        camera_session_launcher_start_requested(NULL);
+    }
+}
