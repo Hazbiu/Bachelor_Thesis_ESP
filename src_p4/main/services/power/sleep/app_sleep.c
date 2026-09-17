@@ -1,3 +1,4 @@
+
 #include "services/power/sleep/app_sleep.h"
 
 #include <inttypes.h>
@@ -51,6 +52,7 @@
 
 static const char *TAG = "app_sleep";
 static const char *POWER_TAG = "PWR_STATE";
+static int64_t s_light_wake_start_us = -1;
 
 static portMUX_TYPE s_sleep_request_lock =
     portMUX_INITIALIZER_UNLOCKED;
@@ -1557,6 +1559,12 @@ static void inactivity_power_policy_task(void *arg)
                     (unsigned)APP_LIGHT_SLEEP_TOUCH_PRESS_STABLE_MS);
             } else if (touch_event == APP_TOUCH_GATE_CONFIRMED) {
                 touchscreen_touched = true;
+                s_light_wake_start_us = esp_timer_get_time();
+                ESP_LOGI(
+                    POWER_TAG,
+                    "[WAKE-TIME] mode=LIGHT_SLEEP event=WAKE_CONFIRMED "
+                    "timestamp_us=%" PRId64 " source=TOUCHSCREEN",
+                    s_light_wake_start_us);
                 ESP_LOGI(
                     POWER_TAG,
                     "event=LIGHT_SLEEP_TOUCH_CONFIRMED "
@@ -1669,6 +1677,20 @@ static void inactivity_power_policy_task(void *arg)
     vTaskDelete(NULL);
 }
 
+
+
+
+int64_t app_sleep_take_light_wake_start_us(void)
+{
+    int64_t timestamp_us;
+
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    timestamp_us = s_light_wake_start_us;
+    s_light_wake_start_us = -1;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+
+    return timestamp_us;
+}
 
 esp_err_t app_sleep_start_button_monitor(
     app_sleep_prepare_callback_t prepare_callback,

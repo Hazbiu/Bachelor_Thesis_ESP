@@ -1,6 +1,8 @@
+
 #include "app/app_runtime.h"
 
 #include <stdbool.h>
+#include <inttypes.h>
 #include <stdint.h>
 
 #include "app/camera/camera_session.h"
@@ -14,6 +16,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
+#include "esp_timer.h"
 #include "domain/ports/system_adapters_port.h"
 #include "services/power/sleep/wake_up.h"
 #include "app/configuration/app_configuration.h"
@@ -27,6 +30,14 @@ void app_runtime_start(void)
     app_logging_init();
 
     app_controller_init(NULL, NULL);
+
+    /*
+     * esp_timer restarts after real Deep-sleep. Capture the earliest application
+     * timestamp so the GPIO3 wake metric measures app-runtime entry through the
+     * first successfully presented camera frame. ROM/bootloader latency is not
+     * part of this software-only number.
+     */
+    const int64_t app_runtime_entry_us = esp_timer_get_time();
 
     /*
      * Light-sleep resumes in place and never comes through this boot path.
@@ -81,33 +92,57 @@ void app_runtime_start(void)
     diagnostics_start_cpu_stats_monitor();
 #endif
 
+    if (woke_from_lcd_button) {
+        /*
+         * Deep-sleep wake path:
+         *   - rebuild only the display/touch infrastructure required by camera;
+         *   - never create/show launcher widgets;
+         *   - keep the panel dark until the first live camera frame;
+         *   - retain the existing logical BOOTING->LAUNCHER->CAMERA_ACTIVE FSM
+         *     transitions so the state machine structure stays unchanged.
+         */
+        ESP_LOGI(
+            TAG,
+            "[WAKE-TIME] mode=DEEP_SLEEP event=APP_RUNTIME_ENTRY "
+            "timestamp_us=%" PRId64
+            " scope=EXCLUDES_ROM_BOOTLOADER",
+            app_runtime_entry_us);
+
+        if (camera_session_prepare_direct_wake_display() != ESP_OK) {
+            ESP_LOGE(TAG, "[DEEP-WAKE] could not prepare direct camera display");
+            return;
+        }
+
+        if (app_controller_handle_event(APP_EVENT_BOOT_COMPLETE)) {
+            ESP_LOGI(
+                TAG,
+                "[APP-STATE] BOOTING -> LAUNCHER "
+                "(logical state only; launcher UI bypassed)");
+        } else {
+            ESP_LOGW(
+                TAG,
+                "[DEEP-WAKE] BOOT_COMPLETE did not cause logical launcher transition");
+        }
+
+        (void)camera_session_setup_power_management();
+
+        ESP_LOGI(
+            TAG,
+            "GPIO%d Deep-sleep wake detected; bypassing launcher UI and "
+            "starting camera directly",
+            (int)APP_DEEP_SLEEP_BUTTON_GPIO);
+
+        camera_session_start_direct_after_deep_sleep(app_runtime_entry_us);
+        return;
+    }
+
     /*
-     * Rebuild the normal launcher/display after every boot.
-     * Deep-sleep destroyed the previous RAM/display/application state.
+     * Normal cold boot is unchanged: create and show the launcher, then wait for
+     * the user's Start action.
      */
     if (app_navigation_start() != ESP_OK) {
         return;
     }
 
-    /*
-     * Register the existing Light/Deep sleep callbacks before automatically
-     * entering the application after a GPIO3 Deep-sleep wake.
-     */
     (void)camera_session_setup_power_management();
-
-    /*
-     * Cold boot:
-     *     remain on the launcher exactly as before.
-     *
-     * GPIO3 Deep-sleep wake:
-     *     perform the same action as pressing Start on the LCD launcher.
-     */
-    if (woke_from_lcd_button) {
-        ESP_LOGI(
-            TAG,
-            "GPIO%d Deep-sleep wake detected; returning directly to camera application",
-            (int)APP_DEEP_SLEEP_BUTTON_GPIO);
-
-        camera_session_launcher_start_requested(NULL);
-    }
 }

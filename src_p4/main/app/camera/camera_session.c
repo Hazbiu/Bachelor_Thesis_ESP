@@ -1,3 +1,4 @@
+
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -45,6 +46,7 @@
 #include "lvgl.h"
 #include "lv_demos.h"
 #include "services/power/sleep/wake_up.h"
+#include "services/power/sleep/app_sleep.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -169,6 +171,17 @@ static void note_preview_frame_presented(int64_t now_us)
 
 static bool dummy_draw_enabled = false;
 static bool application_start_requested = false;
+static bool s_direct_deep_wake_start = false;
+
+typedef enum {
+    WAKE_TIMING_NONE = 0,
+    WAKE_TIMING_LIGHT_SLEEP,
+    WAKE_TIMING_DEEP_SLEEP,
+} wake_timing_mode_t;
+
+static wake_timing_mode_t s_wake_timing_mode = WAKE_TIMING_NONE;
+static int64_t s_wake_timing_start_us = -1;
+
 static bool dummy_mode_delay_flag = false;
 
 /*
@@ -178,6 +191,74 @@ static bool dummy_mode_delay_flag = false;
  */
 static SemaphoreHandle_t display_mode_mutex;
 
+
+
+static void startup_status(const char *message)
+{
+    if (s_direct_deep_wake_start) {
+        ESP_LOGI(TAG, "[DEEP-WAKE] %s", message ? message : "");
+        return;
+    }
+
+    presentation_launcher_set_status(message);
+}
+
+static void startup_error(const char *message)
+{
+    if (s_direct_deep_wake_start) {
+        ESP_LOGE(TAG, "[DEEP-WAKE] startup error: %s", message ? message : "");
+        return;
+    }
+
+    presentation_launcher_show_error(message);
+}
+
+static void wake_timing_arm(
+    wake_timing_mode_t mode,
+    int64_t start_us)
+{
+    if (start_us < 0) {
+        return;
+    }
+
+    s_wake_timing_mode = mode;
+    s_wake_timing_start_us = start_us;
+
+    ESP_LOGI(
+        TAG,
+        "[WAKE-TIME] mode=%s event=TIMER_ARMED timestamp_us=%" PRId64,
+        mode == WAKE_TIMING_DEEP_SLEEP ? "DEEP_SLEEP" : "LIGHT_SLEEP",
+        start_us);
+}
+
+static void wake_timing_finish_on_first_camera_frame(void)
+{
+    if (s_wake_timing_mode == WAKE_TIMING_NONE ||
+        s_wake_timing_start_us < 0) {
+        return;
+    }
+
+    const int64_t end_us = esp_timer_get_time();
+    const int64_t elapsed_us = end_us - s_wake_timing_start_us;
+
+    ESP_LOGI(
+        TAG,
+        "[WAKE-TIME] mode=%s event=FIRST_CAMERA_FRAME "
+        "start_us=%" PRId64 " end_us=%" PRId64
+        " elapsed_us=%" PRId64 " elapsed_ms=%.3f%s",
+        s_wake_timing_mode == WAKE_TIMING_DEEP_SLEEP
+            ? "DEEP_SLEEP" : "LIGHT_SLEEP",
+        s_wake_timing_start_us,
+        end_us,
+        elapsed_us,
+        (double)elapsed_us / 1000.0,
+        s_wake_timing_mode == WAKE_TIMING_DEEP_SLEEP
+            ? " scope=APP_RUNTIME_TO_FIRST_FRAME excludes_ROM_BOOTLOADER"
+            : " scope=WAKE_CONFIRMED_TO_FIRST_FRAME");
+
+    s_wake_timing_mode = WAKE_TIMING_NONE;
+    s_wake_timing_start_us = -1;
+}
 
 esp_err_t camera_session_prepare_launcher_display(void)
 {
@@ -227,6 +308,37 @@ esp_err_t camera_session_prepare_launcher_display(void)
     return ESP_OK;
 }
 
+
+
+esp_err_t camera_session_prepare_direct_wake_display(void)
+{
+    /*
+     * Mark the boot as the launcher-free Deep-sleep path before any shared
+     * display/power setup can report an error. This keeps every failure path
+     * serial-only because no launcher widgets exist on this boot.
+     */
+    s_direct_deep_wake_start = true;
+
+    const esp_err_t ret = camera_session_prepare_launcher_display();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /*
+     * The BSP display stack must exist before the camera path can be built, but
+     * no launcher widgets are created on a Deep-sleep GPIO3 wake. Keep the
+     * physical display dark until the first complete live camera frame.
+     */
+    system_display_backlight_off();
+    display_backlight_enabled = false;
+
+    ESP_LOGI(
+        TAG,
+        "[DEEP-WAKE] display/touch stack prepared with launcher UI BYPASSED; "
+        "backlight remains OFF until first camera frame");
+
+    return ESP_OK;
+}
 
 bool camera_session_launcher_touch_ready(void)
 {
@@ -399,7 +511,7 @@ static void power_manager_on_setup_error(
             TAG,
             "Failed to register Light-sleep transitions: %s",
             esp_err_to_name(error));
-        presentation_launcher_show_error(
+        startup_error(
             "Light-sleep setup failed. Restart the device.");
         break;
 
@@ -408,7 +520,7 @@ static void power_manager_on_setup_error(
             TAG,
             "Failed to register adaptive IDLE-SCAN transitions: %s",
             esp_err_to_name(error));
-        presentation_launcher_show_error(
+        startup_error(
             "Adaptive CPU power setup failed. Restart the device.");
         break;
 
@@ -417,7 +529,7 @@ static void power_manager_on_setup_error(
             TAG,
             "Failed to start deep-sleep button monitor: %s",
             esp_err_to_name(error));
-        presentation_launcher_show_error(
+        startup_error(
             "Deep-sleep button task failed. Restart the device.");
         break;
 
@@ -836,6 +948,10 @@ static esp_err_t resume_application_from_light_sleep(void *user_data)
 {
     (void)user_data;
 
+    const int64_t light_wake_start_us =
+        app_sleep_take_light_wake_start_us();
+    wake_timing_arm(WAKE_TIMING_LIGHT_SLEEP, light_wake_start_us);
+
     if (!display_suspended_for_light_sleep || video_cam_fd0 < 0 ||
         display_mode_mutex == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -980,7 +1096,7 @@ static void camera_application_start_task(void *arg)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Saved power policy could not be applied: %s",
                  esp_err_to_name(ret));
-        presentation_launcher_show_error(
+        startup_error(
             "Power setting could not be applied. Check the serial log and restart.");
         application_start_requested = false;
         vTaskDelete(NULL);
@@ -990,13 +1106,13 @@ static void camera_application_start_task(void *arg)
     const app_configuration_snapshot_t settings = app_configuration_get();
     if (!settings.camera_enabled) {
         ESP_LOGW(TAG, "Camera start blocked by the saved Camera OFF policy");
-        presentation_launcher_show_error("Camera is disabled. Enable it in Settings first.");
+        startup_error("Camera is disabled. Enable it in Settings first.");
         application_start_requested = false;
         vTaskDelete(NULL);
         return;
     }
 
-    presentation_launcher_set_status("Initializing display accelerator...");
+    startup_status("Initializing display accelerator...");
 
     ppa_client_config_t ppa_srm_config = {
         .oper_type = PPA_OPERATION_SRM,
@@ -1005,12 +1121,12 @@ static void camera_application_start_task(void *arg)
     ret = ppa_register_client(&ppa_srm_config, &ppa_srm_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "PPA client registration failed: %s", esp_err_to_name(ret));
-        presentation_launcher_show_error("PPA initialization failed. Restart the device.");
+        startup_error("PPA initialization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
-    presentation_launcher_set_status("Initializing face detection and recognition...");
+    startup_status("Initializing face detection and recognition...");
 
     /*
      * Models, enrollment images and the recognition database are loaded from
@@ -1024,7 +1140,7 @@ static void camera_application_start_task(void *arg)
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Temporary microSD startup access failed: %s",
                      esp_err_to_name(ret));
-            presentation_launcher_show_error(
+            startup_error(
                 "microSD could not be powered for AI initialization.");
             application_start_requested = false;
             vTaskDelete(NULL);
@@ -1055,7 +1171,7 @@ static void camera_application_start_task(void *arg)
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Could not restore saved microSD OFF state: %s",
                      esp_err_to_name(ret));
-            presentation_launcher_show_error(
+            startup_error(
                 "AI loaded, but microSD could not be powered down safely.");
             application_start_requested = false;
             vTaskDelete(NULL);
@@ -1071,7 +1187,7 @@ static void camera_application_start_task(void *arg)
     ret = esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Cache alignment query failed: %s", esp_err_to_name(ret));
-        presentation_launcher_show_error("Memory initialization failed. Restart the device.");
+        startup_error("Memory initialization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1081,12 +1197,12 @@ static void camera_application_start_task(void *arg)
             system_camera_bytes_per_pixel(),
         data_cache_line_size);
 
-    presentation_launcher_set_status("Opening camera...");
+    startup_status("Opening camera...");
 
     ret = system_camera_initialize();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Video initialization failed: %s", esp_err_to_name(ret));
-        presentation_launcher_show_error("Camera initialization failed. Restart the device.");
+        startup_error("Camera initialization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1094,16 +1210,16 @@ static void camera_application_start_task(void *arg)
     video_cam_fd0 = system_camera_open_default();
     if (video_cam_fd0 < 0) {
         ESP_LOGE(TAG, "Video camera open failed");
-        presentation_launcher_show_error("Camera could not be opened. Restart the device.");
+        startup_error("Camera could not be opened. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
-    presentation_launcher_set_status("Allocating camera buffers...");
+    startup_status("Allocating camera buffers...");
 
     ret = allocate_display_buffers();
     if (ret != ESP_OK) {
-        presentation_launcher_show_error("Display-buffer allocation failed. Restart the device.");
+        startup_error("Display-buffer allocation failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1123,7 +1239,7 @@ static void camera_application_start_task(void *arg)
 
         if (!camera_buf[i]) {
             ESP_LOGE(TAG, "Failed to allocate camera buffer %d", i);
-            presentation_launcher_show_error("Camera-buffer allocation failed. Restart the device.");
+            startup_error("Camera-buffer allocation failed. Restart the device.");
             vTaskDelete(NULL);
             return;
         }
@@ -1135,7 +1251,7 @@ static void camera_application_start_task(void *arg)
         (const void **)camera_buf);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Camera buffer setup failed: %s", esp_err_to_name(ret));
-        presentation_launcher_show_error("Camera-buffer setup failed. Restart the device.");
+        startup_error("Camera-buffer setup failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1143,14 +1259,14 @@ static void camera_application_start_task(void *arg)
     if (vision_ai_snapshot_buffer_init(data_cache_line_size) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to allocate %u-byte AI snapshot buffer",
                  (unsigned)vision_ai_snapshot_buffer_capacity());
-        presentation_launcher_show_error("AI snapshot allocation failed. Restart the device.");
+        startup_error("AI snapshot allocation failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
     if (vision_ai_inference_guard_init() != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create AI inference mutex");
-        presentation_launcher_show_error("AI synchronization failed. Restart the device.");
+        startup_error("AI synchronization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1187,7 +1303,7 @@ static void camera_application_start_task(void *arg)
 
     if (!ai_created) {
         ESP_LOGE(TAG, "Failed to create asynchronous AI worker");
-        presentation_launcher_show_error("AI worker creation failed. Restart the device.");
+        startup_error("AI worker creation failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1206,7 +1322,7 @@ static void camera_application_start_task(void *arg)
             TAG,
             "Could not start live HP Core 0/Core 1 usage telemetry: %s",
             esp_err_to_name(ret));
-        presentation_launcher_show_error(
+        startup_error(
             "CPU usage telemetry could not start. Check FreeRTOS run-time stats.");
         application_start_requested = false;
         vTaskDelete(NULL);
@@ -1218,7 +1334,7 @@ static void camera_application_start_task(void *arg)
     display_mode_mutex = xSemaphoreCreateMutex();
     if (!display_mode_mutex) {
         ESP_LOGE(TAG, "Failed to create display-mode mutex");
-        presentation_launcher_show_error("Display synchronization failed. Restart the device.");
+        startup_error("Display synchronization failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1226,12 +1342,12 @@ static void camera_application_start_task(void *arg)
     ret = system_camera_register_frame_callback(camera_video_frame_operation);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Frame callback registration failed: %s", esp_err_to_name(ret));
-        presentation_launcher_show_error("Camera callback setup failed. Restart the device.");
+        startup_error("Camera callback setup failed. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
 
-    presentation_launcher_set_status("Starting live application...");
+    startup_status("Starting live application...");
 
     /*
      * Start capture while dummy draw is still disabled. Any frame arriving in
@@ -1244,7 +1360,7 @@ static void camera_application_start_task(void *arg)
         video_cam_fd0, APP_SYSTEM_WORKER_CORE, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Video stream task failed: %s", esp_err_to_name(ret));
-        presentation_launcher_show_error("Camera stream failed to start. Restart the device.");
+        startup_error("Camera stream failed to start. Restart the device.");
         vTaskDelete(NULL);
         return;
     }
@@ -1257,8 +1373,14 @@ static void camera_application_start_task(void *arg)
      * Remove every launcher object while LVGL still owns the display. Dummy
      * draw is enabled only after the UI has been destroyed safely.
      */
-    presentation_launcher_destroy();
-    vTaskDelay(pdMS_TO_TICKS(50));
+    if (!s_direct_deep_wake_start) {
+        presentation_launcher_destroy();
+        vTaskDelay(pdMS_TO_TICKS(50));
+    } else {
+        ESP_LOGI(
+            TAG,
+            "[DEEP-WAKE] launcher destroy skipped because launcher was never created");
+    }
 
     ret = esp_lv_adapter_set_dummy_draw(disp, true);
     if (ret != ESP_OK) {
@@ -1289,14 +1411,20 @@ static void camera_application_start_task(void *arg)
      * remains in LAUNCHER.
      */
     if (app_controller_handle_event(APP_EVENT_START_CAMERA)) {
-        ESP_LOGI(TAG, "[APP-STATE] LAUNCHER -> CAMERA_ACTIVE");
+        ESP_LOGI(TAG, "[APP-STATE] LAUNCHER -> CAMERA_ACTIVE%s",
+                 s_direct_deep_wake_start ? " (deep-wake UI bypass)" : "");
     } else {
         ESP_LOGW(
             TAG,
             "[APP-STATE] START_CAMERA did not cause a transition");
     }
 
-    ESP_LOGI(TAG, "Launcher completed; camera application is running");
+    ESP_LOGI(
+        TAG,
+        "%s",
+        s_direct_deep_wake_start
+            ? "[DEEP-WAKE] direct camera application startup complete"
+            : "Launcher completed; camera application is running");
     vTaskDelete(NULL);
 }
 
@@ -1304,7 +1432,12 @@ void camera_session_launcher_start_requested(void *user_data)
 {
     (void)user_data;
 
-    ESP_LOGI(TAG, "Launcher start callback received");
+    ESP_LOGI(
+        TAG,
+        "%s",
+        s_direct_deep_wake_start
+            ? "[DEEP-WAKE] direct camera start request received"
+            : "Launcher start callback received");
 
     if (application_start_requested) {
         return;
@@ -1324,10 +1457,24 @@ void camera_session_launcher_start_requested(void *user_data)
     if (created != pdPASS) {
         application_start_requested = false;
         ESP_LOGE(TAG, "Failed to create camera startup task");
-        presentation_launcher_show_error("Could not start application task. Restart the device.");
+        startup_error("Could not start application task. Restart the device.");
     }
 }
 
+
+
+void camera_session_start_direct_after_deep_sleep(int64_t deep_wake_start_us)
+{
+    s_direct_deep_wake_start = true;
+    wake_timing_arm(WAKE_TIMING_DEEP_SLEEP, deep_wake_start_us);
+
+    ESP_LOGI(
+        TAG,
+        "[DEEP-WAKE] GPIO3 wake fast path: starting camera directly; "
+        "launcher UI will not be created");
+
+    camera_session_launcher_start_requested(NULL);
+}
 
 esp_err_t camera_session_setup_power_management(void)
 {
@@ -1584,6 +1731,7 @@ static void camera_video_frame_process(
             if (system_display_backlight_set_percent(
                     system_cpu_backlight_percent()) == ESP_OK) {
                 display_backlight_enabled = true;
+                wake_timing_finish_on_first_camera_frame();
             }
         }
     }

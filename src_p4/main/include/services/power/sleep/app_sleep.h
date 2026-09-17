@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include <stdbool.h>
@@ -48,6 +49,18 @@ esp_err_t app_sleep_register_light_sleep_callbacks(
 * Immediately before real Deep-sleep, GPIO3 is debounced and the opposite
 * level is armed. Either maintained rocker transition can then wake the P4.
 */
+
+
+/*
+ * Wake-latency instrumentation.
+ *
+ * Returns and clears the most recent Light-sleep user-wake timestamp captured
+ * at the instant the wake decision is confirmed. The timestamp uses
+ * esp_timer_get_time() and is therefore valid only within the current boot.
+ * A return value < 0 means no pending Light-sleep wake timestamp.
+ */
+int64_t app_sleep_take_light_wake_start_us(void);
+
 esp_err_t app_sleep_start_button_monitor(
     app_sleep_prepare_callback_t prepare_callback,
     void *user_data);
