@@ -43,6 +43,36 @@ void dl_tie728_s16_conv2d_hwcn(int16_t *output_ptr, int16_t *input_ptr, void *ar
 void dl_tie728_s16_conv2d_hwcn_relu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
 void dl_tie728_s16_conv2d_hwcn_prelu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
 
+void dl_tie728_w8a16_conv2d_11cn_bias(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_conv2d_11cn_bias_relu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_conv2d_11cn(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_conv2d_11cn_relu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+
+void dl_tie728_w8a16_conv2d_33cn_bias(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_conv2d_33cn_bias_relu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_conv2d_33cn(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_conv2d_33cn_relu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+
+void dl_tie728_w8a16_conv2d_hwcn_bias(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_conv2d_hwcn_bias_relu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_conv2d_hwcn(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_conv2d_hwcn_relu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+
+void dl_tie728_w8a16_unaligned_conv2d_11cn_bias(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_unaligned_conv2d_11cn_bias_relu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_unaligned_conv2d_11cn(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_unaligned_conv2d_11cn_relu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+
+void dl_tie728_w8a16_unaligned_conv2d_33cn_bias(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_unaligned_conv2d_33cn_bias_relu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_unaligned_conv2d_33cn(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_unaligned_conv2d_33cn_relu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+
+void dl_tie728_w8a16_unaligned_conv2d_hwcn_bias(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_unaligned_conv2d_hwcn_bias_relu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_unaligned_conv2d_hwcn(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+void dl_tie728_w8a16_unaligned_conv2d_hwcn_relu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+
 void dl_tie728_s16_unaligned_conv2d_hwcn(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
 void dl_tie728_s16_unaligned_conv2d_hwcn_relu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
 void dl_tie728_s16_unaligned_conv2d_hwcn_leakyrelu(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
@@ -89,6 +119,8 @@ void dl_tie728_s16_avg_pool2d_hwc1(int16_t *output_ptr, int16_t *input_ptr, void
 void dl_tie728_s16_avg_pool2d_22c1(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
 void dl_tie728_s16_unaligned_avg_pool2d_hwc1(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
 void dl_tie728_s16_unaligned_avg_pool2d_22c1(int16_t *output_ptr, int16_t *input_ptr, void *args_ptr);
+
+void dl_tie728_s16_avg_pool2d_hwc_sum(uint32_t *scratch_ptr, int16_t *input_ptr, void *args_ptr);
 
 void dl_tie728_s16_add2d_11c(int16_t *output_ptr, int16_t *input0_ptr, int16_t *input1_ptr, void *args_ptr);
 void dl_tie728_s16_add2d_11c_relu(int16_t *output_ptr, int16_t *input0_ptr, int16_t *input1_ptr, void *args_ptr);
@@ -244,6 +276,8 @@ void dl_tie728_s8_unaligned_avg_pool2d_22c1(int8_t *output_ptr, int8_t *input_pt
 
 void dl_tie728_s8_avg_pool2d_hwc1(int8_t *output_ptr, int8_t *input_ptr, void *args_ptr);
 void dl_tie728_s8_unaligned_avg_pool2d_hwc1(int8_t *output_ptr, int8_t *input_ptr, void *args_ptr);
+
+void dl_tie728_s8_avg_pool2d_hwc_sum(int32_t *buffer_ptr, int8_t *input_ptr, void *args_ptr);
 
 void dl_tie728_s8_add2d_11c(int8_t *output_ptr, int8_t *input0_ptr, int8_t *input1_ptr, void *args_ptr);
 void dl_tie728_s8_add2d_11c_relu(int8_t *output_ptr, int8_t *input0_ptr, int8_t *input1_ptr, void *args_ptr);
@@ -448,6 +482,12 @@ void dl_tie728_s16_lessorequal_w1_1_w2_8_unaligned(bool *output_ptr,
                                                    int16_t *input1_ptr,
                                                    void *args_ptr);
 
+/* Native row-major A[M,K] x B[K,N] MatMul kernels. */
+void dl_tie728_s8_matmul_kn(const void *args);
+void dl_tie728_s16_matmul_kn(const void *args);
+void dl_tie728_s8_unaligned_matmul_kn(const void *args);
+void dl_tie728_s16_unaligned_matmul_kn(const void *args);
+
 void dl_tie728_dotprod_i8k8o16(
     int16_t *output_ptr, int8_t *input0_ptr, int8_t *input1_ptr, int shift, int n, int64_t *rounding_offset);
 void dl_tie728_dotprod_i16k16o16(
@@ -477,4 +517,18 @@ void dl_tie728_rmsnorm_s16(int16_t *output, int16_t *input, float *scale, float 
 /* LUT API */
 void dl_tie728_s8_lut(int8_t *output, int8_t *input, int32_t n_16, int8_t *table);
 void dl_tie728_s16_lut_nearest_neighbor(int16_t *output, int16_t *input, int32_t n_8, int16_t *table, int32_t shift);
+
+/* INT8 transpose kernels.
+ *   dl_tie728_s8_transpose: N×M byte matrix, N%8==0, M%16==0.
+ *   dl_tie728_block_transpose: N×M grid of K-byte blocks, any K>=1.
+ */
+void dl_tie728_s8_transpose(int8_t *output, const int8_t *input, int N, int M);
+void dl_tie728_block_transpose(int8_t *output, const int8_t *input, int N, int M, int K);
+
+/* INT16 transpose kernels.
+ *   dl_tie728_s16_transpose: N×M int16 matrix, N%8==0, M%8==0.
+ *   dl_tie728_s16_block_transpose: N×M grid of K-element blocks, any K>=1.
+ */
+void dl_tie728_s16_transpose(int16_t *output, const int16_t *input, int N, int M);
+void dl_tie728_s16_block_transpose(int16_t *output, const int16_t *input, int N, int M, int K);
 }

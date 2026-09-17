@@ -1,7 +1,12 @@
+
 #pragma once
 
 #include "driver/gpio.h"
 #include "config/sleep_mode_selection.h"
+
+/* Sleep/power package identity for serial verification after flashing. */
+#define APP_SLEEP_POWER_FIX_VERSION                 17
+#define APP_SLEEP_POWER_FIX_TAG                     "SLEEP_FIX_V3"
 
 /* Camera and display buffers */
 #define APP_CAMERA_BUFFER_COUNT             2
@@ -149,6 +154,13 @@
  */
 #define APP_LIGHT_SLEEP_TOUCH_POLL_MS               250U
 
+/* Only while AI/camera/display are suspended. Save and restore the exact
+ * active PM configuration on both wake and failed sleep. 90 MHz preserves the
+ * P4 peripheral/APB rate used by the 360 MHz DFS policy. No auto-sleep change. */
+#ifndef APP_LIGHT_SLEEP_POLL_CPU_FREQ_MHZ
+#define APP_LIGHT_SLEEP_POLL_CPU_FREQ_MHZ            90
+#endif
+
 /*
  * Power-efficient Light-sleep display policy:
  * Keep the physical LCD backlight OFF while JD9365, LVGL/MIPI-DSI and camera
@@ -195,17 +207,28 @@
  */
 
 /*
- * IP101GRI Light-sleep reduced-bandwidth experiment:
- *
- * Do NOT assert the PHY RESET pin in Light-sleep. Keep the PHY powered and
- * temporarily force its standard MII Control Register to 10 Mbps. This gives a
- * deterministic, immediate reduced-Ethernet state without waiting for the
- * IP101G WOL+ sleep-ready timer.
- *
- * The original BMCR value is restored when Light-sleep returns to Active mode.
- * Deep-sleep remains unchanged and still asserts GPIO51 RESET LOW.
+ * Retain the legacy master toggle/function name. The default now saves BMCR
+ * and sets its POWER_DOWN bit; RESET remains HIGH, without a reset pulse.
+ * Ethernet is not a wake source and its link is restored on application wake.
+ * Set the second toggle to 0 only to compare against the former powered 10M
+ * policy. User Ethernet OFF always stays in its existing RESET_LOW state.
  */
 #define APP_LIGHT_SLEEP_ETHERNET_REDUCED_10M         1
+#ifndef APP_LIGHT_SLEEP_ETHERNET_BMCR_POWER_DOWN
+#define APP_LIGHT_SLEEP_ETHERNET_BMCR_POWER_DOWN     1
+#endif
+
+/*
+ * Lowest-current reversible Light-sleep Ethernet policy.
+ *
+ * The project's measured/annotated power work found the lower plateau with
+ * the IP101GRI held in hardware RESET. Ethernet is not a wake source, so the
+ * PHY can stay in RESET_LOW for the complete touch-polling Light-sleep window
+ * and be reset/released on wake without changing application wake semantics.
+ */
+#ifndef APP_LIGHT_SLEEP_ETHERNET_RESET_LOW
+#define APP_LIGHT_SLEEP_ETHERNET_RESET_LOW           1
+#endif
 
 /*
  * GT911 Light-sleep false-wake filter (V8, preserving the proven V6 driver fix).
@@ -348,7 +371,7 @@
  * A valid register read does not prove this draws less than hardware reset;
  * keep whichever policy measures lower with DS-RETENTION-1 enabled. */
 #ifndef APP_PWR_ETHERNET_DEEP_BMCR_POWER_DOWN
-#define APP_PWR_ETHERNET_DEEP_BMCR_POWER_DOWN        1
+#define APP_PWR_ETHERNET_DEEP_BMCR_POWER_DOWN        0
 #endif
 
 /*
@@ -390,24 +413,12 @@
 #define APP_PWR_HOLD_VERIFY_POLL_MS                 5
 
 /*
- * ---------------------------------------------------------------------
- * Display / touch Deep-sleep configuration
- * ---------------------------------------------------------------------
- *
- * V19 intentionally uses the GT911's real full-Sleep command
- * (0x05 -> register 0x8040) instead of Green/low-speed scanning.
- *
- * IMPORTANT STOCK-BOARD LIMITATION:
- * Waveshare's ESP32-P4-NANO BSP exposes the GT911 INT and RESET pins as
- * GPIO_NUM_NC. The GT911 programming guide requires INT-high or RESET to
- * wake from full Sleep. Therefore the P4 cannot restore touch after a
- * Deep-sleep wake on this stock wiring. This V19 build is a deepest-software
- * power-measurement build: after waking the P4 with GPIO3, a complete board
- * power-cycle is required before touch can work again.
- *
- * The sleep command is verified before the P4 sleeps by confirming that:
- *   1. the GT911 stops ACKing on I2C after >58 ms; and
- *   2. the shared I2C bus itself is still alive through the ES8311 address.
+ * Display / touch sleep configuration.
+ * Keep full GT911 Sleep disabled: stock wiring has no host INT/RESET wake.
+ * Automatic Green mode instead shortens only the no-touch idle interval and
+ * returns to normal scanning on touch. It leaves the working GPIO3 wake path
+ * independent of touch. Goodix normally supports automatic Green already;
+ * this setting does not imply it was physically disabled in the old firmware.
  */
 #define APP_PWR_GT911_SLEEP_ENABLED                 0
 #define APP_PWR_GT911_ALLOW_SLEEP_WITHOUT_HOST_WAKE 0
@@ -431,12 +442,18 @@
 #define APP_PWR_TOUCH_RESET_GPIO                    (-1)
 #define APP_PWR_TOUCH_RESET_ACTIVE_LEVEL            0
 
-/*
- * Green mode is explicitly disabled in V19. The GT911 goes from normal
- * operation directly into full Sleep at the destructive Deep-sleep boundary.
- */
-#define APP_PWR_GT911_GREEN_MODE_ENABLED            0
-#define APP_PWR_GT911_GREEN_IDLE_SECONDS            0U
+/* Apply with touch/UI suspended in either sleep entry path. Reuse a shorter
+ * existing idle interval. Calibration, thresholds and coordinate rates stay
+ * unchanged. Unsupported Goodix product/firmware IDs are never rewritten. */
+#define APP_PWR_GT911_GREEN_MODE_ENABLED            1
+#define APP_PWR_GT911_GREEN_IDLE_SECONDS            1U
+
+#if APP_PWR_GT911_GREEN_IDLE_SECONDS > 15U
+#error "GT911 automatic Green idle time must fit its 4-bit field"
+#endif
+#if APP_PWR_GT911_GREEN_MODE_ENABLED && APP_PWR_GT911_SLEEP_ENABLED
+#error "Choose automatic Green or full Sleep, not both"
+#endif
 
 /*
  * DS-RETENTION-1: ESP-IDF 5.5.4 initializes HP_SLEEP.hp_pad_hold_all=0.
@@ -550,8 +567,8 @@
 #endif
 
 /*
- * Normally full GT911 Sleep is refused when no host wake pin exists.
- * V19 explicitly opts into this only for deepest-software current measurement.
+ * Full GT911 Sleep is refused when no host wake pin exists unless a future
+ * explicitly selected measurement build opts out of touch recovery.
  */
 #if APP_PWR_GT911_SLEEP_ENABLED && \
     (APP_PWR_TOUCH_INT_GPIO < 0) && (APP_PWR_TOUCH_RESET_GPIO < 0) && \

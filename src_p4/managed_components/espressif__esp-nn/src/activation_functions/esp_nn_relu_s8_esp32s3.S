@@ -1,4 +1,4 @@
-// Copyright 2021-2022 Espressif Systems (Shanghai) PTE LTD
+// Copyright 2021-2026 Espressif Systems (Shanghai) PTE LTD
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,6 +25,28 @@
 
 esp_nn_relu6_s8_esp32s3:
     entry   a1,48                       #
+
+ // ee.vld.128/ee.vst.128 truncate the address to 16 bytes, so unaligned
+ // buffers were processed lane-shifted (issue #21). Consume bytes scalar
+ // until the data pointer is 16-byte aligned.
+    extui   a5,a2,0,4                   # a5 = data & 15
+    beqz.n  a5,.Lt_head_aligned
+    movi.n  a6,16
+    sub     a5,a6,a5                    # head count = 16 - (data & 15)
+    min     a5,a5,a3                    # clamp to size
+    sub     a3,a3,a5                    # size -= head count
+    movi.n  a6,0                        # zero (relu lower bound)
+    movi.n  a4,6                        # six (relu6 upper bound)
+    loopgtz a5,.Lt_head_done
+    l8ui    a8,a2,0
+    sext    a8,a8,7
+    max     a8,a6,a8
+    min     a8,a4,a8
+    s8i     a8,a2,0
+    addi.n  a2,a2,1
+.Lt_head_done:
+.Lt_head_aligned:
+
     mov.n   a9,a2                       # [0], data
     mov.n   a7,a3                       # [1], size
 

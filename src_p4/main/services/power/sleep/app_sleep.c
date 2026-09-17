@@ -1,4 +1,5 @@
 
+
 #include "services/power/sleep/app_sleep.h"
 
 #include <inttypes.h>
@@ -277,6 +278,37 @@ static esp_err_t enter_light_sleep_poll_slice_resilient(
     return ret;
 }
 
+/* Complete an early timer return with another real sleep entry. A task delay
+ * leaves the HP subsystem awake because automatic Light-sleep is disabled.
+ * Bound retries so an unhealthy timer cannot create an endless wake loop. */
+static esp_err_t sleep_until_touch_poll_deadline(
+    uint32_t timeout_ms, uint32_t *short_slice_count)
+{
+    const int64_t deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000LL;
+    uint32_t requested_ms = timeout_ms;
+    for (unsigned entry = 0; entry < APP_LIGHT_SLEEP_ENTRY_RETRY_COUNT; ++entry) {
+        esp_err_t ret = enter_light_sleep_poll_slice_resilient(requested_ms);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        if (light_sleep_get_last_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        const int64_t remaining_us = deadline_us - esp_timer_get_time();
+        if (remaining_us <= APP_LIGHT_SLEEP_EARLY_RETURN_TOLERANCE_US) {
+            return ESP_OK;
+        }
+        ++*short_slice_count;
+        if (*short_slice_count == 1U) {
+            ESP_LOGW(POWER_TAG, "event=LIGHT_SLEEP_SLICE_MATERIALLY_SHORT "
+                     "remaining_us=%" PRId64 " action=RESLEEP", remaining_us);
+        }
+        requested_ms = (uint32_t)((remaining_us + 999LL) / 1000LL);
+    }
+    ESP_LOGE(POWER_TAG, "event=LIGHT_SLEEP_TIMER_UNSTABLE action=RECOVER_ACTIVE");
+    return ESP_ERR_TIMEOUT;
+}
+
 /*
 * External board peripherals are not controlled by the ESP32-P4's internal
 * Light-sleep power-domain state machine. Quiesce peripherals that can be
@@ -320,6 +352,14 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
         &first_error);
 #endif
 
+    /* BSP touch/UI polling is paused by the hardware suspend callback.
+     * This optional tuning must never send GT911's full-Sleep command. */
+    const esp_err_t touch_power_ret = component_display_prepare_touch_for_sleep();
+    if (touch_power_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Touch low-power tuning unavailable (%s); "
+                 "retaining normal touch polling", esp_err_to_name(touch_power_ret));
+    }
+
     if (first_error == ESP_OK) {
 #if APP_LIGHT_SLEEP_DISABLE_AUDIO_AMP
         const char *audio_state = "CODEC_SUSPEND+AMP_OFF";
@@ -328,8 +368,13 @@ static esp_err_t suspend_aux_peripherals_for_light_sleep(void)
 #endif
         const char *sdcard_state = "PRESERVED";
 #if APP_LIGHT_SLEEP_ETHERNET_REDUCED_10M
+#if APP_LIGHT_SLEEP_ETHERNET_RESET_LOW
+        const char *ethernet_state = "RESET_LOW";
+#else
         const char *ethernet_state = component_ethernet_is_enabled()
-            ? "POWERED_10M" : "OFF_BY_POLICY";
+            ? (APP_LIGHT_SLEEP_ETHERNET_BMCR_POWER_DOWN
+               ? "BMCR_POWER_DOWN" : "POWERED_10M") : "OFF_BY_POLICY";
+#endif
 #else
         const char *ethernet_state = "UNCHANGED";
 #endif
@@ -354,14 +399,16 @@ static esp_err_t restore_aux_peripherals_after_light_sleep(void)
 {
     esp_err_t first_error = ESP_OK;
 
+    /* Also handles a partially applied polling clock policy on entry failure. */
+    record_first_light_sleep_error(cpu_power_end_light_sleep_polling(), &first_error);
+
     record_first_light_sleep_error(
         component_wifi_restore_after_light_sleep(),
         &first_error);
 
     /*
-     * Reverse only reversible Light-sleep operations. Ethernet restores its
-     * saved BMCR after the temporary powered 10 Mbps mode. Deep-sleep remains
-     * the hard RESET boundary.
+     * Restore Ethernet after Light-sleep. RESET_LOW policy performs a clean
+     * PHY reset/release; the comparison BMCR policy restores its snapshot.
      */
 #if APP_LIGHT_SLEEP_ETHERNET_REDUCED_10M
     record_first_light_sleep_error(
@@ -894,20 +941,9 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
         "Display transport / LVGL / MIPI-DSI teardown",
         esp_err_to_name(display_ret));
 
-    /*
-    * STEP 3 runs after the BSP has released its own touch handle and while
-    * the shared I2C bus is still alive. V20 retains V19's GT911
-    * real full-Sleep command instead of Green mode. On the stock board there
-    * is no P4-controlled GT911 INT/RESET wake pin, so this is a deepest-power
-    * measurement policy: after GPIO3 wakes the P4, board power must be cycled
-    * before touch is usable again.
-    */
-    ESP_LOGI(
-        TAG,
-        "STEP 3: GT911 FULL SLEEP + display side-channel cleanup "
-        "(Green mode disabled; stock wiring needs power-cycle to restore touch)");
-
-    sleep_power_profile_before("GT911 touch full sleep / display side channels");
+    /* Touch retains its self-waking low-power policy on stock wiring. */
+    ESP_LOGI(TAG, "STEP 3: touch low-power policy + display side-channel cleanup");
+    sleep_power_profile_before("GT911 low-power policy / display side channels");
     esp_err_t touch_ret = component_display_disable_for_deep_sleep();
 
     if (touch_ret == ESP_OK) {
@@ -920,7 +956,7 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
     }
 
     sleep_power_profile_after(
-        "GT911 touch full sleep / display side channels",
+        "GT911 low-power policy / display side channels",
         esp_err_to_name(touch_ret));
 
     ESP_LOGI(
@@ -1094,13 +1130,21 @@ static void inactivity_power_policy_task(void *arg)
     (void)arg;
 
     if (s_light_mode_enabled) {
+#if APP_LIGHT_SLEEP_ETHERNET_RESET_LOW
+        const char *ethernet_sleep_policy = "RESET_LOW";
+#else
+        const char *ethernet_sleep_policy = "BMCR_OR_10M";
+#endif
         ESP_LOGI(
             POWER_TAG,
-            "event=LIGHT_SLEEP_STATE_POLICY version=15 "
+            "event=LIGHT_SLEEP_STATE_POLICY version=%u fix=%s "
             "mode=UNIFIED_FULL_PANEL_SLEEP sdcard=PRESERVED gt911=POLLING "
-            "touch_poll_ms=%u backlight=" APP_LIGHT_SLEEP_BACKLIGHT_STATE " ethernet=FOLLOWS_SAVED_POLICY "
+            "touch_poll_ms=%u backlight=" APP_LIGHT_SLEEP_BACKLIGHT_STATE " ethernet=%s "
             "deep_stage_delay_ms=%u light_to_deep_residency_ms=%u",
+            (unsigned)APP_SLEEP_POWER_FIX_VERSION,
+            APP_SLEEP_POWER_FIX_TAG,
             (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS,
+            ethernet_sleep_policy,
             (unsigned)APP_SLEEP_POWER_PROFILE_STAGE_DELAY_MS,
             (unsigned)(s_deep_mode_enabled ? s_deep_sleep_delay_ms : 0U));
     }
@@ -1253,13 +1297,22 @@ static void inactivity_power_policy_task(void *arg)
             continue;
         }
 
+#if APP_LIGHT_SLEEP_ETHERNET_RESET_LOW
+        const char *suspended_ethernet_state = "RESET_LOW";
+#else
+        const char *suspended_ethernet_state =
+            component_ethernet_is_enabled()
+                ? (APP_LIGHT_SLEEP_ETHERNET_BMCR_POWER_DOWN
+                   ? "BMCR_POWER_DOWN" : "POWERED_10M")
+                : "OFF_BY_POLICY";
+#endif
         ESP_LOGI(
             POWER_TAG,
             "event=LIGHT_SLEEP_HARDWARE_SUSPENDED "
             "camera=OFF display=OFF backlight=" APP_LIGHT_SLEEP_BACKLIGHT_STATE " audio=OFF sdcard=PRESERVED "
             "ethernet=%s c6=%s "
             "gt911=POLLING ram=PRESERVED",
-            component_ethernet_is_enabled() ? "POWERED_10M" : "OFF_BY_POLICY",
+            suspended_ethernet_state,
             component_wifi_is_enabled() ? "RETAINED_80MHZ" : "OFF_BY_POLICY");
 
         /*
@@ -1390,6 +1443,20 @@ static void inactivity_power_policy_task(void *arg)
                 (unsigned)APP_LIGHT_SLEEP_TOUCH_POLL_MS);
         }
 
+        esp_err_t clock_ret = cpu_power_begin_light_sleep_polling();
+        if (clock_ret != ESP_OK) {
+            /* A supported optional clock reduction must not become a new
+             * prerequisite for the user's working touch wake. */
+            const esp_err_t rollback_ret = cpu_power_end_light_sleep_polling();
+            if (rollback_ret != ESP_OK) {
+                recover_light_sleep_without_reset(
+                    "POLL_CLOCK_RESTORE", rollback_ret, true, true);
+                continue;
+            }
+            ESP_LOGW(TAG, "Polling clock reduction unavailable (%s); "
+                     "using the saved CPU policy", esp_err_to_name(clock_ret));
+        }
+
         esp_err_t light_ret = ESP_OK;
         esp_sleep_wakeup_cause_t wake_cause =
             ESP_SLEEP_WAKEUP_UNDEFINED;
@@ -1420,68 +1487,10 @@ static void inactivity_power_policy_task(void *arg)
                 poll_slice_ms = remaining_ms;
             }
 
-            const int64_t slice_start_us = esp_timer_get_time();
-
-            light_ret = enter_light_sleep_poll_slice_resilient(poll_slice_ms);
+            light_ret = sleep_until_touch_poll_deadline(poll_slice_ms, &short_slice_count);
             wake_cause = light_sleep_get_last_wakeup_cause();
-
-            const int64_t slice_elapsed_us =
-                esp_timer_get_time() - slice_start_us;
-
             if (light_ret != ESP_OK) {
                 break;
-            }
-
-            if (wake_cause != ESP_SLEEP_WAKEUP_TIMER) {
-                ESP_LOGE(
-                    POWER_TAG,
-                    "event=LIGHT_SLEEP_FAILED phase=WAKE_CHECK "
-                    "wake_cause=%d action=RECOVER_ACTIVE_NO_RESET",
-                    (int)wake_cause);
-                light_ret = ESP_ERR_INVALID_STATE;
-                break;
-            }
-
-            /*
-            * The RTC can occasionally return materially before the requested
-            * timer slice. Pad that shortfall while the application remains
-            * suspended so the inactivity and touch qualification windows are
-            * based on real scheduler time rather than a tight polling loop.
-            */
-            const int64_t requested_us = (int64_t)poll_slice_ms * 1000LL;
-            const int64_t tolerance_us =
-                (int64_t)APP_LIGHT_SLEEP_EARLY_RETURN_TOLERANCE_US;
-
-            if (slice_elapsed_us + tolerance_us < requested_us) {
-                const int64_t shortfall_us = requested_us - slice_elapsed_us;
-                const uint32_t shortfall_ms =
-                    (uint32_t)((shortfall_us + 999LL) / 1000LL);
-
-                short_slice_count++;
-
-                if (short_slice_count == 1) {
-                    ESP_LOGW(
-                        POWER_TAG,
-                        "event=LIGHT_SLEEP_SLICE_MATERIALLY_SHORT "
-                        "requested_ms=%" PRIu32 " actual_us=%" PRId64
-                        " tolerance_us=%" PRId64 " action=PAD_WITH_DELAY",
-                        poll_slice_ms,
-                        slice_elapsed_us,
-                        tolerance_us);
-                    ESP_LOGW(
-                        TAG,
-                        "Light-sleep timer returned materially early: actual=%"
-                        PRId64 " us requested=%" PRIu32
-                        " ms. Padding the %" PRIu32
-                        " ms shortfall so the inactivity deadline follows wall time.",
-                        slice_elapsed_us,
-                        poll_slice_ms,
-                        shortfall_ms);
-                }
-
-                if (shortfall_ms > 0) {
-                    vTaskDelay(pdMS_TO_TICKS(shortfall_ms));
-                }
             }
 
             if (s_deep_mode_enabled) {
@@ -1554,6 +1563,12 @@ static void inactivity_power_policy_task(void *arg)
 
         const bool user_activity = touchscreen_touched;
 
+        /* Restore before camera/display resume AND before the Light->Deep
+         * transition. Saved full-power mode and AI boost policy survive. */
+        clock_ret = cpu_power_end_light_sleep_polling();
+        if (light_ret == ESP_OK && clock_ret != ESP_OK) {
+            light_ret = clock_ret;
+        }
         finish_light_sleep(light_ret, user_activity);
 
         if (light_ret != ESP_OK) {

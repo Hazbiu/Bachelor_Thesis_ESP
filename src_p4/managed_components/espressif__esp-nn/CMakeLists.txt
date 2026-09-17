@@ -22,6 +22,7 @@ if(CONFIG_IDF_TARGET_ESP32S3)
         "src/common/esp_nn_common_functions_esp32s3.S"
         "src/common/esp_nn_dot_s8_esp32s3.S"
         "src/common/esp_nn_multiply_by_quantized_mult_esp32s3.S"
+        "src/convolution/esp_nn_depthwise_conv_s8_kx1_esp32s3.S"
         "src/common/esp_nn_multiply_by_quantized_mult_ver1_esp32s3.S"
         "src/activation_functions/esp_nn_relu_s8_esp32s3.S"
         "src/activation_functions/esp_nn_hard_swish_s8_esp32s3.c"
@@ -54,25 +55,26 @@ if(CONFIG_IDF_TARGET_ESP32S3)
         "src/softmax/esp_nn_softmax_s8_esp32s3.c")
 endif()
 
-if(CONFIG_IDF_TARGET_ESP32P4)
-    set(p4_srcs
-        "src/common/esp_nn_mean_s8_esp32p4.c"
-        "src/common/esp_nn_multiply_by_quantized_mult_esp32p4.S"
-        "src/activation_functions/esp_nn_hard_swish_s8_esp32p4.c"
-        "src/activation_functions/esp_nn_relu_s8_esp32p4.c"
-        "src/basic_math/esp_nn_add_s8_esp32p4.c"
-        "src/basic_math/esp_nn_mul_s8_esp32p4.c"
-        "src/convolution/esp_nn_conv_esp32p4.c"
-        "src/convolution/esp_nn_depthwise_conv_esp32p4.c"
-        "src/fully_connected/esp_nn_fully_connected_s8_esp32p4.c"
-        "src/pooling/esp_nn_avg_pool_s8_esp32p4.c"
-        "src/pooling/esp_nn_max_pool_s8_esp32p4.c"
-        "src/softmax/esp_nn_softmax_s8_esp32p4.c")
+# ESP32-S31 shares the P4 PIE/SIMD ISA, so it reuses the ESP32-P4 kernels
+if(CONFIG_IDF_TARGET_ESP32P4 OR CONFIG_IDF_TARGET_ESP32S31)
+    set(riscv_pie_srcs
+        "src/common/esp_nn_mean_s8_riscv_pie.c"
+        "src/common/esp_nn_multiply_by_quantized_mult_riscv_pie.S"
+        "src/activation_functions/esp_nn_hard_swish_s8_riscv_pie.c"
+        "src/activation_functions/esp_nn_relu_s8_riscv_pie.c"
+        "src/basic_math/esp_nn_add_s8_riscv_pie.c"
+        "src/basic_math/esp_nn_mul_s8_riscv_pie.c"
+        "src/convolution/esp_nn_conv_riscv_pie.c"
+        "src/convolution/esp_nn_depthwise_conv_riscv_pie.c"
+        "src/fully_connected/esp_nn_fully_connected_s8_riscv_pie.c"
+        "src/pooling/esp_nn_avg_pool_s8_riscv_pie.c"
+        "src/pooling/esp_nn_max_pool_s8_riscv_pie.c"
+        "src/softmax/esp_nn_softmax_s8_riscv_pie.c")
 endif()
 
 idf_component_register(SRCS "${c_srcs}"
                             "${s3_srcs}"
-                            "${p4_srcs}"
+                            "${riscv_pie_srcs}"
                        INCLUDE_DIRS "include" "src/common")
 
 if(CONFIG_IDF_TARGET_ESP32S3)

@@ -152,8 +152,39 @@ extern void esp_nn_depthwise_conv_s16_mult1_esp32s3(const int16_t *input_data,
 
 extern void esp_nn_s8_to_s16_esp32s3(const int8_t *src, int16_t *dst, const int size);
 
+/* int8 depthwise for (K,1) filters on width-1 tensors, the shape a 1-D
+ * convolutional encoder produces. Measured on ESP32-S3 with a 16-layer speech
+ * encoder: 461-489 ms against 478-507 ms for the int16 path it replaces, and
+ * scratch for the affected layers falls from 99 kB to about 1 kB. */
+#ifndef ESP_NN_DW_S8_KX1
+#define ESP_NN_DW_S8_KX1 1
+#endif
+
+/* Everything past the sixth argument goes by pointer: see the note in
+ * esp_nn_depthwise_conv_s8_kx1_esp32s3.S about stack-argument placement. */
+typedef struct {
+    int8_t        *out;
+    const int32_t *out_mult;
+    const int32_t *out_shift;
+    int32_t        out_offset;
+    int32_t        activation_min;
+    int32_t        activation_max;
+} dw_kx1_params_t;
+
+/* Everything from the multiply-accumulate through the activation clamp;
+ * results come back as 16 int32 and the caller truncates them to int8. */
+extern void esp_nn_dw_s8_kx1_esp32s3(const int8_t *in, int tap_stride,
+                                     int n_taps, const int8_t *filter,
+                                     const int32_t *bias16,
+                                     const dw_kx1_params_t *p);
+
 extern void esp_nn_aligned_s8_to_s16_with_offset_esp32s3(const int8_t *src, int16_t *dst,
                                                          const int size, const int32_t offset);
+
+/* Unaligned-source variant. Reads up to 32 bytes past src + size and 16
+ * before src, so the row must be INTERIOR to a larger readable object. */
+extern void esp_nn_s8_to_s16_with_offset_row_esp32s3(const int8_t *src, int16_t *dst,
+                                                     const int size, const int32_t offset);
 
 static void esp_nn_depthwise_conv_s8_unrolled(const int8_t *input_data,
                                               const uint16_t input_wd,
@@ -363,12 +394,25 @@ int esp_nn_get_depthwise_conv_scratch_size_esp32s3(const data_dims_t *input_dims
     const uint16_t stride_wd = conv_params->stride.width;
     const uint16_t stride_ht = conv_params->stride.height;
 
+    /* MUST mirror the kernel's dispatch. Now that the (K,1) path declines
+     * nothing on alignment grounds, its requirement is knowable here:
+     * bias_adj (channels int32) + a K-row window + an aligned filter copy.
+     * For a 384x1x128 layer that is ~1.3 kB against 99 kB for the int16 path
+     * it replaces. */
+    if (ESP_NN_DW_S8_KX1 && (ch_mult == 1) && (input_wd == 1) &&
+            (filter_wd == 1) && (out_wd == 1) && (stride_wd == 1) &&
+            (pad_wd == 0) && (channels % 16 == 0)) {
+        return channels * 4 + 2 * filter_ht * channels + 64;
+    }
+
     int filter_size = filter_wd * filter_ht * channels * ch_mult;
     int pad_width = 0, pad_height = 0;
 
     if ((ch_mult == 1) && (channels % 8 == 0)) {
         if(filter_wd == 3 && filter_ht == 3) {
-            if (channels % 16 == 0) {
+            /* symmetric padding only: same test the kernel dispatch makes */
+            if ((channels % 16 == 0) &&
+                (((pad_wd == 1) && (pad_ht == 1)) || ((pad_wd == 0) && (pad_ht == 0)))) {
                 if (pad_wd || pad_ht) {
                     pad_width = pad_wd * 2;
                     pad_height = pad_ht * 2;
@@ -468,6 +512,97 @@ void esp_nn_set_depthwise_conv_scratch_buf_esp32s3(void *buf)
 
 #include "esp_nn_generic_opt.h"
 
+
+/**
+ * int8 depthwise for a (filter_ht, 1) filter on a width-1 tensor.
+ *
+ * Reads int8 in place instead of converting the tensor to int16. Padding is
+ * materialized only for the few edge output rows.
+ */
+static void esp_nn_depthwise_conv_s8_mult1_kx1(const int8_t *input,
+                                              const uint16_t input_ht,
+                                              const uint16_t channels,
+                                              const int32_t input_offset,
+                                              const uint16_t pad_ht,
+                                              const uint16_t stride_ht,
+                                              const int8_t *filter,
+                                              const uint16_t filter_ht,
+                                              const int32_t *bias,
+                                              int8_t *out_data,
+                                              const uint16_t out_ht,
+                                              const int32_t out_offset,
+                                              const int32_t *out_shift,
+                                              const int32_t *out_mult,
+                                              const int32_t activation_min,
+                                              const int32_t activation_max)
+{
+    /* offset folded into the bias once per layer: sum((q+off)*w) =
+     * sum(q*w) + off*sum(w), because ee.vmulas.s8.qacc has no offset operand.
+     * A padded tap must then hold -offset so its share of off*sum(w) cancels,
+     * which is what the edge buffer below is filled with. */
+    int32_t *bias_adj = (int32_t *)((((uintptr_t)scratch_buffer) + 15) & ~(uintptr_t)15);
+    int8_t *edge = (int8_t *)(bias_adj + channels);
+    int8_t *filt_aligned = edge + filter_ht * channels;
+    for (int ch = 0; ch < channels; ch++) {
+        int32_t sum_w = 0;
+        for (int k = 0; k < filter_ht; k++) {
+            sum_w += filter[k * channels + ch];
+        }
+        bias_adj[ch] = (bias ? bias[ch] : 0) + input_offset * sum_w;
+    }
+
+    /* The kernel loads the filter with ee.vld.128, so it must be aligned.
+     * TFLM hands out aligned tensors, so the copy (K*channels bytes, once
+     * per layer) only runs for misaligned callers. */
+    if (((uintptr_t)filter & 15) != 0) {
+        memcpy(filt_aligned, filter, (size_t)filter_ht * channels);
+        filter = filt_aligned;
+    }
+
+    /* A misaligned input is read through the window for every row, not just
+     * the edges. In TFLM the arena hands out aligned tensors so this stays
+     * cold, but it means the path never has to be declined. */
+    const bool input_unaligned = (((uintptr_t)input) & 15) != 0;
+
+    const int8_t pad_val = (int8_t)(-input_offset);
+    /* The kernel does everything through the clamp; only the truncation to
+     * int8 is left, one store per channel. Staging is hoisted: only the
+     * per-channel-group mult/shift pointers change between calls. */
+    int32_t acc[16] __attribute__((aligned(16)));
+    dw_kx1_params_t pp = {
+        .out = (int8_t *)acc,
+        .out_offset = out_offset,
+        .activation_min = activation_min,
+        .activation_max = activation_max,
+    };
+    for (int out_y = 0; out_y < out_ht; out_y++) {
+        const int base_y = out_y * stride_ht - pad_ht;
+        const int8_t *rows = input + base_y * channels;
+        int tap_stride = channels;
+        if (input_unaligned || base_y < 0 || base_y + filter_ht > input_ht) {
+            /* only the few edge rows need a materialized window */
+            for (int k = 0; k < filter_ht; k++) {
+                const int y = base_y + k;
+                if (y < 0 || y >= input_ht) {
+                    memset(edge + k * channels, pad_val, channels);
+                } else {
+                    memcpy(edge + k * channels, input + y * channels, channels);
+                }
+            }
+            rows = edge;
+        }
+        for (int ch = 0; ch < channels; ch += 16) {
+            pp.out_mult = out_mult + ch;
+            pp.out_shift = out_shift + ch;
+            esp_nn_dw_s8_kx1_esp32s3(rows + ch, tap_stride, filter_ht,
+                                     filter + ch, bias_adj + ch, &pp);
+            for (int i = 0; i < 16; i++) {
+                out_data[out_y * channels + ch + i] = (int8_t)acc[i];
+            }
+        }
+    }
+}
+
 void esp_nn_depthwise_conv_s8_esp32s3(const data_dims_t *input_dims,
                                       const int8_t *input_data,
                                       const data_dims_t *filter_dims,
@@ -504,6 +639,21 @@ void esp_nn_depthwise_conv_s8_esp32s3(const data_dims_t *input_dims,
     int16_t *input_data16 = scratch_buffer + filter_size + align_len;
     if (scratch_buffer == NULL) {
         printf("esp_nn_depthwise_conv error! scratch_buffer not set!\n");
+        return;
+    }
+
+    /* Width-1 tensor with a (K,1) filter: int8 in place. Alignment is
+     * arranged inside the helper, not demanded of the caller. */
+    if (ESP_NN_DW_S8_KX1 && (ch_mult == 1) && (input_wd == 1) &&
+            (filter_wd == 1) &&
+            (out_wd == 1) && (stride_wd == 1) && (pad_wd == 0) &&
+            (channels % 16 == 0)) {
+        esp_nn_depthwise_conv_s8_mult1_kx1(input_data, input_ht, channels,
+                                           input_offset, pad_ht, stride_ht,
+                                           filter_data, filter_ht, bias,
+                                           out_data, out_ht, out_offset,
+                                           out_shift, out_mult,
+                                           activation_min, activation_max);
         return;
     }
 
@@ -667,30 +817,46 @@ void esp_nn_depthwise_conv_s8_esp32s3(const data_dims_t *input_dims,
                                                         filter_wd, filter_ht, bias, out_data, out_wd, out_ht, out_offset, out_shift,
                                                         out_mult, activation_min, activation_max);
             } else {
-                /* Large input: process in row tiles to reduce cache pressure.
-                 * Convert only the input rows needed for each output row strip. */
+                /* Row tiles to limit cache pressure: convert only the rows
+                 * each output row needs, in SIMD. A row is reconverted per
+                 * output row; caching across rows needs a rotated window the
+                 * kernel does not accept. */
                 int16_t *tile_buf = input_data16; /* reuse scratch for tile */
+                const int row_len = input_wd * channels;
 
                 for (int out_row = 0; out_row < out_ht; out_row++) {
                     int in_row_start = out_row * stride_ht - pad_ht;
                     int in_row_end = in_row_start + filter_ht;
 
-                    /* Fill tile: pad rows that are outside input bounds */
                     int16_t *dst = tile_buf;
                     for (int r = in_row_start; r < in_row_end; r++) {
                         if (r < 0 || r >= input_ht) {
-                            /* Padding row: fill with input_offset */
-                            for (int i = 0; i < input_wd * channels; i++) {
-                                dst[i] = (int16_t)input_offset;
-                            }
+                            /* Padding row. Valid rows are stored as
+                             * (q + in_offset), so a real zero is 0 here. */
+                            memset(dst, 0, sizeof(int16_t) * (size_t)row_len);
                         } else {
-                            /* Valid row: convert s8 to s16 with offset */
-                            const int8_t *src = input_data + r * input_wd * channels;
-                            for (int i = 0; i < input_wd * channels; i++) {
-                                dst[i] = (int16_t)src[i] + (int16_t)input_offset;
+                            const int8_t *src = input_data + r * row_len;
+                            if ((((uintptr_t)src | (uintptr_t)dst) & 15) == 0) {
+                                esp_nn_aligned_s8_to_s16_with_offset_esp32s3(
+                                        src, dst, row_len, input_offset);
+                            } else if (r > 0 && r + 1 < input_ht &&
+                                       (((uintptr_t)dst & 15) == 0)) {
+                                /* row_len is the BYTE stride of an int8 row:
+                                 * at channels % 16 != 0 alternate rows start
+                                 * 8-byte aligned and the aligned converter's
+                                 * 128-bit loads need 16. Interior rows have
+                                 * neighbours covering the QUP window's
+                                 * over-read. Cases 21/22 cover this path. */
+                                esp_nn_s8_to_s16_with_offset_row_esp32s3(
+                                        src, dst, row_len, input_offset);
+                            } else {
+                                /* first/last row: no slack for the QUP window */
+                                for (int i = 0; i < row_len; i++) {
+                                    dst[i] = (int16_t)(src[i] + input_offset);
+                                }
                             }
                         }
-                        dst += input_wd * channels;
+                        dst += row_len;
                     }
 
                     /* Process one output row */

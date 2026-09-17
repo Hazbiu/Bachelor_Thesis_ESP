@@ -8,11 +8,16 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <malloc.h>
 #include <inttypes.h>
 
 #include <esp_nn.h>
 #include "test_utils.h"
+
+/* Scratch guard: sized to absorb an overflow, not just detect it */
+#define SCRATCH_GUARD_SZ    (16 * 1024)
+#define SCRATCH_GUARD_BYTE  0x5a
 
 void esp_nn_depthwise_conv_s8_test()
 {
@@ -32,8 +37,14 @@ void esp_nn_depthwise_conv_s8_test()
     uint16_t pad_wd, pad_ht, stride_wd, stride_ht;
 
     printf("\n######## Running %s ##########\n", __FUNCTION__);
-    // run for 17 iterations
-    for (int itr = 0; itr < 17; itr++) {
+    // run for 19 iterations
+    for (int itr = 0; itr < 27; itr++) {
+        bool no_bias = false;
+        /* Explicit output dims (0 = derive from pad/stride below). Needed for
+         * TFLite-style asymmetric "SAME" padding where only the leading
+         * (top/left) padding is passed in and trailing padding is implicit. */
+        uint16_t force_out_wd = 0, force_out_ht = 0;
+
         /* prepare data */
         switch (itr) {
         case 0: // (ch_mult 1, (channels % 16) = 0), filter (3,3), pad (0,0)
@@ -180,6 +191,132 @@ void esp_nn_depthwise_conv_s8_test()
             stride_wd = 2;
             stride_ht = 2;
             break;
+        case 17: // ch_mult 1, 3x3 padded, bias == NULL
+            input_wd = 8;
+            input_ht = 8;
+            filter_ht = 3;
+            filter_wd = 3;
+            ch_mult = 1;
+            channels = 16;
+            pad_wd = 1;
+            pad_ht = 1;
+            stride_wd = 1;
+            stride_ht = 1;
+            no_bias = true;
+            break;
+        case 18: // asymmetric "SAME" padding as TFLite generates it (3x3, stride 2)
+            input_wd = 49;
+            input_ht = 20;
+            filter_ht = 3;
+            filter_wd = 3;
+            ch_mult = 1;
+            channels = 32;
+            pad_wd = 1;
+            pad_ht = 0;
+            stride_wd = 2;
+            stride_ht = 2;
+            force_out_ht = 10; /* SAME: ceil(20/2); derived VALID value would be 9 */
+            break;
+        case 19: // time-major dw (3,1), SAME pad, big enough to tile the s16 path
+            input_wd = 1;
+            input_ht = 384;
+            filter_ht = 3;
+            filter_wd = 1;
+            ch_mult = 1;
+            channels = 128;
+            pad_wd = 0;
+            pad_ht = 1;
+            stride_wd = 1;
+            stride_ht = 1;
+            break;
+        case 23: // as 19, but with an ALIGNED filter: exercises the int8 (K,1) path
+            input_wd = 1;
+            input_ht = 384;
+            filter_ht = 3;
+            filter_wd = 1;
+            ch_mult = 1;
+            channels = 128;
+            pad_wd = 0;
+            pad_ht = 1;
+            stride_wd = 1;
+            stride_ht = 1;
+            break;
+        case 24: // as 20, aligned filter, stride 2
+            input_wd = 1;
+            input_ht = 192;
+            filter_ht = 3;
+            filter_wd = 1;
+            ch_mult = 1;
+            channels = 256;
+            pad_wd = 0;
+            pad_ht = 1;
+            stride_wd = 1;
+            stride_ht = 2;
+            break;
+        case 25: // aligned (5,1): the kernel loops over taps, so K != 3 must work
+            input_wd = 1;
+            input_ht = 256;
+            filter_ht = 5;
+            filter_wd = 1;
+            ch_mult = 1;
+            channels = 128;
+            pad_wd = 0;
+            pad_ht = 2;
+            stride_wd = 1;
+            stride_ht = 1;
+            break;
+        case 26: // aligned (3,1) with bias == NULL
+            input_wd = 1;
+            input_ht = 128;
+            filter_ht = 3;
+            filter_wd = 1;
+            ch_mult = 1;
+            channels = 256;
+            pad_wd = 0;
+            pad_ht = 1;
+            stride_wd = 1;
+            stride_ht = 1;
+            no_bias = true;
+            break;
+        case 20: // same, stride 2, 256 channels
+            input_wd = 1;
+            input_ht = 192;
+            filter_ht = 3;
+            filter_wd = 1;
+            ch_mult = 1;
+            channels = 256;
+            pad_wd = 0;
+            pad_ht = 1;
+            stride_wd = 1;
+            stride_ht = 2;
+            break;
+        case 21: // (3,1) with channels % 16 == 8. Cases 19/20 use 128 and
+                 // 256, both multiples of 16, which is why the misaligned row
+                 // start in the tiled converter went unnoticed: wrong results,
+                 // no fault. Fails without the alignment guard.
+            input_wd = 1;
+            input_ht = 384;
+            filter_ht = 3;
+            filter_wd = 1;
+            ch_mult = 1;
+            channels = 168;
+            pad_wd = 0;
+            pad_ht = 1;
+            stride_wd = 1;
+            stride_ht = 1;
+            break;
+        case 22: // same, larger 8-mod-16 count and stride 2
+            input_wd = 1;
+            input_ht = 192;
+            filter_ht = 3;
+            filter_wd = 1;
+            ch_mult = 1;
+            channels = 328;
+            pad_wd = 0;
+            pad_ht = 1;
+            stride_wd = 1;
+            stride_ht = 2;
+            break;
         default:
             input_wd = 6;
             input_ht = 6;
@@ -205,6 +342,12 @@ void esp_nn_depthwise_conv_s8_test()
         } else {
             out_ht = (input_ht + stride_ht - filter_ht) / stride_ht;
         }
+        if (force_out_wd) {
+            out_wd = force_out_wd;
+        }
+        if (force_out_ht) {
+            out_ht = force_out_ht;
+        }
 
         // if (itr == 9) {
             // expect the function to handle this gracefully
@@ -221,7 +364,7 @@ void esp_nn_depthwise_conv_s8_test()
         int8_t *input_orig = ESP_NN_TEST_ALLOC(in_size + 16);
         int8_t *out_c_orig = ESP_NN_TEST_ALLOC(out_size + 16);
         int8_t *out_opt_orig = ESP_NN_TEST_ALLOC(out_size + 16);
-        filter_data = ESP_NN_TEST_ALLOC(filter_size);
+        filter_data = ESP_NN_TEST_ALLOC(filter_size + 16);
         bias = ESP_NN_TEST_ALLOC(bias_size * 4);
 
         if (bias == NULL || input_orig == NULL || filter_data == NULL ||
@@ -233,6 +376,16 @@ void esp_nn_depthwise_conv_s8_test()
         input = (int8_t *) (((uint32_t) input_orig + 15) & ~15);
         out_data_c = (int8_t *) (((uint32_t) out_c_orig + 15) & ~15);
         out_data_opt = (int8_t *) (((uint32_t) out_opt_orig + 15) & ~15);
+
+        /* Most cases pass filter_data + 4 deliberately, to keep the kernels
+         * honest about unaligned filters. Cases 21-22 need an ALIGNED filter:
+         * the int8 (K,1) path reads the caller's tensors in place, so it only
+         * engages when input, output and filter are all 16-byte aligned, and
+         * without an aligned case it would never be exercised here at all. */
+        const bool want_aligned_filter = (itr >= 23) && (itr <= 26);
+        int8_t *filter_arg = want_aligned_filter
+                ? (int8_t *) ((((uint32_t) filter_data) + 15) & ~15)
+                : filter_data + 4;
 
         /* Generate input data */
         for (int i = 0; i < in_size; ++i) {
@@ -261,14 +414,17 @@ void esp_nn_depthwise_conv_s8_test()
 
         int scratch_buf_size = esp_nn_get_depthwise_conv_scratch_size(&input_dims, &filter_dims,
                                                                       &output_dims, &conv_params);
+        int8_t *scratch_guard = NULL;
         if (scratch_buf_size > 0) {
-            scratch_buf = ESP_NN_TEST_ALLOC(scratch_buf_size + 16);
+            scratch_buf = ESP_NN_TEST_ALLOC(scratch_buf_size + 16 + SCRATCH_GUARD_SZ);
             if (scratch_buf == NULL) {
                 printf(ANSI_COLOR_RED"[%d] scratch_buf alloc failed size %d\n"ANSI_COLOR_RESET,
                        itr, scratch_buf_size);
                 goto dc_s8_cleanup;
             }
             int align_sz = 16 - (((int32_t) scratch_buf) & 0xf);
+            scratch_guard = (int8_t *) scratch_buf + align_sz + scratch_buf_size;
+            memset(scratch_guard, SCRATCH_GUARD_BYTE, SCRATCH_GUARD_SZ);
             esp_nn_set_depthwise_conv_scratch_buf(scratch_buf + align_sz);
         }
 
@@ -276,18 +432,36 @@ void esp_nn_depthwise_conv_s8_test()
         profile_c_start();
 
         /* C function */
-        esp_nn_depthwise_conv_s8_ansi(&input_dims, input, &filter_dims, filter_data + 4,
-                                      bias + 1, &output_dims, out_data_c, &conv_params, &quant_data);
+        const int32_t *bias_arg = no_bias ? NULL : (bias + 1);
+
+        esp_nn_depthwise_conv_s8_ansi(&input_dims, input, &filter_dims, filter_arg,
+                                      bias_arg, &output_dims, out_data_c, &conv_params, &quant_data);
 
         total_c = profile_c_end();
         profile_opt_start();
 
         /* Optimized function */
-        esp_nn_depthwise_conv_s8(&input_dims, input, &filter_dims, filter_data + 4,
-                                 bias + 1, &output_dims, out_data_opt, &conv_params, &quant_data);
+        esp_nn_depthwise_conv_s8(&input_dims, input, &filter_dims, filter_arg,
+                                 bias_arg, &output_dims, out_data_opt, &conv_params, &quant_data);
 
         /* disable profiler */
         total_opt = profile_opt_end();
+
+        /* scan whole guard: extent, not just first hit */
+        int overflow = 0;
+        for (int i = 0; scratch_guard && i < SCRATCH_GUARD_SZ; i++) {
+            if (scratch_guard[i] != (int8_t) SCRATCH_GUARD_BYTE) {
+                overflow = i + 1;
+            }
+        }
+        if (overflow) {
+            printf(ANSI_COLOR_RED"[%3d] scratch overflow: wrote at least %d bytes past"
+                   " reported size %d [pad: (%d, %d), stride: (%d, %d), out: (%3d,%3d),"
+                   " ch %3d]\n"ANSI_COLOR_RESET,
+                   itr, overflow, scratch_buf_size, pad_wd, pad_ht,
+                   stride_wd, stride_ht, out_wd, out_ht, channels);
+            goto dc_s8_cleanup;
+        }
 
         bool ret = CHECK_EQUAL(out_data_c, out_data_opt, out_size);
         if (ret == false) {

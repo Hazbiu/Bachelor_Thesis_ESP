@@ -145,7 +145,7 @@ __NN_FORCE_INLINE__ int32_t esp_nn_multiply_by_quantized_mult(int32_t x, int32_t
     return esp_nn_div_by_power_of_two(result, right_shift);
 }
 
-#if CONFIG_IDF_TARGET_ESP32P4
+#if CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32S31
 /** PIE enable macro - call once before using any esp.* instructions */
 #define ESP_NN_PIE_ENABLE() do { \
     asm volatile ( \
@@ -175,7 +175,7 @@ __NN_FORCE_INLINE__ int32_t esp_nn_multiply_by_quantized_mult(int32_t x, int32_t
  * Interleaves mulh across two independent elements for pipeline fill.
  * Outputs r0, r1 as requantized int32 values (before offset/clamp).
  */
-#if CONFIG_IDF_TARGET_ESP32P4
+#if CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32S31
 #define ESP_NN_REQUANT_2X(x0, x1, m0, m1, s0, s1, r0, r1) do { \
     int32_t _ls0 = (s0) > 0 ? (s0) : 0; \
     int32_t _ls1 = (s1) > 0 ? (s1) : 0; \

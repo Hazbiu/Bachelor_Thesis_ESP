@@ -14,11 +14,12 @@
 #include <esp_nn_defs.h>
 #include <common_functions.h>
 
-int esp_nn_conv_s8_1x1_scratch_size(int out_channels)
+int esp_nn_conv_s8_1x1_scratch_size(int in_channels)
 {
-    /* Transpose buffer: 8 channels × 8 positions × 2 bytes = 128 bytes per chunk.
-     * Multiple chunks processed sequentially, so 128 is enough. */
-    return 128 + 64; /* transpose + alignment */
+    /* 128 bytes per input channel group, and all groups are held at once.
+     * Depends on in_channels, not out_channels. */
+    const int ch8 = in_channels / 8;
+    return ch8 * 128 + 64;      /* transpose + alignment */
 }
 
 /*

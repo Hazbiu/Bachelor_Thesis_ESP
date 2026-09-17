@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include <stdbool.h>
@@ -19,6 +20,12 @@ esp_err_t cpu_power_init(void);
  * and 100% active backlight. Explicit sleep modes remain independent. */
 esp_err_t cpu_power_set_active_optimization_enabled(bool enabled);
 bool cpu_power_active_optimization_is_enabled(void);
+
+/* Call only after camera/display/AI suspension. Restore on every exit before
+ * resuming hardware or entering Deep-sleep. Neither call changes saved settings.
+ * A failed begin must still be paired with end to restore a partial change. */
+esp_err_t cpu_power_begin_light_sleep_polling(void);
+esp_err_t cpu_power_end_light_sleep_polling(void);
 
 /*
  * Compatibility registration for the former display-off IDLE-SCAN policy.

@@ -4,7 +4,6 @@
 #include "dl_model_base.hpp"
 #include "dl_module_creator.hpp"
 #include "fbs_model.hpp"
-#include <format>
 
 static const char *TAG = "dl::Model";
 
@@ -172,12 +171,45 @@ esp_err_t Model::load(fbs::FbsModel *fbs_model)
         for (int j = 0; j < op_inputs.size(); j++) {
             bool is_parameter = m_fbs_model->is_parameter(op_inputs[j]);
             if (is_parameter || op_inputs[j].empty()) {
-                index =
-                    m_model_context->add_tensor(op_inputs[j], true, m_fbs_model->get_operation_parameter(node_name, j));
+                TensorBase *parameter = m_fbs_model->get_operation_parameter(node_name, j);
+                // An empty input name is an omitted optional input, but a named parameter that comes
+                // back missing, or without the exponents its data is quantized with, would leave the
+                // operator computing on a weight it cannot interpret.
+                if (is_parameter && (!parameter || !parameter->exponent.is_valid())) {
+                    ESP_LOGE(TAG, "Fail to load the parameter %s of node %s", op_inputs[j].c_str(), node_name.c_str());
+                    delete parameter;
+                    ret = ESP_FAIL;
+                    break;
+                }
+                index = m_model_context->add_tensor(op_inputs[j], true, parameter);
             } else {
                 index = m_model_context->add_tensor(op_inputs[j], false, nullptr);
             }
             module->m_inputs_index.push_back(index); // assign input index of module
+        }
+
+        // Add LUT inputs if the module is a LUT module
+        if (module->is_lut_module()) {
+            std::string lut_name;
+            if (m_fbs_model->get_operation_lut_name(node_name, lut_name) != ESP_OK) {
+                ESP_LOGE(TAG, "Can not find LUT initializer for operation %s", node_name.c_str());
+                ret = ESP_FAIL;
+                break;
+            }
+
+            int lut_index;
+            if (m_model_context->has_tensor(lut_name)) {
+                lut_index = m_model_context->get_tensor_index(lut_name);
+            } else {
+                TensorBase *table = m_fbs_model->get_parameter(lut_name);
+                if (!table) {
+                    ESP_LOGE(TAG, "Can not load LUT initializer %s", lut_name.c_str());
+                    ret = ESP_FAIL;
+                    break;
+                }
+                lut_index = m_model_context->add_tensor(lut_name, true, table);
+            }
+            module->m_inputs_index.push_back(lut_index);
         }
 
         for (int j = 0; j < op_outputs.size(); j++) {
@@ -498,7 +530,7 @@ esp_err_t Model::test()
                         return ESP_FAIL;
                     }
                 } else {
-                    if (!output->equal(output_gt, 2e-5, true)) {
+                    if (!output->equal(output_gt, 5e-5, true)) {
                         ESP_LOGE(TAG, "Test output %s does not match\n", output_name.c_str());
                         delete output_gt;
                         m_fbs_model->clear_map();
@@ -613,7 +645,9 @@ static void print_memory_info(const std::map<std::string, mem_info_t> &info)
     size_t col0_width = strlen("parameter_copy");
     std::string sub_prefix = " -- ";
     auto get_fmt_size = [&sub_prefix](size_t size, bool sub_header) -> std::string {
-        std::string fmt_size = std::format("{:<.2f}KB", size / 1024.f);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.2fKB", size / 1024.f);
+        std::string fmt_size(buf);
         if (sub_header) {
             fmt_size = (fmt_size == "0.00KB") ? "" : sub_prefix + fmt_size;
         } else if (fmt_size == "0.00KB") {
@@ -651,16 +685,20 @@ static void print_memory_info(const std::map<std::string, mem_info_t> &info)
     for (int i = 0; i < row_headers.size(); i++) {
         std::string row_header = row_headers[i];
         bool sub_header = (row_header == "parameter");
-        std::string row = std::format("| {:<{}} | {:<{}} | {:<{}} | {:<{}} |",
-                                      sub_header ? (sub_prefix + row_header) : row_header,
-                                      col0_width,
-                                      get_fmt_size(info.at(row_header).internal, sub_header),
-                                      col1_width,
-                                      get_fmt_size(info.at(row_header).psram, sub_header),
-                                      col2_width,
-                                      get_fmt_size(info.at(row_header).flash, sub_header),
-                                      col3_width);
-        ESP_LOGI(TAG, "%s", row.c_str());
+        std::string name = sub_header ? (sub_prefix + row_header) : row_header;
+        std::string internal = get_fmt_size(info.at(row_header).internal, sub_header);
+        std::string psram = get_fmt_size(info.at(row_header).psram, sub_header);
+        std::string flash = get_fmt_size(info.at(row_header).flash, sub_header);
+        ESP_LOGI(TAG,
+                 "| %-*s | %-*s | %-*s | %-*s |",
+                 col0_width,
+                 name.c_str(),
+                 col1_width,
+                 internal.c_str(),
+                 col2_width,
+                 psram.c_str(),
+                 col3_width,
+                 flash.c_str());
         if (i == row_headers.size() - 1 || row_headers[i + 1] != "parameter") {
             ESP_LOGI(TAG, "%s", sep.c_str());
         }

@@ -1,4 +1,5 @@
 
+
 #include "services/power/sleep/deep_sleep.h"
 
 #include <stdbool.h>
@@ -123,14 +124,24 @@ static int read_stable_deep_sleep_button_level(void)
     return level;
 }
 
+/* RAM state resets after real Deep-sleep. This service owns the GPIO wake
+ * source from successful arming until entry or the next arming attempt. */
+static bool s_deep_sleep_button_wakeup_armed;
+
 static esp_err_t arm_deep_sleep_button_change(int *baseline)
 {
     for (;;) {
-        /* Clear GPIO first: in IDF 5.5.4, ALL clears the trigger bitmap but
-         * the source-specific call also clears the saved GPIO mask. */
-        esp_err_t ret = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
-        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-            return ret;
+        esp_err_t ret;
+        /* Disable the specific source only after we successfully armed it.
+         * IDF logs an error before returning ESP_ERR_INVALID_STATE if GPIO
+         * wake is already disabled, which is normal on the first attempt.
+         * On retries, clear GPIO before ALL so its saved mask is reset too. */
+        if (s_deep_sleep_button_wakeup_armed) {
+            ret = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            s_deep_sleep_button_wakeup_armed = false;
         }
         ret = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
         if (ret != ESP_OK) {
@@ -144,6 +155,7 @@ static esp_err_t arm_deep_sleep_button_change(int *baseline)
         if (ret != ESP_OK) {
             return ret;
         }
+        s_deep_sleep_button_wakeup_armed = true;
         /* No manual output/hold is applied to the input. Re-sample if the
          * rocker moved while the wake API was being configured. */
         if (gpio_get_level(WAKE_BUTTON_GPIO) == level) {
@@ -309,7 +321,7 @@ static void audit_rails_before_deep_sleep(void)
 #if APP_PWR_GT911_SLEEP_ENABLED
         ESP_LOGI(AUDIT_TAG, "GT911 FULL SLEEP (no I2C ACK)             OK");
 #else
-        ESP_LOGI(AUDIT_TAG, "GT911 automatic Green/low-power mode      OK");
+        ESP_LOGI(AUDIT_TAG, "GT911 automatic Green configuration      OK");
 #endif
     } else {
         mismatches++;
@@ -357,7 +369,7 @@ static void audit_rails_before_deep_sleep(void)
             AUDIT_TAG,
             "Pre-entry checks passed; post-entry rail levels are NOT measured here: "
             "C6 mode GPIO LOW + CHIP_PU LOW, selected IP101GRI policy, "
-            "ES8311 suspend, NS4150B off, GT911 FULL SLEEP, microSD rail off "
+            "ES8311 suspend, NS4150B off, selected GT911 policy, microSD rail off "
             "and shared I2C high. Display shutdown requested "
             "LCD SLEEP_IN before the Light-sleep transport is destroyed.");
     } else {
@@ -986,7 +998,7 @@ void enter_deep_sleep_with_profile(deep_sleep_profile_t profile)
     for (;;) {
         ESP_ERROR_CHECK(arm_deep_sleep_button_change(&baseline));
         ESP_LOGI(TAG,
-                 "DS-EDGE-1: GPIO%d baseline=%s wake=%s "
+                 "DS-EDGE-2: GPIO%d baseline=%s wake=%s "
                  "pull=FIXED_UP timer=OFF other_wake_sources=OFF",
                  WAKE_BUTTON_GPIO,
                  baseline == 0 ? "LOW" : "HIGH",

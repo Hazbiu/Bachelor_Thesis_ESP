@@ -15,7 +15,7 @@ description: esp-dl is a lightweight and efficient neural network inference fram
 license: MIT
 repository: git://github.com/espressif/esp-dl.git
 repository_info:
-  commit_sha: 12c0616de145b704e1149c474b9a1e852e631d67
+  commit_sha: 5d9c36063dddbe98b5387828c831d6bbadb1370f
   path: esp-dl
 targets:
 - esp32
@@ -28,4 +28,4 @@ targets:
 - esp32s3
 - esp32s31
 url: https://github.com/espressif/esp-dl/tree/master/esp-dl
-version: 3.3.9
+version: 3.3.11

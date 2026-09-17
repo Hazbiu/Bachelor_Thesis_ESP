@@ -10,6 +10,7 @@
 #include "esp_timer.h"
 #include "esp_idf_version.h"
 #include "soc/soc_caps.h"
+#include "hal/adc_ll.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -34,7 +35,11 @@ static const char *TAG = "adc_button";
 #define ADC_BUTTON_WIDTH          SOC_ADC_DIGI_MAX_BITWIDTH
 #endif
 
+#ifdef SOC_ADC_CHANNEL_NUM
 #define ADC_BUTTON_CHANNEL_MAX(adc_unit)    SOC_ADC_CHANNEL_NUM(adc_unit)
+#else
+#define ADC_BUTTON_CHANNEL_MAX(adc_unit)    ADC_LL_CHANNEL_NUM(adc_unit)
+#endif
 #define ADC_BUTTON_ATTEN          DEFAULT_ADC_ATTEN
 
 #define ADC_BUTTON_MAX_CHANNEL  CONFIG_ADC_BUTTON_MAX_CHANNEL

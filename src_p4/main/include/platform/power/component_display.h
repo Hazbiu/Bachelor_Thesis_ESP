@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include "esp_err.h"
@@ -10,15 +11,9 @@ extern "C" {
  * Put the display side-channels into their lowest software-controlled state
  * before ESP32-P4 Deep-sleep.
  *
- * V19 uses the GT911 full-Sleep command (0x05 -> 0x8040), not automatic
- * Green mode. The controller is considered asleep only when it stops ACKing
- * on I2C while another device on the same bus (ES8311) still responds.
- *
- * IMPORTANT: on the stock ESP32-P4-NANO BSP, GT911 INT and RESET are not
- * connected to a P4 GPIO. Goodix requires INT-high or RESET to wake from full
- * Sleep. Therefore this V19 build is intended for deepest-software current
- * measurement: after GPIO3 wakes the P4, a complete board power-cycle is
- * required before the GT911/touch path can operate again.
+ * The default policy uses automatic GT911 Green mode. Full Sleep stays
+ * disabled because the stock board has no host INT/RESET wake connection.
+ * This preserves touch availability after the P4 wakes through GPIO3.
  *
  * Call ordering:
  *
@@ -45,11 +40,17 @@ esp_err_t component_display_panel_enter_full_sleep(void);
 
 esp_err_t component_display_disable_for_deep_sleep(void);
 
+/* Call with BSP touch/UI polling suspended and shared I2C still available.
+ * Shortens the verified GT911 automatic Green idle interval, at most once per
+ * configuration change. Normal scanning resumes on touch; full Sleep is not
+ * used. Unsupported controller layouts are left untouched. */
+esp_err_t component_display_prepare_touch_for_sleep(void);
+
 /**
  * Audit the selected GT911 low-power state while the shared I2C bus is still
- * available. In V19 this verifies full Sleep by confirming:
- *   - ES8311 still ACKs (bus healthy);
- *   - the sleeping GT911 does not ACK.
+ * available. The default policy verifies the automatic Green configuration;
+ * this does not measure whether the controller is currently scanning slowly.
+ * The optional full-Sleep build instead checks I2C non-response and bus health.
  */
 esp_err_t component_display_verify_deep_sleep_low_power(void);
 
@@ -62,7 +63,7 @@ esp_err_t component_display_restore_after_failed_sleep(void);
 
 /**
  * Wake GT911 when a future board revision provides a usable RESET or INT GPIO.
- * On stock wiring with V19 full-Sleep enabled this returns
+ * On stock wiring with full-Sleep enabled this returns
  * ESP_ERR_NOT_SUPPORTED and logs that a full board power-cycle is required.
  */
 esp_err_t component_display_wake_touch_after_reset(void);

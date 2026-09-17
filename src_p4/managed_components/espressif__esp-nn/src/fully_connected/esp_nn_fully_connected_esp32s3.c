@@ -15,6 +15,7 @@
 #include <string.h>
 #include <common_functions.h>
 #include <esp_nn_ansi_headers.h>
+#include "../common/esp_nn_filter_sum_esp32s3.h"
 
 /* Original s16 assembly (renamed) */
 extern void esp_nn_fc_s16_esp32s3(const int8_t *input_data,
@@ -73,6 +74,30 @@ extern int32_t esp_nn_dot_s8_unaligned_esp32s3(const int8_t *a,
  * input. Anything less has to go to the ansi reference. */
 #define FC_S16_INPUT_ALIGN  8
 
+/* When the dot path beats the fused s16 assembly. It has ~2x the assembly's
+ * throughput but pays a per-channel filter-sum the assembly folds into its MAC
+ * for free, plus a scalar tail once more per pass for a row_len that is not a
+ * whole number of vectors. Two regimes, both measured on S3 (row_len 16..1024,
+ * out_ch 1..256; out_ch never shifts the boundary):
+ *   input_offset != 0: correction pass runs, tail paid twice -> 192 + tail*16
+ *   input_offset == 0: no correction pass, tail paid once    ->  64 + tail*8
+ * The io==0 constants being exactly half-ish of the io!=0 ones matches the
+ * model: one filter pass and one tail instead of two of each.
+ *
+ * These constants are empirical, so they can drift with cache geometry: the
+ * two-pass case doubles the traffic once the filter outgrows dcache. Both paths
+ * are bit-exact, so a mis-tuned boundary costs a few percent, never
+ * correctness. Fusing the sum into the MAC pass would remove the second pass
+ * and the boundary with it. */
+static inline bool fc_dot_path_wins(uint16_t row_len, int32_t input_offset)
+{
+    const int tail = row_len & 15;
+    if (input_offset == 0) {
+        return row_len >= 64 + tail * 8;
+    }
+    return row_len >= 192 + tail * 16;
+}
+
 void esp_nn_fully_connected_s8_esp32s3(const int8_t *input_data,
                                        const int32_t input_offset,
                                        const uint16_t row_len,
@@ -94,7 +119,7 @@ void esp_nn_fully_connected_s8_esp32s3(const int8_t *input_data,
     const bool filter_rows_aligned = (((uintptr_t)filter_data & 15) == 0)
                                      && ((row_len & 15) == 0);
 
-    if (__builtin_expect(filter_offset != 0 || row_len < 16
+    if (__builtin_expect(filter_offset != 0 || !fc_dot_path_wins(row_len, input_offset)
         || (!input_aligned && !filter_rows_aligned), 0)) {
         if ((uintptr_t)input_data & (FC_S16_INPUT_ALIGN - 1)) {
             esp_nn_fully_connected_s8_ansi(input_data, input_offset, row_len,
@@ -120,11 +145,7 @@ void esp_nn_fully_connected_s8_esp32s3(const int8_t *input_data,
             const int8_t *f_ptr = filter_data + ch * row_len;
             int32_t corr = 0;
             if (input_offset != 0) {
-                int32_t filter_sum = 0;
-                for (int i = 0; i < row_len; i++) {
-                    filter_sum += f_ptr[i];
-                }
-                corr = filter_sum * input_offset;
+                corr = esp_nn_filter_sum_s8_esp32s3(f_ptr, row_len) * input_offset;
             }
             if (bias) {
                 corr += bias[ch];
@@ -176,7 +197,7 @@ void esp_nn_fully_connected_per_ch_s8_esp32s3(const int8_t *input_data,
     const bool filter_rows_aligned = (((uintptr_t)filter_data & 15) == 0)
                                      && ((row_len & 15) == 0);
 
-    if (__builtin_expect(filter_offset != 0 || row_len < 16
+    if (__builtin_expect(filter_offset != 0 || !fc_dot_path_wins(row_len, input_offset)
         || (!input_aligned && !filter_rows_aligned), 0)) {
         if ((uintptr_t)input_data & (FC_S16_INPUT_ALIGN - 1)) {
             esp_nn_fully_connected_per_ch_s8_ansi(input_data, input_offset, row_len,
@@ -201,11 +222,7 @@ void esp_nn_fully_connected_per_ch_s8_esp32s3(const int8_t *input_data,
             const int8_t *f_ptr = filter_data + ch * row_len;
             int32_t corr = 0;
             if (input_offset != 0) {
-                int32_t filter_sum = 0;
-                for (int i = 0; i < row_len; i++) {
-                    filter_sum += f_ptr[i];
-                }
-                corr = filter_sum * input_offset;
+                corr = esp_nn_filter_sum_s8_esp32s3(f_ptr, row_len) * input_offset;
             }
             if (bias) {
                 corr += bias[ch];

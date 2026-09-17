@@ -1,3 +1,4 @@
+
 #include "platform/power/cpu_power.h"
 
 #include <inttypes.h>
@@ -30,6 +31,8 @@ static SemaphoreHandle_t s_policy_mutex;
 static bool s_initialized;
 static bool s_init_attempted;
 static bool s_face_boost_active;
+static bool s_light_polling_policy_saved;
+static esp_pm_config_t s_before_light_polling;
 static cpu_power_state_t s_state = CPU_POWER_STATE_ACTIVE;
 
 static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -248,6 +251,11 @@ esp_err_t cpu_power_set_active_optimization_enabled(bool enabled)
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (s_light_polling_policy_saved) {
+        xSemaphoreGive(s_policy_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     portENTER_CRITICAL(&s_state_lock);
     const cpu_power_state_t previous = s_state;
     portEXIT_CRITICAL(&s_state_lock);
@@ -280,6 +288,81 @@ esp_err_t cpu_power_set_active_optimization_enabled(bool enabled)
     }
 
     /* The inference lock keeps its existing ownership across mode changes. */
+    xSemaphoreGive(s_policy_mutex);
+    return ret;
+}
+
+esp_err_t cpu_power_begin_light_sleep_polling(void)
+{
+    if (!s_initialized || s_policy_mutex == NULL ||
+        xSemaphoreTake(s_policy_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_light_polling_policy_saved) {
+        xSemaphoreGive(s_policy_mutex);
+        return ESP_OK;
+    }
+    /* The camera callback must have drained AI and released its boost first. */
+    if (s_face_boost_active) {
+        xSemaphoreGive(s_policy_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t ret = esp_pm_get_configuration(&s_before_light_polling);
+    if (ret == ESP_OK) {
+        const esp_pm_config_t polling = {
+            .max_freq_mhz = APP_LIGHT_SLEEP_POLL_CPU_FREQ_MHZ,
+            .min_freq_mhz = APP_LIGHT_SLEEP_POLL_CPU_FREQ_MHZ,
+            .light_sleep_enable = false,
+        };
+        /* Keep the snapshot until a successful restore, even on an error. */
+        s_light_polling_policy_saved = true;
+        ret = esp_pm_configure(&polling);
+        if (ret == ESP_OK) {
+            esp_pm_config_t applied = {0};
+            ret = esp_pm_get_configuration(&applied);
+            if (ret == ESP_OK &&
+                (applied.min_freq_mhz != polling.min_freq_mhz ||
+                 applied.max_freq_mhz != polling.max_freq_mhz ||
+                 applied.light_sleep_enable)) {
+                ret = ESP_ERR_INVALID_STATE;
+            }
+        }
+    }
+    xSemaphoreGive(s_policy_mutex);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "SLEEP-PWR: polling CPU policy=%d MHz; active policy saved",
+                 APP_LIGHT_SLEEP_POLL_CPU_FREQ_MHZ);
+    }
+    return ret;
+}
+
+esp_err_t cpu_power_end_light_sleep_polling(void)
+{
+    if (!s_initialized || s_policy_mutex == NULL ||
+        xSemaphoreTake(s_policy_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t ret = ESP_OK;
+    if (s_light_polling_policy_saved) {
+        ret = esp_pm_configure(&s_before_light_polling);
+        if (ret == ESP_OK) {
+            esp_pm_config_t applied = {0};
+            ret = esp_pm_get_configuration(&applied);
+            if (ret == ESP_OK &&
+                (applied.min_freq_mhz != s_before_light_polling.min_freq_mhz ||
+                 applied.max_freq_mhz != s_before_light_polling.max_freq_mhz ||
+                 applied.light_sleep_enable != s_before_light_polling.light_sleep_enable)) {
+                ret = ESP_ERR_INVALID_STATE;
+            }
+        }
+        if (ret == ESP_OK) {
+            s_light_polling_policy_saved = false;
+            ESP_LOGI(TAG, "SLEEP-PWR: saved CPU policy restored (%d..%d MHz)",
+                     s_before_light_polling.min_freq_mhz,
+                     s_before_light_polling.max_freq_mhz);
+        }
+    }
     xSemaphoreGive(s_policy_mutex);
     return ret;
 }
@@ -322,6 +405,11 @@ esp_err_t cpu_power_face_boost_begin(void)
 
     if (xSemaphoreTake(s_policy_mutex, portMAX_DELAY) != pdTRUE) {
         return ESP_FAIL;
+    }
+
+    if (s_light_polling_policy_saved) {
+        xSemaphoreGive(s_policy_mutex);
+        return ESP_ERR_INVALID_STATE;
     }
 
     bool already_active;
@@ -538,4 +626,3 @@ uint32_t cpu_power_get_hp_frequency_hz(void)
 
     return frequency_hz;
 }
-

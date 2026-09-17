@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include <stdbool.h>
@@ -19,24 +20,22 @@ esp_err_t component_ethernet_set_enabled(bool enabled);
 bool component_ethernet_is_enabled(void);
 
 /**
- * Reversible Light-sleep path: keep the IP101GRI powered and force its standard
- * MII Control Register to 10 Mbps instead of asserting hardware RESET.
+ * Reversible Light-sleep PHY shutdown (legacy function name retained).
+ * Default V3 policy holds IP101GRI RESET LOW for the full Light-sleep window
+ * and performs a clean reset/release on wake. This minimizes external-PHY
+ * current without changing touch or button wake sources.
  *
- * GPIO51 stays HIGH. The original BMCR value is saved before the transition and
- * restored on application wake. Ethernet is therefore reduced, not stopped.
- *
- * Ethernet traffic is NOT configured as a P4 wake source by this application;
- * touch/GPIO3 remain the application wake sources.
+ * APP_LIGHT_SLEEP_ETHERNET_RESET_LOW=0 keeps the BMCR comparison path; any
+ * failure there falls back to RESET LOW and remains nonfatal if that fallback
+ * succeeds. No Ethernet wake source is configured by this application.
  */
 esp_err_t component_ethernet_enter_light_sleep_reduced_mode(void);
 esp_err_t component_ethernet_restore_after_light_sleep(void);
 
 /**
- * Deep-sleep: identify IP101, set and read back BMCR.POWER_DOWN, then hold
- * RESET HIGH to preserve that register. Any failure attempts RESET LOW and
- * returns the error. APP_PWR_ETHERNET_DEEP_BMCR_POWER_DOWN=0 selects RESET LOW
- * directly for current comparison. Register readback is a pre-entry check;
- * actual sleep current and pad retention still require board measurement.
+ * Deep-sleep: default V3 policy keeps IP101GRI in RESET LOW. The optional
+ * APP_PWR_ETHERNET_DEEP_BMCR_POWER_DOWN=1 comparison path uses MDIO/BMCR and
+ * falls back to RESET LOW if verification fails.
  */
 esp_err_t component_ethernet_disable_for_deep_sleep(void);
 

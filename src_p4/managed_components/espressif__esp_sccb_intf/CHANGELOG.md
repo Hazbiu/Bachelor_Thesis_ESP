@@ -1,3 +1,8 @@
+## 0.0.9
+
+- Added information about the document system to README.md.
+- Added a variable length data read/write interface for registers with an address length of 16 bits.
+
 ## 0.0.8
 
 - Added support for transmitting / receiving `a16v32` register type

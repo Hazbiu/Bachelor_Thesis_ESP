@@ -7,6 +7,7 @@ choice NN_OPTIMIZATIONS
       Use ANSI-C versions for verification and debug purpose.
       Optimisations are automatically picked up for a chipset.
       For ESP32-S3, assembly optimisations are selected.
+      For ESP32-P4 and ESP32-S31, PIE (SIMD) optimisations are selected.
       For other platforms(viz., ESP32, ESP32-C3), generic optimisations are used.
 
 config NN_ANSI_C
@@ -18,6 +19,7 @@ config NN_OPTIMIZED
    help
       Optimisations are automatically picked up for a chipset.
       For ESP32-S3, assembly optimisations are selected.
+      For ESP32-P4 and ESP32-S31, PIE (SIMD) optimisations are selected.
       For other platforms(viz., ESP32, ESP32-C3), generic optimisations are used.
 endchoice
 

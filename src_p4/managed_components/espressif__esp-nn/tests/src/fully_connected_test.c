@@ -563,3 +563,174 @@ fc_align_cleanup:
         free(out_shift);
     }
 }
+
+/**
+ * Performance and bit-exactness guard for esp-nn#36.
+ *
+ * That regression was a scalar O(out_channels * row_len) filter-sum added to the
+ * FC fast path: every correctness test passed while the kernel got ~4x slower,
+ * so nothing caught it. A fixed cycles-per-MAC ceiling is a poor tripwire here
+ * because the achievable rate varies hugely with shape (a 20x128 layer costs
+ * ~6.8 cyc/MAC even on the fused assembly). Instead this measures both paths in
+ * the same run and asserts the dispatcher's choice is never materially worse
+ * than the fused s16 assembly, which is the pre-1.2.1 behaviour and therefore
+ * the floor we must not fall below.
+ *
+ * Correctness is checked first at every channel against the ansi reference: a
+ * faster kernel that is not bit-exact is worthless.
+ */
+#define FC_PERF_ITERS       10
+#define FC_PERF_TOLERANCE   1.10f   /* allow 10% for dispatch + measurement noise */
+
+/* The io==0 case guards the second dispatch regime: with no correction pass the
+ * dot path wins from row_len ~64, so at 128x256 the dispatcher must pick it and
+ * beat the assembly outright (measured 0.68x). Found in self-review: a rule
+ * gating on row_len alone sent io==0 mid rows to the assembly, a 1.5x loss.
+ * Only the S3 dispatcher has this choice to make; elsewhere the misaligned call
+ * is the same kernel with a load penalty, so only the generic bound applies. */
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+#define FC_PERF_IO0_MAX     0.90f
+#else
+#define FC_PERF_IO0_MAX     FC_PERF_TOLERANCE
+#endif
+
+void esp_nn_fully_connected_perf_test()
+{
+    /* Spans both regimes: row_len >= 256 takes the dot path, below it the
+     * dispatcher should fall back to the assembly. */
+    const struct { const char *name; uint16_t row_len; uint16_t out_ch;
+                   int32_t io; float max_ratio; } cases[] = {
+        { "256x256",     256, 256, -3, FC_PERF_TOLERANCE },
+        { "512x128",     512, 128, -3, FC_PERF_TOLERANCE },
+        { "320x320",     320, 320, -3, FC_PERF_TOLERANCE },
+        { "128x256",     128, 256, -3, FC_PERF_TOLERANCE },
+        { " 64x256",      64, 256, -3, FC_PERF_TOLERANCE },
+        { "128x256 io0", 128, 256,  0, FC_PERF_IO0_MAX },
+    };
+    const int32_t filter_offset = 0;    /* symmetric weights, as real int8 models */
+    const int32_t out_mult = 1355715584, out_shift = -6;
+    int failures = 0;
+
+    printf("\n######## Running %s ##########\n", __FUNCTION__);
+
+    for (int c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); c++) {
+        const uint16_t row_len = cases[c].row_len, out_ch = cases[c].out_ch;
+        const int32_t input_offset = cases[c].io;
+        /* +32 slack so the operands can be pushed off 16-byte alignment below */
+        int8_t *input_raw  = ESP_NN_TEST_ALLOC(row_len + 32);
+        int8_t *filter_raw = ESP_NN_TEST_ALLOC((size_t)row_len * out_ch + 32);
+        int8_t *in2_raw    = ESP_NN_TEST_ALLOC(row_len + 32);
+        int8_t *filt2_raw  = ESP_NN_TEST_ALLOC((size_t)row_len * out_ch + 32);
+        int8_t *out_raw    = ESP_NN_TEST_ALLOC(out_ch + 16);
+        int8_t *ref        = ESP_NN_TEST_ALLOC(out_ch);
+        int32_t *bias      = ESP_NN_TEST_ALLOC(out_ch * sizeof(int32_t));
+        if (!input_raw || !filter_raw || !in2_raw || !filt2_raw || !out_raw || !ref || !bias) {
+            printf(ANSI_COLOR_RED"%s: allocation failed\n"ANSI_COLOR_RESET, cases[c].name);
+            goto perf_cleanup;
+        }
+        /* 16-byte align, as TFLite Micro's arena does. Plain malloc is 4-byte
+         * aligned, which makes the dispatcher bail to the ansi reference and
+         * would measure the wrong path entirely (~10 cyc/MAC). */
+        int8_t *input  = (int8_t *)(((uintptr_t)input_raw  + 15) & ~(uintptr_t)15);
+        int8_t *filter = (int8_t *)(((uintptr_t)filter_raw + 15) & ~(uintptr_t)15);
+        int8_t *out    = (int8_t *)(((uintptr_t)out_raw    + 15) & ~(uintptr_t)15);
+
+        for (int i = 0; i < row_len; i++) {
+            input[i] = rand() % 256 - 128;
+        }
+        for (int i = 0; i < row_len * out_ch; i++) {
+            filter[i] = rand() % 256 - 128;
+        }
+        for (int i = 0; i < out_ch; i++) {
+            bias[i] = (rand() % 256 - 128) * 64;
+        }
+
+        /* --- bit-exactness at every channel --- */
+        esp_nn_fully_connected_s8(input, input_offset, row_len, filter, filter_offset,
+                                  bias, out, out_ch, 0, out_shift, out_mult, -128, 127);
+        esp_nn_fully_connected_s8_ansi(input, input_offset, row_len, filter, filter_offset,
+                                       bias, ref, out_ch, 0, out_shift, out_mult, -128, 127);
+        if (!CHECK_EQUAL(out, ref, out_ch)) {
+            int bad = 0, first = -1;
+            for (int i = 0; i < out_ch; i++) {
+                if (out[i] != ref[i]) {
+                    bad++;
+                    if (first < 0) {
+                        first = i;
+                    }
+                }
+            }
+            failures++;
+            printf(ANSI_COLOR_RED"[%s] NOT BIT-EXACT vs ansi: %d/%d channels, first ch %d "
+                   "(opt %d, ref %d)\n"ANSI_COLOR_RESET,
+                   cases[c].name, bad, out_ch, first, out[first], ref[first]);
+            goto perf_cleanup;
+        }
+
+        /* --- dispatcher's chosen path --- */
+        profile_opt_start();
+        for (int it = 0; it < FC_PERF_ITERS; it++) {
+            esp_nn_fully_connected_s8(input, input_offset, row_len, filter, filter_offset,
+                                      bias, out, out_ch, 0, out_shift, out_mult, -128, 127);
+        }
+        uint32_t chosen = profile_opt_end();
+
+        /* --- fused s16 assembly, the floor. Reached by defeating both fast-path
+         * alignment conditions; the input stays 8-aligned, which that assembly
+         * requires. --- */
+        /* Offset from the ALIGNED pointers, not the raw malloc'd ones: malloc is
+         * only 4-byte aligned, so raw+8 is not reliably 8-aligned and the call
+         * would fall through to the ansi reference instead of the assembly,
+         * making this comparison vacuous. Copy into separate buffers - deriving
+         * these from the same allocation and memcpy'ing would overlap, which is
+         * undefined behaviour. */
+        int8_t *in_off = (int8_t *)(((uintptr_t)in2_raw + 15) & ~(uintptr_t)15) + 8;
+        int8_t *filt_off = (int8_t *)(((uintptr_t)filt2_raw + 15) & ~(uintptr_t)15) + 8;
+        memcpy(in_off, input, row_len);
+        memcpy(filt_off, filter, (size_t)row_len * out_ch);
+        esp_nn_fully_connected_s8(in_off, input_offset, row_len, filt_off, filter_offset,
+                                  bias, out, out_ch, 0, out_shift, out_mult, -128, 127);
+        profile_opt_start();
+        for (int it = 0; it < FC_PERF_ITERS; it++) {
+            esp_nn_fully_connected_s8(in_off, input_offset, row_len, filt_off, filter_offset,
+                                      bias, out, out_ch, 0, out_shift, out_mult, -128, 127);
+        }
+        uint32_t asm_floor = profile_opt_end();
+
+        float ratio = (float)chosen / (float)asm_floor;
+        bool ok = ratio <= cases[c].max_ratio;
+        if (!ok) {
+            failures++;
+        }
+        printf("%s[%s] chosen %8"PRIu32" cyc, asm floor %8"PRIu32" cyc, %.2fx  %s%s\n",
+               ok ? ANSI_COLOR_GREEN : ANSI_COLOR_RED, cases[c].name,
+               chosen / FC_PERF_ITERS, asm_floor / FC_PERF_ITERS, ratio,
+               ok ? "ok" : "SLOWER THAN THE ASSEMBLY", ANSI_COLOR_RESET);
+
+    perf_cleanup:
+        if (input_raw) {
+            free(input_raw);
+        }
+        if (filter_raw) {
+            free(filter_raw);
+        }
+        if (in2_raw) {
+            free(in2_raw);
+        }
+        if (filt2_raw) {
+            free(filt2_raw);
+        }
+        if (out_raw) {
+            free(out_raw);
+        }
+        if (ref) {
+            free(ref);
+        }
+        if (bias) {
+            free(bias);
+        }
+    }
+    if (failures) {
+        printf(ANSI_COLOR_RED"%s: %d failure(s)\n"ANSI_COLOR_RESET, __FUNCTION__, failures);
+    }
+}

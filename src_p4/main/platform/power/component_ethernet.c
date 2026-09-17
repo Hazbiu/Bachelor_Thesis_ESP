@@ -1,3 +1,4 @@
+
 #include "platform/power/component_ethernet.h"
 
 #include <inttypes.h>
@@ -47,6 +48,7 @@ static const char *TAG = "component_ethernet";
 static bool s_reset_asserted;
 static bool s_user_enabled = true;
 static bool s_light_reduced_mode_active;
+static bool s_light_reset_low_active;
 static bool s_bmcr_snapshot_valid;
 static uint16_t s_bmcr_snapshot;
 static bool s_deep_bmcr_power_down;
@@ -135,18 +137,23 @@ static esp_err_t mdio_prepare_bus(void)
 
 static void mdio_release_bus(void)
 {
+    /* Keep MDC quiet; MDIO is externally pulled HIGH. A floating input buffer
+     * is unnecessary between management transactions, including Light-sleep. */
     gpio_config_t cfg = {
-        .pin_bit_mask =
-            (1ULL << ETHERNET_MDC_GPIO) |
-            (1ULL << ETHERNET_MDIO_GPIO),
-        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = 1ULL << ETHERNET_MDC_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
+    (void)gpio_set_level(ETHERNET_MDC_GPIO, 0);
     (void)gpio_config(&cfg);
+    (void)gpio_sleep_sel_dis(ETHERNET_MDC_GPIO);
+    cfg.pin_bit_mask = 1ULL << ETHERNET_MDIO_GPIO;
+    cfg.mode = GPIO_MODE_DISABLE;
+    (void)gpio_config(&cfg);
+    (void)gpio_sleep_sel_dis(ETHERNET_MDIO_GPIO);
 }
-
 
 static void mdio_write_bit(int bit)
 {
@@ -229,9 +236,13 @@ static esp_err_t mdio_read_register(uint8_t reg, uint16_t *value_out)
     mdio_write_bits((uint32_t)ETHERNET_PHY_ADDRESS & 0x1FU, 5U);
     mdio_write_bits((uint32_t)reg & 0x1FU, 5U);
 
-    /* Read turnaround is Z0: release MDIO for both turnaround clocks. */
+    /*
+     * The previous bit-bang reader consumed two samples after releasing MDIO.
+     * On this board that eats D15 and shifts every 16-bit register left by one
+     * (observed: 0x0243 -> 0x0487, 0x0c54 -> 0x18a9). Sample the PHY ACK once,
+     * then read the 16 data bits.
+     */
     gpio_set_direction(ETHERNET_MDIO_GPIO, GPIO_MODE_INPUT);
-    (void)mdio_read_bit();
     const int turnaround = mdio_read_bit();
     if (turnaround != 0) {
         mdio_release_bus();
@@ -414,7 +425,32 @@ static esp_err_t deep_reset_fallback(esp_err_t cause)
 }
 
 
-#if APP_PWR_ETHERNET_DEEP_BMCR_POWER_DOWN
+static esp_err_t enter_light_reset_state(esp_err_t cause, const char *reason)
+{
+    s_light_reduced_mode_active = false;
+    s_bmcr_snapshot_valid = false;
+
+    const esp_err_t ret = enter_deep_reset_state();
+    if (ret == ESP_OK) {
+        s_light_reset_low_active = true;
+        ESP_LOGW(
+            TAG,
+            "SLEEP-FIX-V3: Light Ethernet RESET_LOW reason=%s cause=%s",
+            reason != NULL ? reason : "policy",
+            esp_err_to_name(cause));
+        return ESP_OK;
+    }
+
+    s_light_reset_low_active = false;
+    ESP_LOGE(
+        TAG,
+        "SLEEP-FIX-V3: RESET_LOW fallback failed after %s: %s",
+        esp_err_to_name(cause),
+        esp_err_to_name(ret));
+    return ret;
+}
+
+
 static esp_err_t identify_ip101(void)
 {
     uint16_t id1 = 0, id2 = 0;
@@ -433,186 +469,195 @@ static esp_err_t identify_ip101(void)
     return oui == IP101G_OUI && model == IP101G_MODEL
         ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
 }
-#endif
 
 
 esp_err_t component_ethernet_enter_light_sleep_reduced_mode(void)
 {
     if (!s_user_enabled) {
-        ESP_LOGI(
-            TAG,
-            "IP101GRI Light-sleep follows saved Ethernet OFF policy: "
-            "RESET GPIO%d LOW and held",
-            ETHERNET_PHY_RESET_GPIO);
-
-        return configure_phy_reset_level(
-            ETHERNET_PHY_RESET_ACTIVE,
-            true,
-            true);
+        s_light_reset_low_active = false;
+        return enter_deep_reset_state();
+    }
+    if (s_light_reduced_mode_active || s_light_reset_low_active) {
+        return ESP_OK;
+    }
+    if (s_bmcr_snapshot_valid) {
+        return ESP_ERR_INVALID_STATE;
     }
 
+#if APP_LIGHT_SLEEP_ETHERNET_RESET_LOW
     /*
-     * Keep the PHY powered and out of reset. The reduced Light-sleep policy
-     * changes only the standard MII Control Register.
+     * Ethernet is not a wake source. Hardware RESET is reversible and keeps
+     * the PHY off for the complete timer-sliced touchscreen Light-sleep window.
      */
+    return enter_light_reset_state(ESP_OK, "configured");
+#else
     esp_err_t ret = configure_phy_reset_level(
-        ETHERNET_PHY_RESET_RELEASED,
-        false,
-        true);
+        ETHERNET_PHY_RESET_RELEASED, true, true);
     if (ret != ESP_OK) {
-        return ret;
+        return enter_light_reset_state(ret, "reset_release");
+    }
+
+    ret = identify_ip101();
+    if (ret != ESP_OK) {
+        return enter_light_reset_state(ret, "phy_id");
     }
 
     uint16_t bmcr = 0;
     ret = mdio_read_register(IP101G_REG_BMCR, &bmcr);
     if (ret != ESP_OK) {
-        return ret;
+        return enter_light_reset_state(ret, "bmcr_read");
     }
-
+    if (bmcr == 0xFFFFU || (bmcr & IP101G_BMCR_RESET) != 0U) {
+        return enter_light_reset_state(ESP_ERR_INVALID_RESPONSE, "bmcr_invalid");
+    }
     s_bmcr_snapshot = bmcr;
     s_bmcr_snapshot_valid = true;
 
-    /*
-     * Force 10 Mbps immediately:
-     * SPEED_100=0, AUTO_NEGOTIATE=0, POWER_DOWN=0, ISOLATE=0.
-     * Keep the currently reflected duplex bit.
-     */
-    uint16_t reduced_bmcr = bmcr;
-    reduced_bmcr &= (uint16_t)~IP101G_BMCR_RESET;
-    reduced_bmcr &= (uint16_t)~IP101G_BMCR_LOOPBACK;
-    reduced_bmcr &= (uint16_t)~IP101G_BMCR_SPEED_100;
-    reduced_bmcr &= (uint16_t)~IP101G_BMCR_AUTONEG_ENABLE;
-    reduced_bmcr &= (uint16_t)~IP101G_BMCR_POWER_DOWN;
-    reduced_bmcr &= (uint16_t)~IP101G_BMCR_ISOLATE;
-    reduced_bmcr &= (uint16_t)~IP101G_BMCR_RESTART_AUTONEG;
-    reduced_bmcr &= (uint16_t)~IP101G_BMCR_COLLISION_TEST;
+#if APP_LIGHT_SLEEP_ETHERNET_BMCR_POWER_DOWN
+    const uint16_t requested = (bmcr | IP101G_BMCR_POWER_DOWN) &
+        (uint16_t)~(IP101G_BMCR_RESET | IP101G_BMCR_RESTART_AUTONEG);
+#else
+    const uint16_t requested = bmcr & (uint16_t)~(
+        IP101G_BMCR_RESET | IP101G_BMCR_LOOPBACK | IP101G_BMCR_SPEED_100 |
+        IP101G_BMCR_AUTONEG_ENABLE | IP101G_BMCR_POWER_DOWN |
+        IP101G_BMCR_ISOLATE | IP101G_BMCR_RESTART_AUTONEG |
+        IP101G_BMCR_COLLISION_TEST);
+#endif
 
-    ret = mdio_write_register(IP101G_REG_BMCR, reduced_bmcr);
+    ret = mdio_write_register(IP101G_REG_BMCR, requested);
     if (ret != ESP_OK) {
-        s_bmcr_snapshot_valid = false;
-        return ret;
+        return enter_light_reset_state(ret, "bmcr_write");
     }
 
-    vTaskDelay(pdMS_TO_TICKS(IP101G_REDUCED_SETTLE_MS));
-
+    vTaskDelay(pdMS_TO_TICKS(IP101G_REDUCED_SETTLE_MS) + 1);
     uint16_t readback = 0;
     ret = mdio_read_register(IP101G_REG_BMCR, &readback);
     if (ret != ESP_OK) {
-        return ret;
+        return enter_light_reset_state(ret, "bmcr_verify_read");
     }
 
-    const uint16_t forbidden =
-        IP101G_BMCR_SPEED_100 |
-        IP101G_BMCR_AUTONEG_ENABLE |
-        IP101G_BMCR_POWER_DOWN |
-        IP101G_BMCR_ISOLATE;
+    const uint16_t verify_mask = (uint16_t)~IP101G_BMCR_RESTART_AUTONEG;
+    if ((readback & verify_mask) != (requested & verify_mask)) {
+        ESP_LOGE(TAG, "Light PHY verify failed: requested=0x%04x actual=0x%04x",
+                 requested, readback);
+        return enter_light_reset_state(ESP_ERR_INVALID_STATE, "bmcr_verify");
+    }
 
-    if ((readback & forbidden) != 0U) {
-        ESP_LOGE(
-            TAG,
-            "IP101GRI reduced-mode verification failed: "
-            "BMCR before=0x%04x requested=0x%04x readback=0x%04x",
-            bmcr,
-            reduced_bmcr,
-            readback);
-
-        (void)mdio_write_register(IP101G_REG_BMCR, s_bmcr_snapshot);
-        s_bmcr_snapshot_valid = false;
-        return ESP_ERR_INVALID_STATE;
+    ret = hold_deep_mdio_idle();
+    if (ret != ESP_OK) {
+        return enter_light_reset_state(ret, "mdio_idle");
     }
 
     s_light_reduced_mode_active = true;
-
-    ESP_LOGI(
-        TAG,
-        "IP101GRI Light-sleep reduced mode ACTIVE: "
-        "RESET=HIGH powered=YES speed=10Mbps autoneg=OFF duplex=%s "
-        "BMCR_before=0x%04x BMCR_now=0x%04x",
-        (readback & IP101G_BMCR_DUPLEX_FULL) ? "FULL" : "HALF",
-        bmcr,
-        readback);
-
+    ESP_LOGI(TAG, "SLEEP-PWR: Light PHY=%s RESET=HIGH (no reset) "
+             "BMCR_saved=0x%04x BMCR_sleep=0x%04x",
+             APP_LIGHT_SLEEP_ETHERNET_BMCR_POWER_DOWN
+                 ? "BMCR_POWER_DOWN" : "POWERED_10M", bmcr, readback);
     return ESP_OK;
+#endif
 }
-
 
 esp_err_t component_ethernet_restore_after_light_sleep(void)
 {
     if (!s_user_enabled) {
         s_light_reduced_mode_active = false;
+        s_light_reset_low_active = false;
+        s_bmcr_snapshot_valid = false;
+        return enter_deep_reset_state();
+    }
+
+    if (s_light_reset_low_active) {
+        s_light_reset_low_active = false;
+        s_light_reduced_mode_active = false;
         s_bmcr_snapshot_valid = false;
 
-        return configure_phy_reset_level(
-            ETHERNET_PHY_RESET_ACTIVE,
-            true,
-            true);
+        esp_err_t reset_ret = reset_phy_to_defaults();
+        if (reset_ret != ESP_OK) {
+            return reset_ret;
+        }
+        const esp_err_t bus_ret = gpio_hold_dis(ETHERNET_MDC_GPIO);
+        if (bus_ret != ESP_OK && bus_ret != ESP_ERR_NOT_SUPPORTED) {
+            return bus_ret;
+        }
+        mdio_release_bus();
+        ESP_LOGI(TAG, "SLEEP-FIX-V3: Ethernet restored from RESET_LOW");
+        return ESP_OK;
     }
 
-    esp_err_t first_error = ESP_OK;
-
-    if (s_light_reduced_mode_active && s_bmcr_snapshot_valid) {
-        uint16_t restore_bmcr = s_bmcr_snapshot;
-
-        /*
-         * A forced-speed interval breaks the previous negotiated link. If the
-         * saved policy used auto-negotiation, restart it explicitly on wake.
-         */
-        if ((restore_bmcr & IP101G_BMCR_AUTONEG_ENABLE) != 0U) {
-            restore_bmcr |= IP101G_BMCR_RESTART_AUTONEG;
+    esp_err_t ret = configure_phy_reset_level(
+        ETHERNET_PHY_RESET_RELEASED, false, true);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    /* Restore even when entry failed after a write but before verification. */
+    if (s_bmcr_snapshot_valid) {
+        uint16_t requested = s_bmcr_snapshot & (uint16_t)~IP101G_BMCR_RESET;
+        if ((requested & IP101G_BMCR_AUTONEG_ENABLE) != 0U &&
+            (requested & IP101G_BMCR_POWER_DOWN) == 0U) {
+            requested |= IP101G_BMCR_RESTART_AUTONEG;
         }
-
-        esp_err_t ret =
-            mdio_write_register(IP101G_REG_BMCR, restore_bmcr);
-
+        ret = mdio_write_register(IP101G_REG_BMCR, requested);
         if (ret != ESP_OK) {
-            first_error = ret;
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(IP101G_RESTORE_SETTLE_MS));
-
-            uint16_t readback = 0;
-            ret = mdio_read_register(IP101G_REG_BMCR, &readback);
-
-            if (ret != ESP_OK) {
-                first_error = ret;
-            } else {
-                ESP_LOGI(
-                    TAG,
-                    "IP101GRI BMCR restored after Light-sleep: "
-                    "saved=0x%04x readback=0x%04x autoneg=%s",
-                    s_bmcr_snapshot,
-                    readback,
-                    (s_bmcr_snapshot & IP101G_BMCR_AUTONEG_ENABLE)
-                        ? "ON_RESTARTED"
-                        : "OFF");
-            }
+            return ret;
         }
+        vTaskDelay(pdMS_TO_TICKS(IP101G_RESTORE_SETTLE_MS) + 1);
+        uint16_t readback = 0;
+        ret = mdio_read_register(IP101G_REG_BMCR, &readback);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        const uint16_t verify_mask = (uint16_t)~IP101G_BMCR_RESTART_AUTONEG;
+        if ((readback & verify_mask) != (requested & verify_mask)) {
+            ESP_LOGE(TAG, "Light PHY restore failed: expected=0x%04x actual=0x%04x",
+                     requested, readback);
+            return ESP_ERR_INVALID_STATE;
+        }
+        /* Retain the snapshot on every failed restore so recovery can retry. */
+        s_bmcr_snapshot_valid = false;
     }
-
-    esp_err_t reset_ret = configure_phy_reset_level(
-        ETHERNET_PHY_RESET_RELEASED,
-        false,
-        true);
-
-    if (reset_ret != ESP_OK && first_error == ESP_OK) {
-        first_error = reset_ret;
-    }
-
     s_light_reduced_mode_active = false;
-    s_bmcr_snapshot_valid = false;
-
-    if (first_error == ESP_OK) {
-        ESP_LOGI(
-            TAG,
-            "IP101GRI restored from Light-sleep reduced mode: "
-            "RESET=HIGH normal PHY policy restored");
+    s_light_reset_low_active = false;
+    ret = gpio_hold_dis(ETHERNET_MDC_GPIO);
+    if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
+        return ret;
     }
-
-    return first_error;
+    mdio_release_bus();
+    ESP_LOGI(TAG, "SLEEP-PWR: saved Ethernet policy restored; RESET stayed HIGH");
+    return ESP_OK;
 }
-
 
 esp_err_t component_ethernet_disable_for_deep_sleep(void)
 {
+    /* OFF stays OFF. Do not reboot a user-disabled PHY just to put it back
+     * to sleep, which also used to replace RESET_LOW with RESET_HIGH. */
+    if (!s_user_enabled || s_light_reset_low_active) {
+        s_light_reduced_mode_active = false;
+        s_light_reset_low_active = false;
+        s_bmcr_snapshot_valid = false;
+        return enter_deep_reset_state();
+    }
+#if APP_LIGHT_SLEEP_ETHERNET_BMCR_POWER_DOWN && APP_PWR_ETHERNET_DEEP_BMCR_POWER_DOWN
+    if (s_light_reduced_mode_active) {
+        uint16_t bmcr = 0;
+        esp_err_t ret = mdio_read_register(IP101G_REG_BMCR, &bmcr);
+        if (ret == ESP_OK && bmcr != 0xFFFFU &&
+            (bmcr & (IP101G_BMCR_POWER_DOWN | IP101G_BMCR_RESET)) ==
+                IP101G_BMCR_POWER_DOWN) {
+            ret = configure_phy_reset_level(ETHERNET_PHY_RESET_RELEASED, true, true);
+            if (ret == ESP_OK) {
+                ret = hold_deep_mdio_idle();
+            }
+            if (ret == ESP_OK) {
+                s_light_reduced_mode_active = false;
+                s_bmcr_snapshot_valid = false;
+                s_deep_bmcr_power_down = true;
+                ESP_LOGI(TAG, "SLEEP-PWR: Light->Deep retains PHY POWER_DOWN; no reset");
+                return ESP_OK;
+            }
+        }
+        /* Reuse failed: take the existing verified Deep-sleep shutdown path. */
+    }
+#endif
     s_light_reduced_mode_active = false;
     s_bmcr_snapshot_valid = false;
 
@@ -743,6 +788,7 @@ esp_err_t component_ethernet_set_enabled(bool enabled)
     const bool previous_policy = s_user_enabled;
     s_user_enabled = enabled;
     s_light_reduced_mode_active = false;
+    s_light_reset_low_active = false;
     s_bmcr_snapshot_valid = false;
 
     /* Deep-sleep restarts the P4, but not the externally powered PHY.

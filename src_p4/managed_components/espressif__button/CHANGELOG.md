@@ -1,5 +1,11 @@
 # ChangeLog
 
+## v4.2.1 - 2026-08-31
+
+### Fix:
+
+* Added compatibility for targets without the `SOC_ADC_CHANNEL_NUM` macro.
+
 ## v4.2.0 - 2026-06-08
 
 ### Feature:

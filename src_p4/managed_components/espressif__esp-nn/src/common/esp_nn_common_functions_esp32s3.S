@@ -253,3 +253,81 @@ esp_nn_s8_to_s16_esp32s3:	# 0x40b
 	j	.Lt_3_2050                  	# [2]
 
 	.size	esp_nn_s8_to_s16_esp32s3, . - esp_nn_s8_to_s16_esp32s3
+// ============================================================
+// esp_nn_s8_to_s16_with_offset_row_esp32s3
+//
+// s8 -> s16 with additive offset; SOURCE MAY BE UNALIGNED.
+// Aligned 128-bit loads slide a two-register window over the row and
+// ee.src.q funnel-shifts the unaligned 16 bytes out by SAR_BYTE.
+//
+// Contract: reads up to 32 bytes past src + size and up to 16 before
+// src (aligned-down window + lookahead), so src must be an INTERIOR
+// row of a larger readable object. The tiled depthwise path
+// guarantees this by sending only rows with neighbours on both sides.
+//
+// a2: src (any alignment)   a3: dst (16-byte aligned)
+// a4: size (>= 48)          a5: offset
+// ============================================================
+    .text
+    .type   esp_nn_s8_to_s16_with_offset_row_esp32s3, @function
+    .align  4
+    .global esp_nn_s8_to_s16_with_offset_row_esp32s3
+
+esp_nn_s8_to_s16_with_offset_row_esp32s3:
+    entry   a1, 48
+    s32i.n  a5, a1, 12
+    addi.n  a7, a1, 12
+    ee.zero.q       q5
+    ee.vldbc.16     q4, a7              // offset in every s16 lane
+
+    mov.n   a10, a2                     // original src (scalar tail)
+    mov.n   a11, a3                     // original dst (scalar tail)
+
+    srai    a6, a4, 4
+    addi.n  a6, a6, -1                  // windows to vectorize
+    srai    a9, a6, 1                   // unrolled-x2 iterations
+    slli    a6, a9, 1                   // windows actually emitted
+    slli    a6, a6, 4                   // = bytes converted by vector part
+
+    // prime; sets SAR_BYTE from src's low bits
+    ee.ld.128.usar.ip   q0, a2, 16
+    ee.ld.128.usar.ip   q1, a2, 16
+
+    loopgtz a9, .Lrow_vec_end
+        ee.src.q        q2, q0, q1     // 16 unaligned bytes from (q0:q1)
+        ee.vld.128.ip   q0, a2, 16     // next raw; window becomes (q1:q0)
+        ee.vcmp.lt.s8   q3, q2, q5
+        ee.vzip.8       q2, q3
+        ee.vadds.s16    q2, q2, q4
+        ee.vadds.s16    q3, q3, q4
+        ee.vst.128.ip   q2, a3, 16
+        ee.vst.128.ip   q3, a3, 16
+        ee.src.q        q2, q1, q0     // next 16 bytes from (q1:q0)
+        ee.vld.128.ip   q1, a2, 16     // window back to (q0:q1)
+        ee.vcmp.lt.s8   q3, q2, q5
+        ee.vzip.8       q2, q3
+        ee.vadds.s16    q2, q2, q4
+        ee.vadds.s16    q3, q3, q4
+        ee.vst.128.ip   q2, a3, 16
+        ee.vst.128.ip   q3, a3, 16
+.Lrow_vec_end:
+
+    // scalar tail: everything past the vector part
+    add.n   a2, a10, a6                 // src tail
+    add.n   a3, a11, a6
+    add.n   a3, a3, a6                  // dst tail = dst + 2*bytes
+    sub     a4, a4, a6
+    l32i.n  a5, a1, 12
+    beqz    a4, .Lrow_done
+    loopgtz a4, .Lrow_tail_end
+        l8ui    a8, a2, 0
+        sext    a8, a8, 7
+        add.n   a8, a8, a5
+        s16i    a8, a3, 0
+        addi.n  a2, a2, 1
+        addi.n  a3, a3, 2
+.Lrow_tail_end:
+.Lrow_done:
+    retw.n
+
+    .size esp_nn_s8_to_s16_with_offset_row_esp32s3, . - esp_nn_s8_to_s16_with_offset_row_esp32s3

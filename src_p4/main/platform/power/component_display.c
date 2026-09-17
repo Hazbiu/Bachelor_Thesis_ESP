@@ -1,8 +1,10 @@
+
 #include "platform/power/component_display.h"
 #include "platform/display/display_platform.h"
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "bsp/esp-bsp.h"
 #include "config/app_config.h"
@@ -130,6 +132,7 @@ static esp_err_t release_hold(gpio_num_t gpio_num, const char *name)
 
 static bool s_gt911_green_mode_verified;
 static uint8_t s_gt911_green_mode_address;
+static uint8_t s_gt911_green_idle_seconds;
 
 static esp_err_t gt911_open_device(
     i2c_master_bus_handle_t bus,
@@ -172,28 +175,6 @@ static esp_err_t gt911_read_bytes(
         sizeof(address_bytes),
         data,
         length,
-        GT911_I2C_TIMEOUT_MS);
-}
-
-static esp_err_t gt911_write_byte(
-    i2c_master_dev_handle_t device,
-    uint16_t reg,
-    uint8_t value)
-{
-    if (device == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    const uint8_t payload[3] = {
-        (uint8_t)(reg >> 8),
-        (uint8_t)(reg & 0xFFU),
-        value,
-    };
-
-    return i2c_master_transmit(
-        device,
-        payload,
-        sizeof(payload),
         GT911_I2C_TIMEOUT_MS);
 }
 
@@ -244,166 +225,144 @@ static esp_err_t gt911_find_and_open(
     return ESP_ERR_NOT_FOUND;
 }
 
+/* Commit the existing panel configuration with one modified idle-time nibble.
+ * Goodix guide 4.4 requires a new checksum and Config_Fresh. The full block
+ * keeps all resolution, calibration and filtering bytes exactly as read. */
+static esp_err_t gt911_commit_config(
+    i2c_master_dev_handle_t device, const uint8_t *config)
+{
+    uint8_t payload[2U + GT911_CONFIG_LENGTH + 2U];
+    payload[0] = (uint8_t)(GT911_CONFIG_START_REGISTER >> 8);
+    payload[1] = (uint8_t)(GT911_CONFIG_START_REGISTER & 0xFFU);
+    memcpy(&payload[2], config, GT911_CONFIG_LENGTH);
+    payload[2U + GT911_CONFIG_LENGTH] =
+        gt911_calculate_config_checksum(config, GT911_CONFIG_LENGTH);
+    payload[3U + GT911_CONFIG_LENGTH] = 1U;
+    return i2c_master_transmit(device, payload, sizeof(payload), GT911_I2C_TIMEOUT_MS);
+}
+
+static esp_err_t gt911_wait_config_applied(i2c_master_dev_handle_t device)
+{
+    for (unsigned attempt = 0; attempt < 10U; ++attempt) {
+        vTaskDelay(pdMS_TO_TICKS(10) + 1);
+        uint8_t fresh = 1U;
+        esp_err_t ret = gt911_read_bytes(device, GT911_CONFIG_FRESH_REGISTER, &fresh, 1U);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        if (fresh == 0U) {
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t gt911_check_config(
+    i2c_master_dev_handle_t device, const uint8_t *expected)
+{
+    uint8_t readback[GT911_CONFIG_LENGTH + 1U];
+    esp_err_t ret = gt911_read_bytes(device, GT911_CONFIG_START_REGISTER,
+                                    readback, sizeof(readback));
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (memcmp(readback, expected, GT911_CONFIG_LENGTH) != 0 ||
+        readback[GT911_CONFIG_LENGTH] !=
+            gt911_calculate_config_checksum(readback, GT911_CONFIG_LENGTH)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_OK;
+}
+
 static esp_err_t gt911_configure_automatic_green_mode(void)
 {
+    s_gt911_green_mode_verified = false;
     i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
     if (bus == NULL) {
-        ESP_LOGW(
-            TAG,
-            "GT911 Green-mode configuration skipped: shared I2C bus unavailable");
         return ESP_ERR_INVALID_STATE;
     }
-
     uint8_t address = 0U;
     i2c_master_dev_handle_t device = NULL;
     esp_err_t ret = gt911_find_and_open(bus, &address, &device);
-
     if (ret != ESP_OK) {
-        ESP_LOGW(
-            TAG,
-            "GT911 Green-mode configuration skipped: no controller at "
-            "0x%02X/0x%02X (%s)",
-            APP_PWR_GT911_PRIMARY_ADDRESS,
-            APP_PWR_GT911_SECONDARY_ADDRESS,
-            esp_err_to_name(ret));
         return ret;
     }
 
-    uint8_t config[GT911_CONFIG_LENGTH];
-    uint8_t stored_checksum = 0U;
+    /* A driver named GT911 can also serve other Goodix parts. Never write a
+     * GT911 configuration layout to an unverified GT9271/GT9xx controller. */
+    uint8_t identity[6] = {0};
+    ret = gt911_read_bytes(device, 0x8140, identity, sizeof(identity));
+    const uint16_t firmware = (uint16_t)identity[4] | ((uint16_t)identity[5] << 8);
+    if (ret == ESP_OK &&
+        (identity[0] != '9' || identity[1] != '1' || identity[2] != '1' ||
+         (identity[3] != 0 && identity[3] != ' ') || firmware < 0x1040U)) {
+        ESP_LOGW(TAG, "Green tuning skipped: product=%.4s firmware=0x%04x; "
+                 "GT911 firmware >= 0x1040 required", (const char *)identity, firmware);
+        ret = ESP_ERR_NOT_SUPPORTED;
+    }
+    if (ret != ESP_OK) {
+        (void)i2c_master_bus_rm_device(device);
+        return ret;
+    }
 
-    ret = gt911_read_bytes(
-        device,
-        GT911_CONFIG_START_REGISTER,
-        config,
-        sizeof(config));
-
+    ret = gt911_wait_config_applied(device);
+    uint8_t original[GT911_CONFIG_LENGTH + 1U];
     if (ret == ESP_OK) {
-        ret = gt911_read_bytes(
-            device,
-            GT911_CONFIG_CHECKSUM_REGISTER,
-            &stored_checksum,
-            1U);
+        ret = gt911_read_bytes(device, GT911_CONFIG_START_REGISTER,
+                               original, sizeof(original));
     }
-
+    if (ret == ESP_OK && original[GT911_CONFIG_LENGTH] !=
+            gt911_calculate_config_checksum(original, GT911_CONFIG_LENGTH)) {
+        ESP_LOGW(TAG, "Green tuning skipped: existing GT911 checksum invalid");
+        ret = ESP_ERR_INVALID_RESPONSE;
+    }
     if (ret != ESP_OK) {
-        ESP_LOGW(
-            TAG,
-            "GT911 configuration read failed at 0x%02X: %s",
-            address,
-            esp_err_to_name(ret));
         (void)i2c_master_bus_rm_device(device);
         return ret;
     }
 
-    const uint8_t calculated_checksum =
-        gt911_calculate_config_checksum(config, sizeof(config));
-
-    if (calculated_checksum != stored_checksum) {
-        ESP_LOGW(
-            TAG,
-            "GT911 configuration checksum invalid at 0x%02X: "
-            "stored=0x%02X calculated=0x%02X; leaving configuration untouched",
-            address,
-            stored_checksum,
-            calculated_checksum);
-
-        (void)i2c_master_bus_rm_device(device);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    const uint8_t old_value = config[GT911_LOW_POWER_INDEX];
-    const uint8_t target_seconds =
-        (uint8_t)(APP_PWR_GT911_GREEN_IDLE_SECONDS & 0x0FU);
-    const uint8_t new_value =
-        (uint8_t)((old_value & 0xF0U) | target_seconds);
-
-    if (new_value != old_value) {
-        config[GT911_LOW_POWER_INDEX] = new_value;
-        const uint8_t new_checksum =
-            gt911_calculate_config_checksum(config, sizeof(config));
-
-        /*
-         * This is deliberately NOT the GT911 0x8040 Sleep command.
-         * Low_Power_Control selects the controller's automatic Green state,
-         * which wakes itself on touch and therefore remains safe on the stock
-         * board with no host-accessible GT911 INT/RESET pins.
-         */
-        ret = gt911_write_byte(
-            device,
-            GT911_LOW_POWER_CONTROL_REGISTER,
-            new_value);
-
+    const uint8_t old_value = original[GT911_LOW_POWER_INDEX];
+    const uint8_t old_seconds = old_value & 0x0FU;
+    /* Do not lengthen an existing shorter idle timeout (0 is valid). */
+    const uint8_t target_seconds = old_seconds < APP_PWR_GT911_GREEN_IDLE_SECONDS
+        ? old_seconds : APP_PWR_GT911_GREEN_IDLE_SECONDS;
+    uint8_t desired[GT911_CONFIG_LENGTH];
+    memcpy(desired, original, sizeof(desired));
+    desired[GT911_LOW_POWER_INDEX] = (old_value & 0xF0U) | target_seconds;
+    if (desired[GT911_LOW_POWER_INDEX] != old_value) {
+        ret = gt911_commit_config(device, desired);
         if (ret == ESP_OK) {
-            ret = gt911_write_byte(
-                device,
-                GT911_CONFIG_CHECKSUM_REGISTER,
-                new_checksum);
+            ret = gt911_wait_config_applied(device);
         }
-
         if (ret == ESP_OK) {
-            ret = gt911_write_byte(
-                device,
-                GT911_CONFIG_FRESH_REGISTER,
-                0x01U);
+            ret = gt911_check_config(device, desired);
         }
-
         if (ret != ESP_OK) {
-            ESP_LOGW(
-                TAG,
-                "GT911 Green-mode update failed at 0x%02X: %s",
-                address,
-                esp_err_to_name(ret));
+            /* A partial I2C transfer may have changed configuration RAM. */
+            const esp_err_t failure = ret;
+            esp_err_t rollback = gt911_commit_config(device, original);
+            if (rollback == ESP_OK) {
+                rollback = gt911_wait_config_applied(device);
+            }
+            if (rollback == ESP_OK) {
+                rollback = gt911_check_config(device, original);
+            }
+            ESP_LOGW(TAG, "Green tuning failed (%s); original config restore=%s",
+                     esp_err_to_name(failure), esp_err_to_name(rollback));
             (void)i2c_master_bus_rm_device(device);
-            return ret;
+            return rollback == ESP_OK ? failure : rollback;
         }
-
-        /* Allow the controller to accept the refreshed configuration. */
-        vTaskDelay(pdMS_TO_TICKS(10));
     }
-
-    uint8_t readback = 0xFFU;
-    ret = gt911_read_bytes(
-        device,
-        GT911_LOW_POWER_CONTROL_REGISTER,
-        &readback,
-        1U);
-
-    (void)i2c_master_bus_rm_device(device);
-
-    if (ret != ESP_OK) {
-        ESP_LOGW(
-            TAG,
-            "GT911 Green-mode read-back failed at 0x%02X: %s",
-            address,
-            esp_err_to_name(ret));
-        return ret;
+    const esp_err_t remove_ret = i2c_master_bus_rm_device(device);
+    if (remove_ret != ESP_OK) {
+        return remove_ret;
     }
-
-    if ((readback & 0x0FU) != target_seconds) {
-        ESP_LOGW(
-            TAG,
-            "GT911 Green-mode verify failed at 0x%02X: "
-            "requested_idle=%us readback=0x%02X",
-            address,
-            (unsigned)target_seconds,
-            readback);
-        return ESP_ERR_INVALID_STATE;
-    }
-
     s_gt911_green_mode_verified = true;
     s_gt911_green_mode_address = address;
-
-    ESP_LOGI(
-        TAG,
-        "GT911 automatic Green mode verified at 0x%02X: "
-        "Low_Power_Control 0x%02X -> 0x%02X idle_to_green=%us "
-        "(touch self-wake retained; full Sleep command remains disabled)",
-        address,
-        old_value,
-        readback,
-        (unsigned)target_seconds);
-
+    s_gt911_green_idle_seconds = target_seconds;
+    ESP_LOGI(TAG, "SLEEP-PWR: GT911 automatic Green idle=%us (previous=%us) "
+             "config verified; touch self-wake retained; current not measured",
+             (unsigned)target_seconds, (unsigned)old_seconds);
     return ESP_OK;
 }
 
@@ -441,8 +400,7 @@ esp_err_t component_display_verify_deep_sleep_low_power(void)
         return ret;
     }
 
-    const uint8_t target_seconds =
-        (uint8_t)(APP_PWR_GT911_GREEN_IDLE_SECONDS & 0x0FU);
+    const uint8_t target_seconds = s_gt911_green_idle_seconds;
 
     if ((readback & 0x0FU) != target_seconds) {
         return ESP_ERR_INVALID_STATE;
@@ -515,6 +473,15 @@ esp_err_t component_display_verify_deep_sleep_low_power(void)
 }
 
 #endif /* APP_PWR_GT911_GREEN_MODE_ENABLED */
+
+esp_err_t component_display_prepare_touch_for_sleep(void)
+{
+#if APP_PWR_GT911_GREEN_MODE_ENABLED
+    return gt911_configure_automatic_green_mode();
+#else
+    return ESP_OK;
+#endif
+}
 
 #if APP_PWR_GT911_SLEEP_ENABLED
 static esp_err_t gt911_write_sleep_command(
@@ -845,9 +812,9 @@ esp_err_t component_display_disable_for_deep_sleep(void)
     /*
      * 2. GT911 low-power policy.
      *
-     * V19 disables Green mode and requests the controller's real full Sleep
-     * state. The command is accepted only after the controller stops ACKing
-     * while the ES8311 proves that the shared I2C bus itself remains healthy.
+     * Keep touch self-wake available on the stock board. Green mode changes
+     * only the no-touch idle interval; it is not the destructive 0x05 command.
+     * Successful register checks verify configuration, not physical current.
      */
 #if APP_PWR_GT911_GREEN_MODE_ENABLED
     ret = gt911_configure_automatic_green_mode();

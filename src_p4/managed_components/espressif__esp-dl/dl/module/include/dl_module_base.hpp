@@ -46,11 +46,24 @@ public:
      */
     virtual ~Module();
 
-#if CONFIG_SPIRAM
-    void *operator new(size_t size) { return tool::malloc_aligned(size, MALLOC_CAP_SPIRAM); }
+    /**
+     * @brief Allocate the module object itself.
+     *
+     * MALLOC_CAP_DEFAULT prefers PSRAM when one is present and falls back to internal RAM otherwise,
+     * so a model's modules do not spend internal RAM on the objects themselves.
+     *
+     * @param size Size of the object in bytes
+     *
+     * @return Pointer to the allocated memory
+     */
+    void *operator new(size_t size) { return tool::malloc_aligned(size, MALLOC_CAP_DEFAULT); }
 
+    /**
+     * @brief Deallocate the module object.
+     *
+     * @param ptr Pointer previously returned by operator new
+     */
     void operator delete(void *ptr) { heap_caps_free(ptr); }
-#endif
 
     /**
      * @brief Get the tensor index of this module's outputs
@@ -58,6 +71,15 @@ public:
      * @return Tensor index of model's tensors
      */
     virtual std::vector<int> get_outputs_index() { return m_outputs_index; }
+
+    /**
+     * @brief Whether this module uses a lookup table (LUT) as an extra input.
+     *
+     * LUT modules load the table from the model initializer and append it to `m_inputs_index`.
+     *
+     * @return true if the module is a LUT module, false otherwise
+     */
+    virtual bool is_lut_module() const { return false; }
 
     /**
      * @brief Calculate output shape by input shape

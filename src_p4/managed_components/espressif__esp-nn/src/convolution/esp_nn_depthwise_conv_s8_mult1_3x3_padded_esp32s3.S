@@ -217,6 +217,7 @@ esp_nn_depthwise_conv_s8_mult1_3x3_padded_esp32s3:  # 0xccc
     l32i            a11,a1,328      // load bias
     add.n           a6,a6,a8                    # [102]
     ee.movi.32.q    q0,a9,0             # [113]
+    addmi           a10,a1,256                  # offset+bias scratch base
     beqz.n          a11,.Lt_7_5378          # [114]
 
 // add bias
@@ -226,7 +227,6 @@ esp_nn_depthwise_conv_s8_mult1_3x3_padded_esp32s3:  # 0xccc
     ee.vld.128.ip   q5,a8,16            # [5]  id:683
     ee.vld.128.ip   q6,a8,16            # [6]  id:684
     ee.vld.128.ip   q7,a8,16            # [7]  id:685
-    addmi           a10,a1,256                  # [2]
     ee.src.q.ld.ip  q2,a8,16,q5,q6              # [9]
     ee.vadds.s32    q1,q1,q5            # [12]
     ee.src.q.ld.ip  q5,a8,0,q6,q7               # [13]

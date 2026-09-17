@@ -1,4 +1,4 @@
-// Copyright 2020-2021 Espressif Systems (Shanghai) PTE LTD
+// Copyright 2020-2026 Espressif Systems (Shanghai) PTE LTD
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,8 +16,9 @@
 
 #if defined(CONFIG_NN_OPTIMIZED)
 // select apt optimisations
-#ifdef CONFIG_IDF_TARGET_ESP32P4
-#define ARCH_ESP32_P4 1
+// ESP32-S31 shares the P4 PIE/SIMD ISA, so it reuses the ESP32-P4 kernels
+#if defined(CONFIG_IDF_TARGET_ESP32P4) || defined(CONFIG_IDF_TARGET_ESP32S31)
+#define ARCH_ESP_RISCV_PIE 1
 #endif
 #ifdef CONFIG_IDF_TARGET_ESP32S3
 #define ARCH_ESP32_S3 1
@@ -35,8 +36,8 @@ extern "C" {
 #include "esp_nn_ansi_headers.h"
 
 #if defined(CONFIG_NN_OPTIMIZED)
-#if defined(ARCH_ESP32_P4)
-#include "esp_nn_esp32p4.h"
+#if defined(ARCH_ESP_RISCV_PIE)
+#include "esp_nn_riscv_pie.h"
 #elif defined(ARCH_ESP32_S3)
 #include "esp_nn_esp32s3.h"
 #else // for other platforms use generic optimisations
