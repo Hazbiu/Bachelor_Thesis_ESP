@@ -8,44 +8,6 @@ A recognized user proceeds to a **PIN-entry stage** as a second authentication f
 
 Power optimization is applied to the complete system rather than only to the ESP32-P4 CPU. The implementation coordinates CPU frequency, AI scheduling, display brightness, camera operation, the ESP32-C6 wireless co-processor, Ethernet PHY, audio subsystem, microSD, touchscreen, and the display when entering lower-power states.
 
-### Main Hardware
-
-The project is centered around the **ESP32-P4-NANO** and uses the board-level peripherals required by the application, including:
-
-- ESP32-P4 dual high-performance RISC-V cores
-- 32 MB PSRAM
-- ESP32-C6-MINI-1 wireless co-processor
-- MIPI-CSI camera interface
-- OV5647 camera
-- MIPI-DSI display path
-- 10.1-inch touch display
-- Goodix GT9271/GT911-compatible touch interface
-- IP101GRI Ethernet PHY
-- ES8311 audio codec
-- NS4150B audio amplifier
-- microSD storage
-
----
-
-## Repository Overview
-
-```text
-Bachelor_Thesis_ESP/
-├── src_p4/                 # Main ESP32-P4 thesis application
-│   ├── main/               # Application, services, platform adapters and UI
-│   ├── managed_components/ # ESP-IDF / BSP managed dependencies
-│   └── ...
-├── src_c6/                 # ESP32-C6 support / companion projects
-├── results/                # Measurement and evaluation results
-├── tools/                  # Development / project tools
-├── utilities/              # Flashing, logging and helper scripts
-├── legacy/                 # Retained legacy material
-├── power_patch_backups/    # Historical power-related development material
-└── ...
-```
-
-The current `src_p4/main/` application is split into application logic, domain definitions, services, platform-specific adapters, diagnostics, and user-interface modules.
-
 ---
 
 # Flashing Process
