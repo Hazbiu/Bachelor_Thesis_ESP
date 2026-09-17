@@ -246,31 +246,7 @@ The end timestamp is captured **before** the SD-card file is written, so filesys
 
 ---
 
-# Achievements
-
-The developed system fulfills the main functional and power-management requirements defined for the Bachelor thesis.
-
-## Functional Achievements
-
-- Local face detection on the ESP32-P4
-- Local face recognition on the ESP32-P4
-- Multi-user enrollment and recognition
-- microSD-based enrollment data
-- PIN-based second-factor authentication
-- Touchscreen launcher
-- Runtime settings interface
-- PIN-entry GUI
-- Direct live camera preview
-- Face-information overlay
-- Persistent configuration
-- Modular state-machine-based application control
-- Pluggable AI backend interfaces
-- Light-sleep recovery without a complete application reboot
-- Deep-sleep with physical GPIO wake-up
-- Direct camera startup after Deep-sleep wake without recreating the launcher
-- Persistent per-wake timing logs on microSD
-
-## Measured Power Achievements
+## Measured Power Results
 
 | Operating mode | Average current | Reduction vs. full Active |
 |---|---:|---:|
