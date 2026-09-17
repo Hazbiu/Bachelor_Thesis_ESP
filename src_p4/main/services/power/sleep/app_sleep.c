@@ -1,5 +1,3 @@
-
-
 #include "services/power/sleep/app_sleep.h"
 
 #include <inttypes.h>
@@ -858,6 +856,14 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
         sleep_reason);
 
     ESP_LOGI(
+        POWER_TAG,
+        "event=DEEP_SLEEP_STATE_POLICY version=%u fix=%s "
+        "wake=GPIO3_ONLY touch=GT9271_PANEL_MCU_RESET camera=OFF display=SLEEP_IN "
+        "c6=OFF ethernet=LOW_POWER audio=SUSPEND sdcard=OFF",
+        (unsigned)APP_SLEEP_POWER_FIX_VERSION,
+        APP_SLEEP_POWER_FIX_TAG);
+
+    ESP_LOGI(
         TAG,
         "Deep sleep requested by %s",
         sleep_reason);
@@ -941,9 +947,10 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
         "Display transport / LVGL / MIPI-DSI teardown",
         esp_err_to_name(display_ret));
 
-    /* Touch retains its self-waking low-power policy on stock wiring. */
-    ESP_LOGI(TAG, "STEP 3: touch low-power policy + display side-channel cleanup");
-    sleep_power_profile_before("GT911 low-power policy / display side channels");
+    /* Deep-sleep must not leave the touch controller self-waking. The panel
+     * MCU holds GT9271 TS_RESET low until the GPIO3 wake boot path releases it. */
+    ESP_LOGI(TAG, "STEP 3: GT9271 hardware reset + display side-channel cleanup");
+    sleep_power_profile_before("GT9271 panel-MCU RESET / display side channels");
     esp_err_t touch_ret = component_display_disable_for_deep_sleep();
 
     if (touch_ret == ESP_OK) {
@@ -956,7 +963,7 @@ static void run_aggressive_deep_sleep_sequence(const char *reason)
     }
 
     sleep_power_profile_after(
-        "GT911 low-power policy / display side channels",
+        "GT9271 panel-MCU RESET / display side channels",
         esp_err_to_name(touch_ret));
 
     ESP_LOGI(

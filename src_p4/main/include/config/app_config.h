@@ -1,12 +1,11 @@
-
 #pragma once
 
 #include "driver/gpio.h"
 #include "config/sleep_mode_selection.h"
 
 /* Sleep/power package identity for serial verification after flashing. */
-#define APP_SLEEP_POWER_FIX_VERSION                 17
-#define APP_SLEEP_POWER_FIX_TAG                     "SLEEP_FIX_V3"
+#define APP_SLEEP_POWER_FIX_VERSION                 18
+#define APP_SLEEP_POWER_FIX_TAG                     "SLEEP_FIX_V4_DEEP_TOUCH_RESET"
 
 /* Camera and display buffers */
 #define APP_CAMERA_BUFFER_COUNT             2
@@ -414,19 +413,30 @@
 
 /*
  * Display / touch sleep configuration.
- * Keep full GT911 Sleep disabled: stock wiring has no host INT/RESET wake.
- * Automatic Green mode instead shortens only the no-touch idle interval and
- * returns to normal scanning on touch. It leaves the working GPIO3 wake path
- * independent of touch. Goodix normally supports automatic Green already;
- * this setting does not imply it was physically disabled in the old firmware.
+ *
+ * Light-sleep remains reversible and keeps the Goodix controller available for
+ * the existing 250 ms touch-poll wake path.
+ *
+ * Deep-sleep is different: GPIO3 is the ONLY P4 wake source, so the touchscreen
+ * must not keep scanning or react to a finger. The Waveshare DSI panel MCU at
+ * I2C address 0x45 exposes its virtual GPIO9 (TS_RESET) in REG_TP 0x94 bit1.
+ * Assert that reset at the irreversible Deep-sleep boundary and release it only
+ * after a GPIO3 wake, before bsp_display_start() probes the touch controller.
+ * This works even though TP_RST/TP_INT are GPIO_NUM_NC from the ESP32-P4 side.
  */
+#define APP_PWR_TOUCH_PANEL_MCU_RESET_ENABLED       1
+#define APP_PWR_TOUCH_PANEL_MCU_RESET_RELEASE_MS    80U
+
+/* Keep the old direct-Goodix command path disabled. Hardware reset through the
+ * panel MCU is deterministic and recoverable after GPIO3 wake; command 0x05 is
+ * not used because stock wiring gives the P4 no direct INT wake/control line. */
 #define APP_PWR_GT911_SLEEP_ENABLED                 0
 #define APP_PWR_GT911_ALLOW_SLEEP_WITHOUT_HOST_WAKE 0
 #define APP_PWR_GT911_SLEEP_VERIFY_DELAY_MS         70U
 #define APP_PWR_GT911_PRIMARY_ADDRESS               0x5D
 #define APP_PWR_GT911_SECONDARY_ADDRESS             0x14
 
-/* Timings used only when a future board exposes a real wake pin. */
+/* Timings used only when a future board exposes a direct P4 touch wake pin. */
 #define APP_PWR_GT911_RESET_ASSERT_MS               20
 #define APP_PWR_GT911_INT_PULSE_MS                  5
 #define APP_PWR_GT911_BOOT_MS                       60
@@ -435,16 +445,17 @@
 #define APP_PWR_DISPLAY_BACKLIGHT_GPIO              (-1)
 #define APP_PWR_DISPLAY_BACKLIGHT_OFF_LEVEL         0
 
-/* Stock BSP: GT911 INT is GPIO_NUM_NC. */
+/* Stock BSP: Goodix INT is GPIO_NUM_NC from the P4. */
 #define APP_PWR_TOUCH_INT_GPIO                      (-1)
 
-/* Stock BSP: GT911 RESET is GPIO_NUM_NC. */
+/* Stock BSP: Goodix RESET is GPIO_NUM_NC from the P4. Deep-sleep reset is
+ * instead driven through the display MCU virtual GPIO described above. */
 #define APP_PWR_TOUCH_RESET_GPIO                    (-1)
 #define APP_PWR_TOUCH_RESET_ACTIVE_LEVEL            0
 
-/* Apply with touch/UI suspended in either sleep entry path. Reuse a shorter
- * existing idle interval. Calibration, thresholds and coordinate rates stay
- * unchanged. Unsupported Goodix product/firmware IDs are never rewritten. */
+/* Light-sleep-only optional tuning. The actual panel identifies as GT9271, so
+ * the GT911-layout guard safely skips this rewrite; touch polling still works.
+ * Deep-sleep does NOT rely on Green mode anymore. */
 #define APP_PWR_GT911_GREEN_MODE_ENABLED            1
 #define APP_PWR_GT911_GREEN_IDLE_SECONDS            1U
 

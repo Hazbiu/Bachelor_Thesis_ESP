@@ -1,4 +1,3 @@
-
 #include "platform/power/component_display.h"
 #include "platform/display/display_platform.h"
 
@@ -368,6 +367,9 @@ static esp_err_t gt911_configure_automatic_green_mode(void)
 
 esp_err_t component_display_verify_deep_sleep_low_power(void)
 {
+#if APP_PWR_TOUCH_PANEL_MCU_RESET_ENABLED
+    return display_platform_touch_reset_verify_asserted();
+#else
     if (!s_gt911_green_mode_verified) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -415,13 +417,16 @@ esp_err_t component_display_verify_deep_sleep_low_power(void)
         (unsigned)target_seconds);
 
     return ESP_OK;
+#endif /* APP_PWR_TOUCH_PANEL_MCU_RESET_ENABLED */
 }
 
 #else
 
 esp_err_t component_display_verify_deep_sleep_low_power(void)
 {
-#if APP_PWR_GT911_SLEEP_ENABLED
+#if APP_PWR_TOUCH_PANEL_MCU_RESET_ENABLED
+    return display_platform_touch_reset_verify_asserted();
+#elif APP_PWR_GT911_SLEEP_ENABLED
     if (!s_gt911_full_sleep_verified) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -670,7 +675,9 @@ static esp_err_t float_pin(gpio_num_t gpio_num)
 
 esp_err_t component_display_wake_touch_after_reset(void)
 {
-#if APP_PWR_TOUCH_RESET_GPIO >= 0
+#if APP_PWR_TOUCH_PANEL_MCU_RESET_ENABLED
+    return display_platform_touch_reset_release_after_deep_sleep();
+#elif APP_PWR_TOUCH_RESET_GPIO >= 0
     /*
      * RESET is the reliable wake: it restores the controller from sleep and
      * from any confused state.
@@ -810,37 +817,44 @@ esp_err_t component_display_disable_for_deep_sleep(void)
 #endif
 
     /*
-     * 2. GT911 low-power policy.
+     * 2. Deep-sleep touch shutdown.
      *
-     * Keep touch self-wake available on the stock board. Green mode changes
-     * only the no-touch idle interval; it is not the destructive 0x05 command.
-     * Successful register checks verify configuration, not physical current.
+     * Do NOT leave the GT9271 in self-waking Green mode: a finger can make the
+     * controller resume normal capacitive scanning and increase board current
+     * even though the P4 itself remains asleep. The Waveshare panel MCU exposes
+     * TS_RESET as virtual GPIO9, so hold the controller in hardware reset for
+     * the complete Deep-sleep residency. GPIO3 is unaffected and remains the
+     * only P4 wake source.
      */
+#if APP_PWR_TOUCH_PANEL_MCU_RESET_ENABLED
+    ret = display_platform_touch_reset_assert_for_deep_sleep();
+    if (ret != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "Could not assert GT9271 panel-MCU reset for Deep-sleep: %s",
+            esp_err_to_name(ret));
+        if (first_error == ESP_OK) {
+            first_error = ret;
+        }
+    } else {
+        ESP_LOGI(
+            TAG,
+            "SLEEP-PWR: GT9271 hardware RESET asserted through panel MCU; "
+            "touch scanning disabled until GPIO3 wake");
+    }
+#else
 #if APP_PWR_GT911_GREEN_MODE_ENABLED
     ret = gt911_configure_automatic_green_mode();
-    if (ret != ESP_OK) {
-        ESP_LOGW(
-            TAG,
-            "Continuing Deep-sleep without GT911 Green-mode optimization: %s",
-            esp_err_to_name(ret));
-        if (first_error == ESP_OK) {
-            first_error = ret;
-        }
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
     }
 #endif
-
 #if APP_PWR_GT911_SLEEP_ENABLED
     ret = gt911_enter_sleep();
-    if (ret != ESP_OK) {
-        ESP_LOGW(
-            TAG,
-            "GT911 did not reach verified FULL SLEEP: %s; continuing P4 "
-            "Deep-sleep so the failure is visible in the final audit",
-            esp_err_to_name(ret));
-        if (first_error == ESP_OK) {
-            first_error = ret;
-        }
+    if (ret != ESP_OK && first_error == ESP_OK) {
+        first_error = ret;
     }
+#endif
 #endif
 
     /*
@@ -873,10 +887,17 @@ esp_err_t component_display_disable_for_deep_sleep(void)
 
     ESP_LOGI(TAG,
              "Display side-channels prepared for Deep-sleep: "
-             "backlight_held=%s touch_int_held=%s touch_reset_held=%s",
+             "backlight_held=%s direct_touch_int_held=%s direct_touch_reset_held=%s "
+             "panel_mcu_touch_reset=%s",
              s_backlight_held ? "yes" : "no",
              s_touch_int_held ? "yes" : "no",
-             s_touch_reset_held ? "yes" : "no");
+             s_touch_reset_held ? "yes" : "no",
+#if APP_PWR_TOUCH_PANEL_MCU_RESET_ENABLED
+             "ASSERTED"
+#else
+             "DISABLED"
+#endif
+    );
 
     return first_error;
 }
@@ -885,6 +906,17 @@ esp_err_t component_display_restore_after_failed_sleep(void)
 {
     esp_err_t first_error = ESP_OK;
     esp_err_t ret = ESP_OK;
+
+#if APP_PWR_TOUCH_PANEL_MCU_RESET_ENABLED
+    ret = display_platform_touch_reset_release_after_deep_sleep();
+    if (ret != ESP_OK) {
+        first_error = ret;
+        ESP_LOGE(
+            TAG,
+            "Could not release GT9271 panel-MCU reset after failed sleep: %s",
+            esp_err_to_name(ret));
+    }
+#endif
 
     (void)ret;
 

@@ -1,5 +1,3 @@
-
-
 #include "services/power/sleep/deep_sleep.h"
 
 #include <stdbool.h>
@@ -315,17 +313,25 @@ static void audit_rails_before_deep_sleep(void)
             esp_err_to_name(codec_ret));
     }
 
-#if APP_PWR_GT911_SLEEP_ENABLED || APP_PWR_GT911_GREEN_MODE_ENABLED
+#if APP_PWR_TOUCH_PANEL_MCU_RESET_ENABLED || \
+    APP_PWR_GT911_SLEEP_ENABLED || APP_PWR_GT911_GREEN_MODE_ENABLED
     esp_err_t gt911_ret = component_display_verify_deep_sleep_low_power();
     if (gt911_ret == ESP_OK) {
-#if APP_PWR_GT911_SLEEP_ENABLED
+#if APP_PWR_TOUCH_PANEL_MCU_RESET_ENABLED
+        ESP_LOGI(AUDIT_TAG, "GT9271 panel-MCU TS_RESET asserted        OK");
+#elif APP_PWR_GT911_SLEEP_ENABLED
         ESP_LOGI(AUDIT_TAG, "GT911 FULL SLEEP (no I2C ACK)             OK");
 #else
         ESP_LOGI(AUDIT_TAG, "GT911 automatic Green configuration      OK");
 #endif
     } else {
         mismatches++;
-#if APP_PWR_GT911_SLEEP_ENABLED
+#if APP_PWR_TOUCH_PANEL_MCU_RESET_ENABLED
+        ESP_LOGE(
+            AUDIT_TAG,
+            "GT9271 panel-MCU TS_RESET                  FAILED (%s)",
+            esp_err_to_name(gt911_ret));
+#elif APP_PWR_GT911_SLEEP_ENABLED
         ESP_LOGE(
             AUDIT_TAG,
             "GT911 FULL SLEEP                           FAILED (%s)",
@@ -369,7 +375,7 @@ static void audit_rails_before_deep_sleep(void)
             AUDIT_TAG,
             "Pre-entry checks passed; post-entry rail levels are NOT measured here: "
             "C6 mode GPIO LOW + CHIP_PU LOW, selected IP101GRI policy, "
-            "ES8311 suspend, NS4150B off, selected GT911 policy, microSD rail off "
+            "ES8311 suspend, NS4150B off, touch controller reset/low-power policy, microSD rail off "
             "and shared I2C high. Display shutdown requested "
             "LCD SLEEP_IN before the Light-sleep transport is destroyed.");
     } else {

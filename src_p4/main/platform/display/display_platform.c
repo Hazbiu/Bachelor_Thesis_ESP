@@ -1,4 +1,3 @@
-
 #include "platform/display/display_platform.h"
 
 #include <stdio.h>
@@ -48,6 +47,11 @@ static int s_last_backlight_percent = -1;
  * are handled separately in display_platform_panel_enter_full_sleep().
  */
 #define DISPLAY_CTRL_I2C_ADDRESS              0x45U
+/* Waveshare panel-MCU GPIO bank: GPIO8..15 live in REG_TP. Linux's current
+ * Waveshare driver names virtual GPIO9 GPIO_TS_RESET, therefore bit1 here is
+ * the active-high touch-reset RELEASE signal (1=run, 0=held in reset). */
+#define DISPLAY_CTRL_TOUCH_REGISTER           0x94U
+#define DISPLAY_CTRL_TOUCH_RESET_RELEASE_MASK 0x02U
 #define DISPLAY_CTRL_STATE_REGISTER           0x95U
 #define DISPLAY_CTRL_BRIGHTNESS_REGISTER      0x96U
 #define DISPLAY_CTRL_RECOVERY_STATE           0x11U
@@ -142,6 +146,188 @@ static esp_err_t display_platform_release_shared_i2c_after_deep_sleep(void)
     return first_error;
 }
 
+
+static esp_err_t display_platform_touch_register_read(uint8_t *value_out)
+{
+    if (value_out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    if (bus == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const i2c_device_config_t device_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = DISPLAY_CTRL_I2C_ADDRESS,
+        .scl_speed_hz = DISPLAY_CTRL_I2C_CLOCK_HZ,
+    };
+
+    i2c_master_dev_handle_t device = NULL;
+    esp_err_t ret = i2c_master_bus_add_device(bus, &device_config, &device);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    const uint8_t reg = DISPLAY_CTRL_TOUCH_REGISTER;
+    ret = i2c_master_transmit_receive(
+        device,
+        &reg,
+        sizeof(reg),
+        value_out,
+        1U,
+        DISPLAY_CTRL_I2C_TIMEOUT_MS);
+
+    const esp_err_t remove_ret = i2c_master_bus_rm_device(device);
+    if (ret == ESP_OK && remove_ret != ESP_OK) {
+        ret = remove_ret;
+    }
+    return ret;
+}
+
+static esp_err_t display_platform_set_touch_reset_released(bool released)
+{
+#if APP_PWR_TOUCH_PANEL_MCU_RESET_ENABLED
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    if (bus == NULL) {
+        ESP_LOGE(TAG, "[TOUCH-DEEP] shared BSP I2C bus unavailable");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const i2c_device_config_t device_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = DISPLAY_CTRL_I2C_ADDRESS,
+        .scl_speed_hz = DISPLAY_CTRL_I2C_CLOCK_HZ,
+    };
+
+    i2c_master_dev_handle_t device = NULL;
+    esp_err_t ret = i2c_master_bus_add_device(bus, &device_config, &device);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "[TOUCH-DEEP] could not open panel MCU 0x%02X: %s",
+                 DISPLAY_CTRL_I2C_ADDRESS, esp_err_to_name(ret));
+        return ret;
+    }
+
+    uint8_t current = 0U;
+    const uint8_t reg = DISPLAY_CTRL_TOUCH_REGISTER;
+    ret = i2c_master_transmit_receive(
+        device,
+        &reg,
+        sizeof(reg),
+        &current,
+        1U,
+        DISPLAY_CTRL_I2C_TIMEOUT_MS);
+
+    if (ret == ESP_OK) {
+        const uint8_t requested = released
+            ? (uint8_t)(current | DISPLAY_CTRL_TOUCH_RESET_RELEASE_MASK)
+            : (uint8_t)(current & (uint8_t)~DISPLAY_CTRL_TOUCH_RESET_RELEASE_MASK);
+        const uint8_t payload[2] = {
+            DISPLAY_CTRL_TOUCH_REGISTER,
+            requested,
+        };
+
+        ret = i2c_master_transmit(
+            device,
+            payload,
+            sizeof(payload),
+            DISPLAY_CTRL_I2C_TIMEOUT_MS);
+
+        if (ret == ESP_OK) {
+            uint8_t readback = 0U;
+            ret = i2c_master_transmit_receive(
+                device,
+                &reg,
+                sizeof(reg),
+                &readback,
+                1U,
+                DISPLAY_CTRL_I2C_TIMEOUT_MS);
+
+            const bool readback_released =
+                (readback & DISPLAY_CTRL_TOUCH_RESET_RELEASE_MASK) != 0U;
+
+            if (ret == ESP_OK && readback_released != released) {
+                ESP_LOGE(
+                    TAG,
+                    "[TOUCH-DEEP] panel MCU TS_RESET verify failed: "
+                    "REG_TP before=0x%02X requested=0x%02X readback=0x%02X",
+                    current,
+                    requested,
+                    readback);
+                ret = ESP_ERR_INVALID_STATE;
+            } else if (ret == ESP_OK) {
+                ESP_LOGI(
+                    TAG,
+                    "[TOUCH-DEEP] panel MCU REG_TP 0x94: 0x%02X -> 0x%02X "
+                    "TS_RESET=%s",
+                    current,
+                    readback,
+                    released ? "RELEASED" : "ASSERTED_LOW");
+            }
+        }
+    }
+
+    const esp_err_t remove_ret = i2c_master_bus_rm_device(device);
+    if (ret == ESP_OK && remove_ret != ESP_OK) {
+        ret = remove_ret;
+    }
+    return ret;
+#else
+    (void)released;
+    return ESP_OK;
+#endif
+}
+
+esp_err_t display_platform_touch_reset_assert_for_deep_sleep(void)
+{
+    return display_platform_set_touch_reset_released(false);
+}
+
+esp_err_t display_platform_touch_reset_verify_asserted(void)
+{
+#if APP_PWR_TOUCH_PANEL_MCU_RESET_ENABLED
+    uint8_t readback = 0U;
+    esp_err_t ret = display_platform_touch_register_read(&readback);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if ((readback & DISPLAY_CTRL_TOUCH_RESET_RELEASE_MASK) != 0U) {
+        ESP_LOGE(
+            TAG,
+            "[TOUCH-DEEP] TS_RESET is not asserted: REG_TP=0x%02X bit1=1",
+            readback);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "[TOUCH-DEEP] final audit: GT9271 held in hardware RESET "
+        "through panel MCU REG_TP=0x%02X",
+        readback);
+    return ESP_OK;
+#else
+    return ESP_OK;
+#endif
+}
+
+esp_err_t display_platform_touch_reset_release_after_deep_sleep(void)
+{
+    esp_err_t ret = display_platform_set_touch_reset_released(true);
+#if APP_PWR_TOUCH_PANEL_MCU_RESET_ENABLED
+    if (ret == ESP_OK) {
+        /* The panel-MCU GPIO release is the GT9271 hardware-reset release.
+         * Let its oscillator/firmware settle before the BSP probes 0x5D/0x14. */
+        vTaskDelay(pdMS_TO_TICKS(APP_PWR_TOUCH_PANEL_MCU_RESET_RELEASE_MS) + 1);
+        ESP_LOGI(
+            TAG,
+            "[TOUCH-DEEP] GT9271 reset released; waited %u ms before BSP probe",
+            (unsigned)APP_PWR_TOUCH_PANEL_MCU_RESET_RELEASE_MS);
+    }
+#endif
+    return ret;
+}
 
 static esp_err_t display_platform_apply_controller_deep_sleep_recovery(void)
 {
@@ -517,7 +703,13 @@ lv_display_t *display_platform_start(void)
                     "BSP I2C initialized but returned a NULL bus handle");
                 ret = ESP_ERR_INVALID_STATE;
             } else {
-                ret = display_platform_apply_controller_light_sleep_wake();
+                /* Deep-sleep held the GT9271 in reset through panel-MCU
+                 * virtual GPIO9. Release it now, while the BSP touch driver is
+                 * still uncreated, then restore the display controller state. */
+                ret = display_platform_touch_reset_release_after_deep_sleep();
+                if (ret == ESP_OK) {
+                    ret = display_platform_apply_controller_light_sleep_wake();
+                }
             }
 
             if (ret != ESP_OK) {

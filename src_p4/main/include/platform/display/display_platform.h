@@ -47,6 +47,18 @@ esp_err_t display_platform_panel_enter_full_sleep(void);
 bool display_platform_panel_sleep_committed(void);
 
 /*
+ * ESP32-P4-NANO / Waveshare DSI panel MCU touch-reset control.
+ *
+ * The panel MCU at I2C 0x45 exposes TS_RESET as virtual GPIO9, encoded as
+ * REG_TP (0x94) bit1. Deep-sleep asserts this hardware reset so the GT9271
+ * cannot scan or react to touches. GPIO3 remains the only P4 wake source.
+ * After a real GPIO3 Deep-sleep wake, release reset before BSP touch probing.
+ */
+esp_err_t display_platform_touch_reset_assert_for_deep_sleep(void);
+esp_err_t display_platform_touch_reset_verify_asserted(void);
+esp_err_t display_platform_touch_reset_release_after_deep_sleep(void);
+
+/*
  * Suspend the BSP display transport for Light-sleep.
  *
  * prepare_panel_for_deep=true sends the LCD controller's strongest software

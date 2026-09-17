@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include "esp_err.h"
@@ -11,9 +10,10 @@ extern "C" {
  * Put the display side-channels into their lowest software-controlled state
  * before ESP32-P4 Deep-sleep.
  *
- * The default policy uses automatic GT911 Green mode. Full Sleep stays
- * disabled because the stock board has no host INT/RESET wake connection.
- * This preserves touch availability after the P4 wakes through GPIO3.
+ * Light-sleep keeps the Goodix controller pollable. Real Deep-sleep instead
+ * asserts the Waveshare panel-MCU TS_RESET output, so the GT9271 stops scanning
+ * and cannot raise current when the glass is touched. GPIO3 remains the only
+ * P4 wake source; the reset is released before BSP touch probing after wake.
  *
  * Call ordering:
  *
@@ -47,24 +47,24 @@ esp_err_t component_display_disable_for_deep_sleep(void);
 esp_err_t component_display_prepare_touch_for_sleep(void);
 
 /**
- * Audit the selected GT911 low-power state while the shared I2C bus is still
- * available. The default policy verifies the automatic Green configuration;
- * this does not measure whether the controller is currently scanning slowly.
- * The optional full-Sleep build instead checks I2C non-response and bus health.
+ * Audit the selected Deep-sleep touch state while the shared I2C bus is still
+ * available. On this board the final audit verifies panel-MCU TS_RESET remains
+ * asserted; optional legacy Goodix Green/full-Sleep paths remain compile-time
+ * fallbacks only.
  */
 esp_err_t component_display_verify_deep_sleep_low_power(void);
 
 /**
- * Release display-side GPIO holds only if Deep-sleep unexpectedly returns.
- * A GT911 already placed into full Sleep cannot be software-restored on the
- * stock board because no host INT/RESET line is available.
+ * Release display-side holds/reset only if Deep-sleep unexpectedly returns.
+ * The panel-MCU touch reset is recoverable in software, so failed entry does
+ * not strand the touchscreen asleep.
  */
 esp_err_t component_display_restore_after_failed_sleep(void);
 
 /**
- * Wake GT911 when a future board revision provides a usable RESET or INT GPIO.
- * On stock wiring with full-Sleep enabled this returns
- * ESP_ERR_NOT_SUPPORTED and logs that a full board power-cycle is required.
+ * Compatibility wake entry point. Direct P4 RESET/INT is still supported when
+ * present; on the stock board the display-platform path releases the panel-MCU
+ * TS_RESET output after a GPIO3 Deep-sleep wake.
  */
 esp_err_t component_display_wake_touch_after_reset(void);
 
