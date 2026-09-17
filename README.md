@@ -1,34 +1,3 @@
-# Power Efficient Operation of an Edge AI Device (ESP32-P4)
-
-Bachelor thesis project for a power-efficient, on-device face-recognition and door-access system built around the **Waveshare ESP32-P4-NANO**.
-
-The system combines local Edge AI inference, camera-to-display processing, multi-user face recognition, PIN-based second-factor authentication, a touchscreen GUI, dynamic CPU power management, Light-sleep, Deep-sleep, peripheral power control, and wake-up performance instrumentation.
-
-**Thesis:** *Power Efficient Operation of an Edge AI Device (Espressif ESP32-P4)*  
-**Platform:** Waveshare ESP32-P4-NANO  
-**Framework:** ESP-IDF 5.5.4 / FreeRTOS  
-**Primary application:** `src_p4/`
-
----
-
-## Purpose of This README
-
-This README is the technical entry point for the GitHub repository.
-
-Its purpose is to:
-
-- explain what the Bachelor thesis project implements and why it exists;
-- identify the main hardware and software components;
-- provide a reproducible ESP32-P4 build and flashing procedure;
-- explain the software architecture and the responsibilities of the main modules;
-- summarize the power-management, AI, GUI, authentication, and wake-up behavior;
-- document the main measured achievements of the thesis;
-- help another developer understand where to start without first reading the complete source tree or thesis.
-
-The README is intentionally a repository-level overview. Detailed implementation decisions, measurements, experiments, background theory, and references remain part of the Bachelor thesis and the source-code documentation.
-
----
-
 ## Description
 
 The project investigates how a continuously operating **Edge AI face-recognition system** can reduce total board power consumption while still preserving useful response time and application functionality.
