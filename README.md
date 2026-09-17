@@ -200,28 +200,7 @@ The main goals are:
 
 ## High-Level Architecture
 
-```mermaid
-flowchart TD
-    UI["User Interface<br/>Launcher · Settings · PIN · Camera Overlay"]
-    APP["Application Logic<br/>Runtime · Navigation · Controller · State Machine<br/>Authentication · Camera Session"]
-    AI["Face Recognition Service<br/>Detection · Recognition · Snapshot Scheduling<br/>Result Processing · AI Worker"]
-    CFG["Configuration Service<br/>Persistent Settings"]
-    PM["Power Management<br/>DFS · Inactivity Policy · Light Sleep · Deep Sleep<br/>Peripheral Power Policy"]
-    ADAPTER["System Adapters<br/>Camera · Display · Storage · CPU/Power"]
-    PLATFORM["Platform Layer<br/>ESP32-P4 / BSP-specific implementation"]
-    ESPIDF["ESP-IDF + Managed Components<br/>FreeRTOS · LVGL · ESP-DL · Drivers · BSP"]
-
-    UI --> APP
-    APP --> AI
-    APP --> CFG
-    APP --> PM
-    APP --> ADAPTER
-    AI --> ADAPTER
-    PM --> ADAPTER
-    CFG --> ADAPTER
-    ADAPTER --> PLATFORM
-    PLATFORM --> ESPIDF
-```
+<img width="934" height="695" alt="image" src="https://github.com/user-attachments/assets/a1395dae-73d2-47d2-bebf-6e829eed252a" />
 
 ## Application Logic
 
