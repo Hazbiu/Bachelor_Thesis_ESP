@@ -1,8 +1,11 @@
-
+#include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <dirent.h>
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_lcd_mipi_dsi.h"
@@ -213,6 +216,172 @@ static void startup_error(const char *message)
     presentation_launcher_show_error(message);
 }
 
+#define WAKE_LOG_DIRECTORY "/sdcard/logs"
+
+static const char *wake_timing_mode_name(wake_timing_mode_t mode)
+{
+    return mode == WAKE_TIMING_DEEP_SLEEP ? "DEEP_SLEEP" : "LIGHT_SLEEP";
+}
+
+static char wake_timing_mode_file_code(wake_timing_mode_t mode)
+{
+    return mode == WAKE_TIMING_DEEP_SLEEP ? 'D' : 'L';
+}
+
+static const char *wake_timing_scope(wake_timing_mode_t mode)
+{
+    return mode == WAKE_TIMING_DEEP_SLEEP
+        ? "APP_RUNTIME_TO_FIRST_FRAME excludes_ROM_BOOTLOADER"
+        : "WAKE_CONFIRMED_TO_FIRST_FRAME";
+}
+
+static const char *wake_timing_start_event(wake_timing_mode_t mode)
+{
+    return mode == WAKE_TIMING_DEEP_SLEEP
+        ? "APP_RUNTIME_ENTRY"
+        : "WAKE_CONFIRMED";
+}
+
+static uint32_t wake_timing_next_log_sequence(void)
+{
+    DIR *directory = opendir(WAKE_LOG_DIRECTORY);
+    if (directory == NULL) {
+        return 1U;
+    }
+
+    uint32_t highest_sequence = 0U;
+    struct dirent *entry = NULL;
+
+    while ((entry = readdir(directory)) != NULL) {
+        char mode_code = '\0';
+        unsigned sequence = 0U;
+        int consumed = 0;
+
+        /*
+         * Use strict FAT 8.3 names so this works even when long filename
+         * support is disabled in FatFs. Files are L000001.LOG/D000002.LOG.
+         */
+        if (sscanf(
+                entry->d_name,
+                "%c%6u.LOG%n",
+                &mode_code,
+                &sequence,
+                &consumed) == 2 &&
+            consumed == (int)strlen(entry->d_name) &&
+            (mode_code == 'L' || mode_code == 'D' ||
+             mode_code == 'l' || mode_code == 'd') &&
+            sequence > highest_sequence) {
+            highest_sequence = (uint32_t)sequence;
+        }
+    }
+
+    closedir(directory);
+
+    /* Six digits keep the basename within the FAT 8.3 limit. */
+    return highest_sequence < 999999U
+        ? highest_sequence + 1U
+        : 0U;
+}
+
+static void wake_timing_write_log_file(
+    wake_timing_mode_t mode,
+    int64_t start_us,
+    int64_t end_us,
+    int64_t elapsed_us)
+{
+    /*
+     * This runs only AFTER end_us has been captured, so SD/FAT filesystem work
+     * is never included in the measured wake latency.
+     */
+    const esp_err_t mount_ret = system_storage_sdcard_ensure_mounted();
+    if (mount_ret != ESP_OK) {
+        ESP_LOGW(
+            TAG,
+            "[WAKE-LOG] mode=%s not saved: microSD mount failed: %s",
+            wake_timing_mode_name(mode),
+            esp_err_to_name(mount_ret));
+        return;
+    }
+
+    if (mkdir(WAKE_LOG_DIRECTORY, 0775) != 0 && errno != EEXIST) {
+        ESP_LOGW(
+            TAG,
+            "[WAKE-LOG] mode=%s not saved: mkdir(%s) failed errno=%d",
+            wake_timing_mode_name(mode),
+            WAKE_LOG_DIRECTORY,
+            errno);
+        return;
+    }
+
+    const uint32_t sequence = wake_timing_next_log_sequence();
+    if (sequence == 0U) {
+        ESP_LOGW(TAG, "[WAKE-LOG] sequence counter exhausted");
+        return;
+    }
+
+    char path[128];
+    const int path_length = snprintf(
+        path,
+        sizeof(path),
+        WAKE_LOG_DIRECTORY "/%c%06" PRIu32 ".LOG",
+        wake_timing_mode_file_code(mode),
+        sequence);
+
+    if (path_length < 0 || (size_t)path_length >= sizeof(path)) {
+        ESP_LOGW(TAG, "[WAKE-LOG] path generation failed");
+        return;
+    }
+
+    /*
+     * The sequence is selected as one greater than the highest existing wake
+     * file. This function is called synchronously by the single camera render
+     * path, so there is no competing wake logger that can claim the same name.
+     */
+    FILE *file = fopen(path, "w");
+    if (file == NULL) {
+        ESP_LOGW(
+            TAG,
+            "[WAKE-LOG] mode=%s not saved: fopen failed errno=%d path=%s",
+            wake_timing_mode_name(mode),
+            errno,
+            path);
+        return;
+    }
+
+    const double elapsed_ms = (double)elapsed_us / 1000.0;
+    const double elapsed_sec = (double)elapsed_us / 1000000.0;
+
+    fprintf(file, "wake_entry=%" PRIu32 "\n", sequence);
+    fprintf(file, "mode=%s\n", wake_timing_mode_name(mode));
+    fprintf(file, "start_event=%s\n", wake_timing_start_event(mode));
+    fprintf(file, "end_event=FIRST_CAMERA_FRAME\n");
+    fprintf(file, "start_us=%" PRId64 "\n", start_us);
+    fprintf(file, "end_us=%" PRId64 "\n", end_us);
+    fprintf(file, "elapsed_us=%" PRId64 "\n", elapsed_us);
+    fprintf(file, "elapsed_ms=%.3f\n", elapsed_ms);
+    fprintf(file, "elapsed_sec=%.6f\n", elapsed_sec);
+    fprintf(file, "scope=%s\n", wake_timing_scope(mode));
+
+    const int close_ret = fclose(file);
+    if (close_ret != 0) {
+        ESP_LOGW(
+            TAG,
+            "[WAKE-LOG] mode=%s file close/flush failed errno=%d path=%s",
+            wake_timing_mode_name(mode),
+            errno,
+            path);
+        return;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "[WAKE-LOG] saved entry=%u mode=%s path=%s elapsed_sec=%.6f",
+        sequence,
+        wake_timing_mode_name(mode),
+        path,
+        elapsed_sec);
+}
+
 static void wake_timing_arm(
     wake_timing_mode_t mode,
     int64_t start_us)
@@ -227,7 +396,7 @@ static void wake_timing_arm(
     ESP_LOGI(
         TAG,
         "[WAKE-TIME] mode=%s event=TIMER_ARMED timestamp_us=%" PRId64,
-        mode == WAKE_TIMING_DEEP_SLEEP ? "DEEP_SLEEP" : "LIGHT_SLEEP",
+        wake_timing_mode_name(mode),
         start_us);
 }
 
@@ -238,26 +407,38 @@ static void wake_timing_finish_on_first_camera_frame(void)
         return;
     }
 
+    /*
+     * Capture and disarm FIRST. File I/O happens afterwards and therefore can
+     * neither change the measured endpoint nor create a duplicate log on a
+     * later camera frame.
+     */
+    const wake_timing_mode_t completed_mode = s_wake_timing_mode;
+    const int64_t start_us = s_wake_timing_start_us;
     const int64_t end_us = esp_timer_get_time();
-    const int64_t elapsed_us = end_us - s_wake_timing_start_us;
+    const int64_t elapsed_us = end_us - start_us;
+
+    s_wake_timing_mode = WAKE_TIMING_NONE;
+    s_wake_timing_start_us = -1;
 
     ESP_LOGI(
         TAG,
         "[WAKE-TIME] mode=%s event=FIRST_CAMERA_FRAME "
         "start_us=%" PRId64 " end_us=%" PRId64
-        " elapsed_us=%" PRId64 " elapsed_ms=%.3f%s",
-        s_wake_timing_mode == WAKE_TIMING_DEEP_SLEEP
-            ? "DEEP_SLEEP" : "LIGHT_SLEEP",
-        s_wake_timing_start_us,
+        " elapsed_us=%" PRId64 " elapsed_ms=%.3f elapsed_sec=%.6f"
+        " scope=%s",
+        wake_timing_mode_name(completed_mode),
+        start_us,
         end_us,
         elapsed_us,
         (double)elapsed_us / 1000.0,
-        s_wake_timing_mode == WAKE_TIMING_DEEP_SLEEP
-            ? " scope=APP_RUNTIME_TO_FIRST_FRAME excludes_ROM_BOOTLOADER"
-            : " scope=WAKE_CONFIRMED_TO_FIRST_FRAME");
+        (double)elapsed_us / 1000000.0,
+        wake_timing_scope(completed_mode));
 
-    s_wake_timing_mode = WAKE_TIMING_NONE;
-    s_wake_timing_start_us = -1;
+    wake_timing_write_log_file(
+        completed_mode,
+        start_us,
+        end_us,
+        elapsed_us);
 }
 
 esp_err_t camera_session_prepare_launcher_display(void)

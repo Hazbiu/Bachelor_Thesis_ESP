@@ -1,4 +1,3 @@
-
 #include "app/app_runtime.h"
 
 #include <stdbool.h>

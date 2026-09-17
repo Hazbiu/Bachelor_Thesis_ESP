@@ -1,4 +1,3 @@
-
 #include "services/power/sleep/app_sleep.h"
 
 #include <inttypes.h>
